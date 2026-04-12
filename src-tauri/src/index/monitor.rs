@@ -10,6 +10,8 @@ pub struct VolumeManager {
 pub struct VolumeMonitor {
     drive_letter: String,
     files: Vec<SearchResult>,
+    include_hidden_files: bool,
+    include_system_files: bool,
 }
 
 impl VolumeManager {
@@ -19,8 +21,8 @@ impl VolumeManager {
         }
     }
 
-    pub fn add_volume(&mut self, drive_letter: &str, _is_admin: bool) -> Result<()> {
-        let monitor = VolumeMonitor::new(drive_letter.to_string());
+    pub fn add_volume(&mut self, drive_letter: &str, _is_admin: bool, include_hidden_files: bool, include_system_files: bool) -> Result<()> {
+        let monitor = VolumeMonitor::new(drive_letter.to_string(), include_hidden_files, include_system_files);
         self.volumes.insert(drive_letter.to_string(), monitor);
         Ok(())
     }
@@ -188,24 +190,44 @@ impl VolumeManager {
 }
 
 impl VolumeMonitor {
-    pub fn new(drive_letter: String) -> Self {
+    pub fn new(drive_letter: String, include_hidden_files: bool, include_system_files: bool) -> Self {
         Self {
             drive_letter,
             files: Vec::new(),
+            include_hidden_files,
+            include_system_files,
         }
     }
 
     pub fn scan(&mut self) -> Result<usize> {
-        let path = format!("{}\\", self.drive_letter);
-
+        // 清空文件列表，避免重复添加
         self.files.clear();
-
+        
+        // 确保路径以"\"结尾
+        let path = if self.drive_letter.ends_with('\\') {
+            self.drive_letter.clone()
+        } else {
+            format!("{}\\" , self.drive_letter)
+        };
+        
         let walker = walkdir::WalkDir::new(&path)
             .max_depth(10)
+            .follow_links(self.include_hidden_files)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                !name.starts_with('.') && !name.eq_ignore_ascii_case("$Recycle.Bin")
+                
+                // 始终跳过 $Recycle.Bin 目录
+                if name.eq_ignore_ascii_case("$Recycle.Bin") {
+                    return false;
+                }
+                
+                // 如果不需要扫描隐藏文件，跳过以 . 开头的文件和目录
+                if !self.include_hidden_files && name.starts_with('.') {
+                    return false;
+                }
+                
+                true
             });
 
         let mut count = 0;
@@ -264,16 +286,34 @@ impl VolumeMonitor {
     }
 
     pub fn scan_with_progress_callback(&mut self, handle: &tauri::AppHandle) -> Result<usize> {
-        let path = format!("{}\\", self.drive_letter);
-
+        // 清空文件列表，避免重复添加
         self.files.clear();
-
+        
+        // 确保路径以"\"结尾
+        let path = if self.drive_letter.ends_with('\\') {
+            self.drive_letter.clone()
+        } else {
+            format!("{}\\" , self.drive_letter)
+        };
+        
         let walker = walkdir::WalkDir::new(&path)
             .max_depth(10)
+            .follow_links(self.include_hidden_files)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                !name.starts_with('.') && !name.eq_ignore_ascii_case("$Recycle.Bin")
+                
+                // 始终跳过 $Recycle.Bin 目录
+                if name.eq_ignore_ascii_case("$Recycle.Bin") {
+                    return false;
+                }
+                
+                // 如果不需要扫描隐藏文件，跳过以 . 开头的文件和目录
+                if !self.include_hidden_files && name.starts_with('.') {
+                    return false;
+                }
+                
+                true
             });
 
         let mut count = 0;
@@ -330,10 +370,7 @@ impl VolumeMonitor {
             if count > 0 && count % 20000 == 0 {
                 let _ = handle.emit(
                     "scan-progress",
-                    serde_json::json!({
-                        "volume": self.drive_letter,
-                        "count": count
-                    }),
+                    serde_json::json!({"volume": self.drive_letter, "count": count}),
                 );
             }
         }

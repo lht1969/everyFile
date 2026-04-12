@@ -49,8 +49,13 @@ pub async fn add_volume(
     log::info!("Adding volume: {}", volume);
     
     let is_admin = crate::fs::is_elevated();
+    // 加载配置，获取索引设置
+    let config = crate::config::Config::load().ok();
+    let include_hidden_files = config.as_ref().map(|c| c.index_settings.include_hidden_files).unwrap_or(false);
+    let include_system_files = config.as_ref().map(|c| c.index_settings.include_system_files).unwrap_or(false);
+    
     let mut vm = state.volume_manager.lock().await;
-    vm.add_volume(&volume, is_admin).map_err(|e| e.to_string())?;
+    vm.add_volume(&volume, is_admin, include_hidden_files, include_system_files).map_err(|e| e.to_string())?;
     
     if let Some(mut monitor) = vm.take_monitor(&volume) {
         let _ = monitor.scan();
@@ -93,10 +98,15 @@ pub async fn refresh_volumes(
     
     let volumes = get_ntfs_volumes().map_err(|e| e.to_string())?;
     
+    // 加载配置，获取索引设置
+    let config = crate::config::Config::load().ok();
+    let include_hidden_files = config.as_ref().map(|c| c.index_settings.include_hidden_files).unwrap_or(false);
+    let include_system_files = config.as_ref().map(|c| c.index_settings.include_system_files).unwrap_or(false);
+    
     for volume in &volumes {
         if !vm.volumes().contains(&volume.drive_letter) {
             let is_admin = crate::fs::is_elevated();
-            let _ = vm.add_volume(&volume.drive_letter, is_admin);
+            let _ = vm.add_volume(&volume.drive_letter, is_admin, include_hidden_files, include_system_files);
         }
     }
     

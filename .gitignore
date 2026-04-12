@@ -1,3 +1,5 @@
 node_modules/
-target/
+src-tauri/target/
 .trae/
+node_modules
+.vscode/

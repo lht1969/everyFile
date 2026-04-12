@@ -35,10 +35,15 @@ impl IndexManager {
 
         let volumes = get_ntfs_volumes()?;
         
+        // 加载配置，获取索引设置
+        let config = crate::config::Config::load().ok();
+        let include_hidden_files = config.as_ref().map(|c| c.index_settings.include_hidden_files).unwrap_or(false);
+        let include_system_files = config.as_ref().map(|c| c.index_settings.include_system_files).unwrap_or(false);
+        
         let mut vm = self.volume_manager.lock().await;
         
         for volume in &volumes {
-            vm.add_volume(&volume.drive_letter, is_admin)?;
+            vm.add_volume(&volume.drive_letter, is_admin, include_hidden_files, include_system_files)?;
         }
 
         for volume in &volumes {

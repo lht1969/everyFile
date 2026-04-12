@@ -101,7 +101,7 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
       alert('配置正在加载中，请稍后再试');
       return;
     }
-    
+
     console.log('Config before processing:', config);
     const { monitored_volumes, ...configWithoutVolumes } = config;
     const configToSave = {
@@ -109,7 +109,7 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
       monitored_volumes: monitoredVolumes.map(v => v.drive_letter),
     };
     console.log('Saving config:', configToSave);
-    
+
     // 调用 save_config 命令，传递用户修改后的配置
     console.log('Before invoke save_config');
     invoke('save_config', {
@@ -152,7 +152,7 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
           <h2>设置</h2>
           <button className="close-button" onClick={onClose}>×</button>
         </div>
-        
+
         <div className="modal-body">
           <section className="settings-section">
             <h3>卷管理</h3>
@@ -172,7 +172,7 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
                   </ul>
                 )}
               </div>
-              
+
               <div className="volume-group">
                 <h4>可用卷</h4>
                 {volumes
