@@ -137,9 +137,9 @@ fn main() {
                         }
                     }
                 } else {
-                    // 如果不是管理员，默认添加 D 盘
-                    if let Err(e) = volume_manager.add_volume("D:", is_admin, include_hidden_files, include_system_files) {
-                        log::warn!("Failed to add volume D:: {}", e);
+                    // 如果不是管理员，默认添加 C 盘
+                    if let Err(e) = volume_manager.add_volume("C:", is_admin, include_hidden_files, include_system_files) {
+                        log::warn!("Failed to add volume C:: {}", e);
                     }
                 }
 
