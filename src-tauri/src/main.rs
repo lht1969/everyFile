@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
  * 功能：
  * 1. 初始化日志系统
  * 2. 解析命令行参数，检查是否为静默模式
- * 3. 创建音量管理器
+ * 3. 创建卷管理器
  * 4. 配置 Tauri 应用
  * 5. 设置窗口关闭事件处理
  * 6. 初始化应用设置
@@ -48,7 +48,7 @@ fn main() {
         info!("Starting in silent mode");
     }
 
-    // 创建音量管理器，使用 Arc<Mutex> 实现线程安全
+    // 创建卷管理器，使用 Arc<Mutex> 实现线程安全
     let volume_manager = Arc::new(Mutex::new(VolumeManager::new()));
 
     // 构建 Tauri 应用
@@ -61,7 +61,7 @@ fn main() {
         .manage(AppState {
             // 创建索引管理器，使用 everything.db 作为数据库
             index_manager: index::IndexManager::new(std::path::Path::new("everything.db")).unwrap(),
-            // 克隆音量管理器到应用状态
+            // 克隆卷管理器到应用状态
             volume_manager: volume_manager.clone(),
         })
         // 设置窗口事件处理
@@ -81,7 +81,7 @@ fn main() {
             // 记录应用设置开始
             info!("Application setup started");
 
-            // 克隆音量管理器和应用句柄
+            // 克隆卷管理器和应用句柄
             let vm = volume_manager.clone();
             let handle = app.handle().clone();
             let handle_for_tray = app.handle().clone();
@@ -98,7 +98,7 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 // 检查是否以管理员身份运行
                 let is_admin = fs::is_elevated();
-                // 获取音量管理器的锁
+                // 获取卷管理器的锁
                 let mut volume_manager = vm.lock().await;
                 
                 // 加载配置
@@ -160,17 +160,17 @@ fn main() {
                                 "count": count
                             }));
                         }
-                        // 将监控器返回给音量管理器
+                        // 将监控器返回给卷管理器
                         volume_manager.return_monitor(&drive_letter, m);
                     }
                 }
                 
-                // 释放音量管理器锁
+                // 释放卷管理器锁
                 drop(volume_manager);
 
                 // 如果以管理员身份运行，启动增量更新任务
                 if is_admin {
-                    // 克隆音量管理器和应用句柄
+                    // 克隆卷管理器和应用句柄
                     let vm_clone = vm.clone();
                     let handle_clone = handle.clone();
                     
@@ -180,7 +180,7 @@ fn main() {
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                             
-                            // 获取音量管理器的锁
+                            // 获取卷管理器的锁
                             let mut volume_manager = vm_clone.lock().await;
                             
                             // 对每个卷执行增量扫描
@@ -200,7 +200,7 @@ fn main() {
                                         }
                                     }
                                 }
-                                // 将监控器返回给音量管理器
+                                // 将监控器返回给卷管理器
                                 if let Some(m) = monitor {
                                     volume_manager.return_monitor(&drive_letter, m);
                                 }
