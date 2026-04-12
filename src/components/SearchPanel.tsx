@@ -62,16 +62,28 @@ function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
   return (
     <div className="search-panel">
       <form onSubmit={handleSubmit} className="search-form">
-        <input
-          type="text"
-          className="search-input"
-          placeholder="搜索文件... (支持 size: datemodified: path: regex:)"
-          defaultValue={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={handleKeyDown}
-          autoFocus
-          autoComplete="off"
-        />
+        <div className="search-input-container">
+          <input
+            type="text"
+            className="search-input"
+            placeholder="搜索文件... (支持 size: datemodified: path: regex:)"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={handleKeyDown}
+            autoFocus
+            autoComplete="off"
+          />
+          {query.length > 0 && (
+            <button 
+              type="button" 
+              className="clear-button" 
+              onClick={() => setQuery('')}
+              title="清空搜索框"
+            >
+              ×
+            </button>
+          )}
+        </div>
         <label className="filter-checkbox">
           <input
             type="checkbox"

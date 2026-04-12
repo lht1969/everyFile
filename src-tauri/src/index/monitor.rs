@@ -187,6 +187,12 @@ impl VolumeManager {
     pub fn process_all_events(&mut self) -> Result<usize> {
         Ok(0)
     }
+
+    pub fn remove_file(&mut self, file_path: &str) {
+        for monitor in self.volumes.values_mut() {
+            monitor.remove_file(file_path);
+        }
+    }
 }
 
 impl VolumeMonitor {
@@ -391,6 +397,10 @@ impl VolumeMonitor {
 
     pub fn clear_index(&mut self) {
         self.files.clear();
+    }
+
+    pub fn remove_file(&mut self, file_path: &str) {
+        self.files.retain(|f| f.path != file_path);
     }
 
     fn search(&self, query: &str) -> Vec<SearchResult> {

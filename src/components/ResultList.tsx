@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from 'react';
+import { useState, useMemo, useRef, useEffect } from 'react';
 
 interface SearchResult {
   file_id: number;
@@ -35,8 +35,19 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string; isDirectory: boolean } | null>(null);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
+  const [showTooltip, setShowTooltip] = useState(false);
   const resultBodyRef = useRef<HTMLDivElement>(null);
+  const hoverTimeoutRef = useRef<number | null>(null);
   const ROW_HEIGHT = 24;
+
+  // 清理定时器
+  useEffect(() => {
+    return () => {
+      if (hoverTimeoutRef.current) {
+        clearTimeout(hoverTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const sortedResults = useMemo(() => {
     return [...results].sort((a, b) => {
@@ -144,6 +155,12 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
 
   const handleContextMenu = (e: React.MouseEvent, path: string, isDirectory: boolean) => {
     e.preventDefault();
+    // 右键点击时立即关闭提示
+    setShowTooltip(false);
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current);
+      hoverTimeoutRef.current = null;
+    }
     setContextMenu({ x: e.clientX, y: e.clientY, path, isDirectory });
   };
 
@@ -152,9 +169,27 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
   const handleMouseEnter = (e: React.MouseEvent, index: number, data: SearchResult) => {
     const rect = (e.target as HTMLElement).getBoundingClientRect();
     setHoveredItem({ index, x: rect.left, y: rect.bottom, data });
+    
+    // 清除之前的定时器
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current);
+    }
+    
+    // 500毫秒后显示提示
+    hoverTimeoutRef.current = setTimeout(() => {
+      setShowTooltip(true);
+    }, 500);
   };
 
-  const handleMouseLeave = () => setHoveredItem(null);
+  const handleMouseLeave = () => {
+    // 清除定时器并隐藏提示
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current);
+      hoverTimeoutRef.current = null;
+    }
+    setHoveredItem(null);
+    setShowTooltip(false);
+  };
 
   return (
     <div className="result-list" tabIndex={0} onKeyDown={handleKeyDown} onClick={closeContextMenu}>
@@ -277,7 +312,7 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
           )}
         </div>
       )}
-      {hoveredItem && (
+      {hoveredItem && showTooltip && (
         <div 
           className="hover-tooltip"
           style={{ left: hoveredItem.x, top: hoveredItem.y }}
