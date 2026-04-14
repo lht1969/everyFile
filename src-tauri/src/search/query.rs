@@ -179,7 +179,7 @@ impl SearchQuery {
         } else if date_str.starts_with("=") {
             ("=", &date_str[1..])
         } else {
-            (">=", date_str)
+            ("=", date_str)
         };
 
         let operator = match operator_str {
@@ -233,27 +233,6 @@ impl SearchQuery {
                 end: None,
             })
         }
-    }
-
-    pub fn matches(&self, name: &str) -> bool {
-        if self.keywords.is_empty() {
-            return true;
-        }
-
-        let name_lower = name.to_lowercase();
-
-        for keyword in &self.keywords {
-            let keyword_lower = keyword.to_lowercase();
-            if !name_lower.contains(&keyword_lower) {
-                return false;
-            }
-        }
-
-        if let Some(ref pattern) = self.regex_pattern {
-            return pattern.is_match(name);
-        }
-
-        true
     }
 }
 
