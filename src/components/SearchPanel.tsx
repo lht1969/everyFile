@@ -3,14 +3,14 @@ import { useState, useEffect } from 'react';
 interface SearchPanelProps {
   onSearch: (query: string, filesOnly?: boolean, directoriesOnly?: boolean) => void;
   onOpenSettings: () => void;
-  isAdmin: boolean;
+  onExport?: (format: 'csv' | 'txt' | 'json') => void;
 }
 
-function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
+function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState<string[]>([]);
-  const [filesOnly, setFilesOnly] = useState(true);
-  const [directoriesOnly, setDirectoriesOnly] = useState(false);
+  const [filterType, setFilterType] = useState<'files' | 'directories'>('files');
+  const [exportFormat, setExportFormat] = useState('');
 
   useEffect(() => {
     const debounce = setTimeout(() => {
@@ -22,6 +22,13 @@ function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
     }, 300);
     return () => clearTimeout(debounce);
   }, [query]);
+
+  useEffect(() => {
+    const debounce = setTimeout(() => {
+      onSearch(query, filterType === 'files', filterType === 'directories');
+    }, 150);
+    return () => clearTimeout(debounce);
+  }, [query, filterType]);
 
   const fetchSuggestions = async (searchQuery: string) => {
     try {
@@ -38,25 +45,17 @@ function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onSearch(query, filesOnly, directoriesOnly);
+    onSearch(query, filterType === 'files', filterType === 'directories');
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
-      onSearch(query, filesOnly, directoriesOnly);
+      onSearch(query, filterType === 'files', filterType === 'directories');
     }
   };
 
-  const handleFilesOnlyChange = (checked: boolean) => {
-    setFilesOnly(checked);
-    if (checked) setDirectoriesOnly(false);
-    onSearch(query, checked, false);
-  };
-
-  const handleDirectoriesOnlyChange = (checked: boolean) => {
-    setDirectoriesOnly(checked);
-    if (checked) setFilesOnly(false);
-    onSearch(query, false, checked);
+  const handleFilterChange = (value: string) => {
+    setFilterType(value as 'files' | 'directories');
   };
 
   return (
@@ -66,7 +65,7 @@ function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
           <input
             type="text"
             className="search-input"
-            placeholder="搜索文件... (支持 size: datemodified: path: regex:)"
+            placeholder="搜索文件... (支持 1.size:=<> 2.datemodified:/datecreated:/dateaccessed:=<> 3.path: 4.regex:)"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -74,9 +73,9 @@ function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
             autoComplete="off"
           />
           {query.length > 0 && (
-            <button 
-              type="button" 
-              className="clear-button" 
+            <button
+              type="button"
+              className="clear-button"
               onClick={() => setQuery('')}
               title="清空搜索框"
             >
@@ -84,26 +83,34 @@ function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
             </button>
           )}
         </div>
-        <label className="filter-checkbox">
-          <input
-            type="checkbox"
-            checked={filesOnly}
-            onChange={(e) => handleFilesOnlyChange(e.target.checked)}
-          />
-          仅文件
-        </label>
-        <label className="filter-checkbox">
-          <input
-            type="checkbox"
-            checked={directoriesOnly}
-            onChange={(e) => handleDirectoriesOnlyChange(e.target.checked)}
-          />
-          仅目录
-        </label>
-        <button type="submit" className="search-button">
-          搜索
-        </button>
-        <button type="button" className="settings-button" onClick={onOpenSettings} title="设置">
+        <select
+          className="filter-select"
+          value={filterType}
+          onChange={(e) => handleFilterChange(e.target.value)}
+        >
+          <option value="files">仅文件</option>
+          <option value="directories">仅文件夹</option>
+        </select>
+        {onExport && (
+          <select
+            className="export-select"
+            title="导出..."
+            value={exportFormat}
+            onChange={(e) => {
+              const format = e.target.value;
+              if (format) {
+                onExport(format as 'csv' | 'txt' | 'json');
+                setExportFormat('');
+              }
+            }}
+          >
+            <option value="">导出...</option>
+            <option value="csv">CSV</option>
+            <option value="txt">TXT</option>
+            <option value="json">JSON</option>
+          </select>
+        )}
+        <button type="button"  className="settings-button" onClick={onOpenSettings} title="设置">
           ⚙
         </button>
       </form>
@@ -114,11 +121,6 @@ function SearchPanel({ onSearch, onOpenSettings, isAdmin }: SearchPanelProps) {
               {s}
             </div>
           ))}
-        </div>
-      )}
-      {!isAdmin && (
-        <div className="admin-warning">
-          ⚠ 非管理员模式，部分功能可能受限
         </div>
       )}
     </div>

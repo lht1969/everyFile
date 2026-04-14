@@ -67,16 +67,12 @@ pub async fn search_files(
 
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(100);
-    let max_results = 1000000;
+    let max_results = 5000000;
 
     let vm = state.volume_manager.lock().await;
-    let mut all_results = vm.search_with_options(&params.query, &options);
+    let (all_results, total_matches) = vm.search_with_options(&params.query, &options);
     
-    if all_results.len() > max_results {
-        all_results.truncate(max_results);
-    }
-    
-    let total = all_results.len();
+    let total = total_matches;
     let total_pages = (total + page_size - 1) / page_size;
     
     let start = (page - 1) * page_size;

@@ -9,6 +9,7 @@ pub struct SearchQuery {
     pub size_filter: Option<SizeFilter>,
     pub date_filter: Option<DateFilter>,
     pub path_filter: Option<String>,
+    pub path_filter_dir_only: bool,
     pub regex_pattern: Option<Regex>,
 }
 
@@ -30,8 +31,19 @@ pub enum SizeOperator {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DateFilter {
     pub date_type: DateType,
+    pub operator: DateOperator,
+    pub date: Option<DateTime<Local>>,
     pub start: Option<DateTime<Local>>,
     pub end: Option<DateTime<Local>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DateOperator {
+    Equal,
+    GreaterThan,
+    LessThan,
+    GreaterOrEqual,
+    LessOrEqual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,6 +59,7 @@ impl SearchQuery {
         let mut size_filter = None;
         let mut date_filter = None;
         let mut path_filter = None;
+        let mut path_filter_dir_only = false;
         let mut regex_pattern = None;
 
         let parts: Vec<&str> = query_str.split_whitespace().collect();
@@ -60,7 +73,13 @@ impl SearchQuery {
             {
                 date_filter = Self::parse_date_filter(part);
             } else if part.starts_with("path:") {
-                path_filter = Some(part[5..].to_string());
+                let path_part = &part[5..];
+                if path_part.ends_with(" folders") || path_part.ends_with(" folder") {
+                    path_filter_dir_only = true;
+                    path_filter = Some(path_part[..path_part.len() - 8].trim_end().to_string());
+                } else {
+                    path_filter = Some(path_part.to_string());
+                }
             } else if part.starts_with("regex:") {
                 if let Ok(re) = Regex::new(&part[6..]) {
                     regex_pattern = Some(re);
@@ -75,6 +94,7 @@ impl SearchQuery {
             size_filter,
             date_filter,
             path_filter,
+            path_filter_dir_only,
             regex_pattern,
         }
     }
@@ -136,7 +156,7 @@ impl SearchQuery {
     }
 
     fn parse_date_filter(part: &str) -> Option<DateFilter> {
-        let (date_type_str, date_str) = if part.starts_with("datemodified:") {
+        let (date_type_str, after_prefix) = if part.starts_with("datemodified:") {
             (DateType::Modified, &part[13..])
         } else if part.starts_with("datecreated:") {
             (DateType::Created, &part[12..])
@@ -146,34 +166,73 @@ impl SearchQuery {
             return None;
         };
 
-        let date_str = date_str.trim();
+        let date_str = after_prefix.trim();
 
-        let date = match date_str {
-            "today" => Some(Local::now().date_naive()),
-            "yesterday" => Some(Local::now().date_naive().pred_opt()?),
-            "thisweek" => None,
-            "thismonth" => None,
-            "thisyear" => None,
-            _ => chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                .ok()
-                .map(|d| d),
+        let (operator_str, date_value_str) = if date_str.starts_with(">=") {
+            (">=", &date_str[2..])
+        } else if date_str.starts_with("<=") {
+            ("<=", &date_str[2..])
+        } else if date_str.starts_with(">") {
+            (">", &date_str[1..])
+        } else if date_str.starts_with("<") {
+            ("<", &date_str[1..])
+        } else if date_str.starts_with("=") {
+            ("=", &date_str[1..])
+        } else {
+            (">=", date_str)
         };
 
-        Some(DateFilter {
-            date_type: date_type_str,
-            start: date.map(|d| {
-                d.and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc()
-                    .with_timezone(&Local)
-            }),
-            end: date.map(|d| {
-                d.and_hms_opt(23, 59, 59)
-                    .unwrap()
-                    .and_utc()
-                    .with_timezone(&Local)
-            }),
-        })
+        let operator = match operator_str {
+            ">" => DateOperator::GreaterThan,
+            "<" => DateOperator::LessThan,
+            "=" => DateOperator::Equal,
+            ">=" => DateOperator::GreaterOrEqual,
+            "<=" => DateOperator::LessOrEqual,
+            _ => DateOperator::GreaterOrEqual,
+        };
+
+        let parsed_date = match date_value_str {
+            "today" => Some(Local::now().date_naive()),
+            "yesterday" => Some(Local::now().date_naive().pred_opt()?),
+            _ => {
+                let formats = ["%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"];
+                let mut result = None;
+                for fmt in &formats {
+                    if let Ok(d) = chrono::NaiveDate::parse_from_str(date_value_str, fmt) {
+                        result = Some(d);
+                        break;
+                    }
+                }
+                result
+            }
+        };
+
+        if let Some(date) = parsed_date {
+            let start = date.and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .with_timezone(&Local);
+            let end = date.and_hms_opt(23, 59, 59)
+                .unwrap()
+                .and_utc()
+                .with_timezone(&Local);
+
+            Some(DateFilter {
+                date_type: date_type_str,
+                operator,
+                date: Some(start),
+                start: Some(start),
+                end: Some(end),
+            })
+        } else {
+            Some(DateFilter {
+                date_type: date_type_str,
+                operator,
+                date: None,
+                start: None,
+                end: None,
+            })
+        }
     }
 
     pub fn matches(&self, name: &str) -> bool {

@@ -13,11 +13,9 @@ interface SearchResult {
 
 interface ResultListProps {
   results: SearchResult[];
-  isSearching: boolean;
   onOpenFile: (path: string) => void;
   onOpenFolder: (path: string) => void;
   onDeleteFile?: (path: string) => void;
-  onExport: (format: 'csv' | 'txt' | 'json') => void;
   pagination?: {
     page: number;
     total: number;
@@ -29,7 +27,7 @@ interface ResultListProps {
 type SortField = 'name' | 'size' | 'modified_time';
 type SortDirection = 'asc' | 'desc';
 
-function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFile, onExport, pagination }: ResultListProps) {
+function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultListProps) {
   const [sortField, setSortField] = useState<SortField>('name');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -40,7 +38,17 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
   const hoverTimeoutRef = useRef<number | null>(null);
   const ROW_HEIGHT = 24;
 
-  // 清理定时器
+  const getDirectoryPath = (path: string, isDirectory: boolean): string => {
+    if (isDirectory) {
+      return path.endsWith('\\') ? path : path + '\\';
+    }
+    const lastBackslash = path.lastIndexOf('\\');
+    if (lastBackslash > 0) {
+      return path.substring(0, lastBackslash);
+    }
+    return path;
+  };
+
   useEffect(() => {
     return () => {
       if (hoverTimeoutRef.current) {
@@ -155,7 +163,6 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
 
   const handleContextMenu = (e: React.MouseEvent, path: string, isDirectory: boolean) => {
     e.preventDefault();
-    // 右键点击时立即关闭提示
     setShowTooltip(false);
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
@@ -170,19 +177,16 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
     const rect = (e.target as HTMLElement).getBoundingClientRect();
     setHoveredItem({ index, x: rect.left, y: rect.bottom, data });
     
-    // 清除之前的定时器
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
     }
     
-    // 500毫秒后显示提示
     hoverTimeoutRef.current = setTimeout(() => {
       setShowTooltip(true);
     }, 500);
   };
 
   const handleMouseLeave = () => {
-    // 清除定时器并隐藏提示
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
       hoverTimeoutRef.current = null;
@@ -193,68 +197,6 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
 
   return (
     <div className="result-list" tabIndex={0} onKeyDown={handleKeyDown} onClick={closeContextMenu}>
-      <div className="result-header">
-        <div className="result-left">
-          <div className="result-count">
-            {isSearching ? '搜索中...' : `${results.length} 个结果`}
-          </div>
-          {pagination && pagination.total_pages > 1 && (
-            <div className="pagination">
-              <button 
-                disabled={pagination.page <= 1}
-                onClick={() => pagination.onPageChange(1)}
-              >第一页</button>
-              <button 
-                disabled={pagination.page <= 1}
-                onClick={() => pagination.onPageChange(pagination.page - 1)}
-              >上一页</button>
-              <span>
-                <input 
-                  type="number" 
-                  min={1}
-                  max={pagination.total_pages}
-                  defaultValue={pagination.page}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      const page = parseInt((e.target as HTMLInputElement).value);
-                      if (page >= 1 && page <= pagination.total_pages) {
-                        pagination.onPageChange(page);
-                      }
-                    }
-                  }}
-                  onBlur={(e) => {
-                    const page = parseInt((e.target as HTMLInputElement).value);
-                    if (page >= 1 && page <= pagination.total_pages) {
-                      pagination.onPageChange(page);
-                    }
-                  }}
-                  className="page-input"
-                />
-                / {pagination.total_pages}
-              </span>
-              <button 
-                disabled={pagination.page >= pagination.total_pages}
-                onClick={() => pagination.onPageChange(pagination.page + 1)}
-              >下一页</button>
-              <button 
-                disabled={pagination.page >= pagination.total_pages}
-                onClick={() => pagination.onPageChange(pagination.total_pages)}
-              >最后一页</button>
-            </div>
-          )}
-        </div>
-        <div className="export-buttons">
-          <select onChange={(e) => {
-            const format = e.target.value;
-            if (format) onExport(format as 'csv' | 'txt' | 'json');
-          }} defaultValue="">
-            <option value="" disabled>导出...</option>
-            <option value="csv">CSV</option>
-            <option value="txt">TXT</option>
-            <option value="json">JSON</option>
-          </select>
-        </div>
-      </div>
       <div className="result-table">
         <div className="result-row header">
           <div className="col-name" onClick={() => handleSort('name')}>
@@ -271,7 +213,7 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
         <div className="result-body" ref={resultBodyRef}>
           {sortedResults.map((result, index) => (
             <div
-              key={result.file_id}
+              key={result.path}
               className={`result-row ${index === selectedIndex ? 'selected' : ''}`}
               onClick={() => handleRowClick(index)}
               onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
@@ -283,7 +225,7 @@ function ResultList({ results, isSearching, onOpenFile, onOpenFolder, onDeleteFi
                 <span className="file-icon">{result.is_directory ? '📁' : '📄'}</span>
                 {result.name}
               </div>
-              <div className="col-path" title={result.path}>{result.path}</div>
+              <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
               <div className="col-size">{result.formatted_size}</div>
               <div className="col-modified">{result.formatted_modified_time}</div>
             </div>

@@ -65,7 +65,7 @@ impl VolumeManager {
             .collect()
     }
 
-    pub fn search_with_options(&self, query: &str, options: &SearchOptions) -> Vec<SearchResult> {
+    pub fn search_with_options(&self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
         log::info!(
             "search_with_options: query='{}', files_only={}, directories_only={}, volumes count={}",
             query,
@@ -74,43 +74,68 @@ impl VolumeManager {
             self.volumes.len()
         );
 
-        let parsed_query = crate::search::query::SearchQuery::parse(query);
+        let effective_limit = if query.trim().is_empty() {
+            usize::MAX
+        } else {
+            std::cmp::min(options.limit, 1000)
+        };
 
-        let mut results: Vec<SearchResult> = self
-            .volumes
-            .values()
-            .flat_map(|v| v.search_with_query(&parsed_query))
-            .collect();
+        let mut results: Vec<SearchResult> = Vec::new();
+        let mut total_count = 0;
 
-        log::info!("After search_with_query: {} results", results.len());
+        for monitor in self.volumes.values() {
+            let volume_results = if query.trim().is_empty() {
+                monitor.get_all_files()
+            } else {
+                let parsed_query = crate::search::query::SearchQuery::parse(query);
+                monitor.search_with_query(&parsed_query)
+            };
 
-        if options.files_only {
-            let before = results.len();
-            results.retain(|r| !r.is_directory);
-            log::info!(
-                "After files_only filter: {} (removed {})",
-                results.len(),
-                before - results.len()
-            );
+            if query.trim().is_empty() {
+                for file in &monitor.files {
+                    if options.files_only && file.is_directory {
+                        continue;
+                    }
+                    if options.directories_only && !file.is_directory {
+                        continue;
+                    }
+
+                    total_count += 1;
+                }
+            } else {
+                for result in &volume_results {
+                    if options.files_only && result.is_directory {
+                        continue;
+                    }
+                    if options.directories_only && !result.is_directory {
+                        continue;
+                    }
+
+                    total_count += 1;
+                }
+            }
+
+            for result in volume_results {
+                if options.files_only && result.is_directory {
+                    continue;
+                }
+                if options.directories_only && !result.is_directory {
+                    continue;
+                }
+
+                results.push(result);
+
+                if results.len() >= effective_limit {
+                    break;
+                }
+            }
         }
 
-        if options.directories_only {
-            let before = results.len();
-            results.retain(|r| r.is_directory);
-            log::info!(
-                "After directories_only filter: {} (removed {})",
-                results.len(),
-                before - results.len()
-            );
-        }
+        log::info!("After search_with_query: {} results, total: {}", results.len(), total_count);
 
         self.sort_results(&mut results, options);
 
-        if results.len() > options.limit {
-            results.truncate(options.limit);
-        }
-
-        results
+        (results, total_count)
     }
 
     pub fn search_all(
@@ -206,33 +231,29 @@ impl VolumeMonitor {
     }
 
     pub fn scan(&mut self) -> Result<usize> {
-        // 清空文件列表，避免重复添加
         self.files.clear();
-        
-        // 确保路径以"\"结尾
+
         let path = if self.drive_letter.ends_with('\\') {
             self.drive_letter.clone()
         } else {
             format!("{}\\" , self.drive_letter)
         };
-        
+
         let walker = walkdir::WalkDir::new(&path)
             .max_depth(10)
             .follow_links(self.include_hidden_files)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                
-                // 始终跳过 $Recycle.Bin 目录
+
                 if name.eq_ignore_ascii_case("$Recycle.Bin") {
                     return false;
                 }
-                
-                // 如果不需要扫描隐藏文件，跳过以 . 开头的文件和目录
+
                 if !self.include_hidden_files && name.starts_with('.') {
                     return false;
                 }
-                
+
                 true
             });
 
@@ -292,33 +313,29 @@ impl VolumeMonitor {
     }
 
     pub fn scan_with_progress_callback(&mut self, handle: &tauri::AppHandle) -> Result<usize> {
-        // 清空文件列表，避免重复添加
         self.files.clear();
-        
-        // 确保路径以"\"结尾
+
         let path = if self.drive_letter.ends_with('\\') {
             self.drive_letter.clone()
         } else {
             format!("{}\\" , self.drive_letter)
         };
-        
+
         let walker = walkdir::WalkDir::new(&path)
             .max_depth(10)
             .follow_links(self.include_hidden_files)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                
-                // 始终跳过 $Recycle.Bin 目录
+
                 if name.eq_ignore_ascii_case("$Recycle.Bin") {
                     return false;
                 }
-                
-                // 如果不需要扫描隐藏文件，跳过以 . 开头的文件和目录
+
                 if !self.include_hidden_files && name.starts_with('.') {
                     return false;
                 }
-                
+
                 true
             });
 
@@ -417,64 +434,91 @@ impl VolumeMonitor {
     }
 
     fn search_with_query(&self, query: &crate::search::query::SearchQuery) -> Vec<SearchResult> {
-        self.files
-            .iter()
-            .filter(|f| {
-                if !query.keywords.is_empty() {
-                    let name_lower = f.name.to_lowercase();
-                    let _path_lower = f.path.to_lowercase();
-                    let mut matched = false;
-                    for keyword in &query.keywords {
-                        let kw_lower = keyword.to_lowercase();
-                        if name_lower.contains(&kw_lower) {
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if !matched {
-                        return false;
-                    }
-                }
+        let mut results = Vec::new();
 
-                if let Some(ref size_filter) = query.size_filter {
-                    if !size_filter.matches(f.size) {
-                        return false;
-                    }
-                }
+        let keywords_lower: Vec<String> = query.keywords.iter()
+            .map(|kw| kw.to_lowercase())
+            .collect();
 
-                if let Some(ref date_filter) = query.date_filter {
+        let path_filter_lower = query.path_filter.as_ref()
+            .map(|pf| pf.to_lowercase());
+
+        for f in &self.files {
+            // 检查关键字 - AND 逻辑：所有关键词都必须匹配
+            if !keywords_lower.is_empty() {
+                let name_lower = f.name.to_lowercase();
+                // 使用 all() 确保所有关键词都被匹配（AND 逻辑）
+                let all_keywords_match = keywords_lower.iter().all(|kw| name_lower.contains(kw));
+                if !all_keywords_match {
+                    continue;
+                }
+            }
+
+            // 检查大小过滤
+            if let Some(ref size_filter) = query.size_filter {
+                if !size_filter.matches(f.size) {
+                    continue;
+                }
+            }
+
+            // 检查日期过滤
+            if let Some(ref date_filter) = query.date_filter {
+                if let Some(ref target_date) = date_filter.date {
                     let time = match date_filter.date_type {
                         crate::search::query::DateType::Created => &f.created_time,
                         crate::search::query::DateType::Modified => &f.modified_time,
                         crate::search::query::DateType::Accessed => &f.accessed_time,
                     };
-                    if let Some(ref start) = date_filter.start {
-                        if time < start {
-                            return false;
+
+                    let target_date_only = target_date.date_naive();
+                    let file_date_only = time.date_naive();
+
+                    let matches = match date_filter.operator {
+                        crate::search::query::DateOperator::Equal => {
+                            file_date_only == target_date_only
                         }
-                    }
-                    if let Some(ref end) = date_filter.end {
-                        if time > end {
-                            return false;
+                        crate::search::query::DateOperator::GreaterThan => {
+                            file_date_only > target_date_only
                         }
+                        crate::search::query::DateOperator::LessThan => {
+                            file_date_only < target_date_only
+                        }
+                        crate::search::query::DateOperator::GreaterOrEqual => {
+                            file_date_only >= target_date_only
+                        }
+                        crate::search::query::DateOperator::LessOrEqual => {
+                            file_date_only <= target_date_only
+                        }
+                    };
+
+                    if !matches {
+                        continue;
                     }
                 }
+            }
 
-                if let Some(ref path_filter) = query.path_filter {
-                    if !f.path.to_lowercase().contains(&path_filter.to_lowercase()) {
-                        return false;
-                    }
+            // 检查路径过滤
+            if let Some(ref path_filter) = path_filter_lower {
+                if !f.path.to_lowercase().contains(path_filter) {
+                    continue;
                 }
+            }
 
-                if let Some(ref regex_pattern) = query.regex_pattern {
-                    if !regex_pattern.is_match(&f.name) {
-                        return false;
-                    }
+            // 检查 path:folders 只返回文件夹
+            if query.path_filter_dir_only && !f.is_directory {
+                continue;
+            }
+
+            // 检查正则表达式
+            if let Some(ref regex_pattern) = query.regex_pattern {
+                if !regex_pattern.is_match(&f.name) {
+                    continue;
                 }
+            }
 
-                true
-            })
-            .cloned()
-            .collect()
+            results.push(f.clone());
+        }
+
+        results
     }
 }

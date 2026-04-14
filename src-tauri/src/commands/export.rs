@@ -33,13 +33,13 @@ pub async fn export_csv(results: Vec<SearchResult>, path: String) -> Result<(), 
 #[tauri::command]
 pub async fn export_txt(results: Vec<SearchResult>, path: String) -> Result<(), String> {
     log::info!("Exporting to TXT: {}", path);
-    
+
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
-    
+
     for r in results {
-        writeln!(file, "{}", r.path).map_err(|e| e.to_string())?;
+        writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size, r.formatted_modified_time, r.is_directory).map_err(|e| e.to_string())?;
     }
-    
+
     Ok(())
 }
 
@@ -80,7 +80,7 @@ pub async fn export_all_results(
         "txt" => {
             let mut file = File::create(&path).map_err(|e| e.to_string())?;
             for r in results {
-                writeln!(file, "{}", r.path).map_err(|e| e.to_string())?;
+                writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size, r.formatted_modified_time, r.is_directory).map_err(|e| e.to_string())?;
             }
         },
         "json" => {

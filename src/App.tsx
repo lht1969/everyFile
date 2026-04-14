@@ -36,7 +36,6 @@ interface IndexStatus {
 
 function App() {
   const [results, setResults] = useState<SearchResult[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
   const [statusMessage, setStatusMessage] = useState('就绪');
   const [indexStatus, setIndexStatus] = useState<IndexStatus>({ status: 'ready', file_count: 0, progress: 1, message: '' });
   const [showSettings, setShowSettings] = useState(false);
@@ -100,30 +99,29 @@ function App() {
     }
   };
 
-  const loadAllFiles = async (page: number = 1) => {
+  const loadAllFiles = async () => {
     try {
       const response = await invoke<SearchResponse>('search_files', {
-        params: { query: '', page, page_size: 1000, files_only: true }
+        params: { query: '', page: 1, page_size: 1000, files_only: true }
       });
       setResults(response.results);
       setPagination({ page: response.page, total: response.total, total_pages: response.total_pages });
-      setStatusMessage(`显示 ${response.results.length} 个文件 (共 ${response.total} 个，第 ${response.page}/${response.total_pages} 页)`);
+      setStatusMessage(`显示 ${response.results.length} 个结果 (共 ${response.total} 个)`);
     } catch (e) {
       console.error('Failed to load all files:', e);
     }
   };
 
-  const handleSearch = useCallback(async (searchQuery: string, filesOnly?: boolean, directoriesOnly?: boolean, page: number = 1) => {
-    setIsSearching(true);
+  const handleSearch = useCallback(async (searchQuery: string, filesOnly?: boolean, directoriesOnly?: boolean) => {
     setStatusMessage(`正在搜索: ${searchQuery}`);
-    
+
     setSearchState({ query: searchQuery, filesOnly: filesOnly ?? true, directoriesOnly: directoriesOnly ?? false });
 
     try {
       const response = await invoke<SearchResponse>('search_files', {
-        params: { 
-          query: searchQuery, 
-          page,
+        params: {
+          query: searchQuery,
+          page: 1,
           page_size: 1000,
           files_only: filesOnly,
           directories_only: directoriesOnly
@@ -131,12 +129,10 @@ function App() {
       });
       setResults(response.results);
       setPagination({ page: response.page, total: response.total, total_pages: response.total_pages });
-      setStatusMessage(`找到 ${response.total} 个结果 (第 ${response.page}/${response.total_pages} 页)`);
+      setStatusMessage(`找到 ${response.total} 个结果`);
     } catch (e) {
       console.error('Search failed:', e);
       setStatusMessage(`搜索失败: ${e}`);
-    } finally {
-      setIsSearching(false);
     }
   }, []);
 
@@ -182,10 +178,11 @@ function App() {
   };
 
   const handleExport = async (format: 'csv' | 'txt' | 'json') => {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const beijingTime = new Date(new Date().getTime() + 8 * 60 * 60 * 1000);
+    const timestamp = beijingTime.toISOString().replace(/[:.]/g, '-');
     const filename = `everything_export_${timestamp}`;
     const ext = format === 'csv' ? 'csv' : format === 'txt' ? 'txt' : 'json';
-    
+
     try {
       const path = await save({
         defaultPath: `${filename}.${ext}`,
@@ -194,7 +191,7 @@ function App() {
           extensions: [ext]
         }]
       });
-      
+
       if (!path) {
         setStatusMessage('导出已取消');
         return;
@@ -228,33 +225,30 @@ function App() {
   return (
     <div className="app">
       <div className="main-content">
-        <SearchPanel 
+        <SearchPanel
           onSearch={handleSearch}
           onOpenSettings={() => setShowSettings(true)}
-          isAdmin={isAdmin}
+          onExport={handleExport}
         />
-        <ResultList 
+        <ResultList
           results={results}
-          isSearching={isSearching}
           onOpenFile={handleOpenFile}
           onOpenFolder={handleOpenFolder}
           onDeleteFile={handleDeleteFile}
-          onExport={handleExport}
-          pagination={pagination.total_pages > 1 ? { ...pagination, onPageChange: (page: number) => handleSearch(searchState.query, searchState.filesOnly, searchState.directoriesOnly, page) } : undefined}
         />
       </div>
-      <StatusBar 
+      <StatusBar
         message={statusMessage}
         indexStatus={indexStatus}
         isAdmin={isAdmin}
       />
       {showSettings && (
-        <SettingsModal 
+        <SettingsModal
           key={Date.now()}
           onClose={() => setShowSettings(false)}
           onRebuildIndex={handleRebuildIndex}
           indexStatus={indexStatus}
-          onVolumeChange={() => loadAllFiles(pagination.page)}
+          onVolumeChange={() => loadAllFiles()}
         />
       )}
     </div>
