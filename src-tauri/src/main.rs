@@ -77,9 +77,11 @@ fn main() {
             last_index_update: last_index_update.clone(),
         })
         // 设置窗口事件处理
-        .on_window_event(|_window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                log::info!("Window close requested");
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                log::info!("Window hidden to tray");
             }
         })
         // 设置应用初始化
