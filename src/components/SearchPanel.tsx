@@ -12,17 +12,26 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
   const [filterType, setFilterType] = useState<'files' | 'directories'>('files');
   const [exportFormat, setExportFormat] = useState('');
   const prevQueryRef = useRef(query);
+  const prevFilterRef = useRef(filterType);
 
   useEffect(() => {
-    const prev = prevQueryRef.current;
+    const prevQuery = prevQueryRef.current;
+    const prevFilter = prevFilterRef.current;
     prevQueryRef.current = query;
-    if (prev.trim() && !query.trim()) {
+    prevFilterRef.current = filterType;
+
+    const filterChanged = prevFilter !== filterType;
+
+    if (prevQuery.trim() && !query.trim()) {
       setSuggestions([]);
       onSearch('', filterType === 'files', filterType === 'directories');
       return;
     }
     if (!query.trim()) {
       setSuggestions([]);
+      if (filterChanged) {
+        onSearch('', filterType === 'files', filterType === 'directories');
+      }
       return;
     }
     const debounce = setTimeout(() => {
