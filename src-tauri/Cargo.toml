@@ -60,6 +60,9 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 rayon = "1.8"
 
+# Base64 encoding for icon data URLs
+base64 = "0.22"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

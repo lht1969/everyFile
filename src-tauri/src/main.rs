@@ -54,6 +54,13 @@ fn main() {
     let is_searching = Arc::new(AtomicBool::new(false));
     let last_index_update = Arc::new(Mutex::new(String::new()));
 
+    // 数据库路径：使用 AppData 目录，避免在 dev 模式下触发文件监听器重建
+    let db_path = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("Everything");
+    std::fs::create_dir_all(&db_path).ok();
+    let db_path = db_path.join("everything.db");
+
     // 构建 Tauri 应用
     tauri::Builder::default()
         // 注册 shell 插件
@@ -62,26 +69,17 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         // 管理应用状态
         .manage(AppState {
-            // 创建索引管理器，使用 everything.db 作为数据库
-            index_manager: index::IndexManager::new(std::path::Path::new("everything.db")).unwrap(),
+            // 创建索引管理器
+            index_manager: index::IndexManager::new(&db_path).unwrap(),
             // 克隆卷管理器到应用状态
             volume_manager: volume_manager.clone(),
             is_searching: is_searching.clone(),
             last_index_update: last_index_update.clone(),
         })
         // 设置窗口事件处理
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                #[cfg(not(debug_assertions))]
-                {
-                    api.prevent_close();
-                    window.hide().unwrap();
-                    log::info!("Window minimized to system tray");
-                }
-                #[cfg(debug_assertions)]
-                {
-                    log::info!("Window close requested (debug mode: allowing close)");
-                }
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                log::info!("Window close requested");
             }
         })
         // 设置应用初始化
@@ -275,6 +273,8 @@ fn main() {
             commands::system::add_startup,
             commands::system::remove_startup,
             commands::system::is_startup_enabled,
+            // 图标相关命令
+            commands::icon::get_file_icon,
         ])
         // 运行应用
         .run(tauri::generate_context!())

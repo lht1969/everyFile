@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tauri::Emitter;
 
-const CACHE_TTL_SECS: u64 = 30;
+const CACHE_TTL_SECS: u64 = 3600;
 
 pub struct SearchCache {
     pub query: String,
@@ -20,6 +20,10 @@ pub struct SearchCache {
 impl SearchCache {
     pub fn is_valid(&self) -> bool {
         self.created_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS)
+    }
+
+    pub fn refresh(&mut self) {
+        self.created_at = Instant::now();
     }
 
     pub fn get_slice(&self, volumes: &HashMap<String, VolumeMonitor>, start: usize, end: usize) -> Vec<SearchResult> {
@@ -202,18 +206,18 @@ impl VolumeManager {
         }
     }
 
-    pub fn get_cached_slice(&self, start: usize, end: usize) -> Option<(Vec<SearchResult>, usize)> {
-        self.search_cache.as_ref().and_then(|cache| {
-            if !cache.is_valid() {
-                return None;
-            }
-            let total = cache.total;
-            if total == 0 {
-                return Some((Vec::new(), 0));
-            }
-            let results = cache.get_slice(&self.volumes, start, end);
-            Some((results, total))
-        })
+    pub fn get_cached_slice(&mut self, start: usize, end: usize) -> Option<(Vec<SearchResult>, usize)> {
+        let cache = self.search_cache.as_mut()?;
+        if !cache.is_valid() {
+            return None;
+        }
+        cache.refresh();
+        let total = cache.total;
+        if total == 0 {
+            return Some((Vec::new(), 0));
+        }
+        let results = cache.get_slice(&self.volumes, start, end);
+        Some((results, total))
     }
 
     pub fn invalidate_cache(&mut self) {

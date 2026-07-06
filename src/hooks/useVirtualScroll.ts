@@ -15,7 +15,9 @@ interface UseVirtualScrollReturn {
   spacerHeight: number;
   visibleItems: number;
   scrollToIndex: (index: number) => void;
+  resetScroll: () => void;
 }
+
 
 export function useVirtualScroll({
   totalItems,
@@ -24,12 +26,14 @@ export function useVirtualScroll({
   containerRef,
   onRangeChange,
 }: UseVirtualScrollOptions): UseVirtualScrollReturn {
-  const [scrollTop, setScrollTop] = useState(0);
+  const [, setTick] = useState(0);
+  const scrollTopRef = useRef(0);
   const rafId = useRef<number | null>(null);
   const lastFiredRef = useRef<string>('');
   const onRangeChangeRef = useRef(onRangeChange);
   onRangeChangeRef.current = onRangeChange;
 
+  const scrollTop = scrollTopRef.current;
   const startIndex = Math.floor(scrollTop / itemHeight);
   const viewportHeight = containerRef.current?.clientHeight ?? 0;
   const visibleCount = Math.ceil(viewportHeight / itemHeight) + overscan;
@@ -37,21 +41,14 @@ export function useVirtualScroll({
   const offsetY = startIndex * itemHeight;
   const spacerHeight = totalItems * itemHeight;
 
-  useEffect(() => {
-    const key = `${startIndex}-${endIndex}`;
-    if (key !== lastFiredRef.current) {
-      lastFiredRef.current = key;
-      onRangeChangeRef.current?.(startIndex, endIndex);
-    }
-  }, [startIndex, endIndex]);
-
   const handleScroll = useCallback(() => {
     if (rafId.current !== null) {
       cancelAnimationFrame(rafId.current);
     }
     rafId.current = requestAnimationFrame(() => {
       if (containerRef.current) {
-        setScrollTop(containerRef.current.scrollTop);
+        scrollTopRef.current = containerRef.current.scrollTop;
+        setTick(t => t + 1);
       }
       rafId.current = null;
     });
@@ -70,11 +67,29 @@ export function useVirtualScroll({
     };
   }, [containerRef, handleScroll]);
 
+  useEffect(() => {
+    const key = `${startIndex}-${endIndex}`;
+    if (key !== lastFiredRef.current) {
+      lastFiredRef.current = key;
+      onRangeChangeRef.current?.(startIndex, endIndex);
+    }
+  }, [startIndex, endIndex, totalItems]);
+
   const scrollToIndex = useCallback((index: number) => {
     if (containerRef.current) {
       containerRef.current.scrollTop = index * itemHeight;
+      scrollTopRef.current = containerRef.current.scrollTop;
+      setTick(t => t + 1);
     }
   }, [containerRef, itemHeight]);
+
+  const resetScroll = useCallback(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = 0;
+    }
+    scrollTopRef.current = 0;
+    setTick(t => t + 1);
+  }, [containerRef]);
 
   return {
     startIndex,
@@ -83,5 +98,6 @@ export function useVirtualScroll({
     spacerHeight,
     visibleItems: endIndex - startIndex,
     scrollToIndex,
+    resetScroll,
   };
 }

@@ -109,7 +109,7 @@ pub async fn get_records_range(
     start: usize,
     end: usize,
 ) -> Result<RecordsRangeResponse, String> {
-    let vm = state.volume_manager.lock().await;
+    let mut vm = state.volume_manager.lock().await;
 
     if let Some((results, total)) = vm.get_cached_slice(start, end) {
         Ok(RecordsRangeResponse {

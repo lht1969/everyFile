@@ -258,10 +258,50 @@ body {
 .result-row {
   display: grid;
   grid-template-columns: 1fr 2fr 100px 150px;
-  gap: 8px;
+  gap: 0;
   padding: 4px 16px;
   border-bottom: 1px solid var(--border-color);
   align-items: center;
+}
+
+.col-size {
+  text-align: right;
+  justify-self: end;
+}
+
+.col-modified {
+  text-align: right;
+  justify-self: end;
+}
+
+.col-resize {
+  position: absolute;
+  right: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+.col-resize:hover {
+  background: var(--primary-color);
+  opacity: 0.4;
+}
+
+.result-row.header > div {
+  position: relative;
+}
+
+.result-row.header > div:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 1px;
+  background: var(--border-color);
+  pointer-events: none;
 }
 
 .result-row.header {
@@ -269,6 +309,12 @@ body {
   background: #f9fafb;
   position: sticky;
   top: 0;
+}
+
+.result-row.header .col-size,
+.result-row.header .col-modified {
+  text-align: center;
+  justify-self: center;
 }
 
 .result-row.header .col-name,
@@ -303,7 +349,27 @@ body {
 }
 
 .file-icon {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
   font-size: 16px;
+}
+
+.file-icon-img {
+  width: 16px;
+  height: 16px;
+  display: block;
+  flex-shrink: 0;
+}
+
+.file-icon-placeholder {
+  width: 16px;
+  height: 16px;
+  display: block;
+  flex-shrink: 0;
 }
 
 .col-path {
@@ -327,15 +393,15 @@ body {
 }
 
 .virtual-spacer {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
   pointer-events: none;
 }
 
 .virtual-content {
-  position: relative;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  pointer-events: auto;
 }
 
 .status-bar {
