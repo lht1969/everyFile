@@ -245,6 +245,7 @@ fn main() {
             commands::search::search_files,
             commands::search::get_search_suggestions,
             commands::search::get_records_range,
+            commands::search::get_sorted_range,
             // 卷管理相关命令
             commands::volume::get_volumes,
             commands::volume::add_volume,

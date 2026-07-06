@@ -110,7 +110,7 @@ function App() {
       if (response.results.length > 0) {
         setResults(response.results);
       } else if (response.total > 0) {
-        const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50 });
+        const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50, sortBy: sortState.field, sortDirection: sortState.direction });
         setResults(range.results);
       }
     } catch (e) {
@@ -118,12 +118,16 @@ function App() {
     }
   };
 
+  const sortStateRef = useRef(sortState);
+  sortStateRef.current = sortState;
+
   const fetchCounterRef = useRef(0);
 
   const fetchRecordsRange = useCallback(async (start: number, end: number) => {
     const myId = ++fetchCounterRef.current;
+    const { field, direction } = sortStateRef.current;
     try {
-      const response = await invoke<RecordsRangeResponse>('get_records_range', { start, end });
+      const response = await invoke<RecordsRangeResponse>('get_records_range', { start, end, sortBy: field, sortDirection: direction });
       if (myId === fetchCounterRef.current) {
         setResults(response.results);
       }
@@ -150,7 +154,7 @@ function App() {
       if (response.results.length > 0) {
         setResults(response.results);
       } else if (response.total > 0) {
-        const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50 });
+        const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50, sortBy: sortState.field, sortDirection: sortState.direction });
         setResults(range.results);
       } else {
         setResults([]);
@@ -165,26 +169,31 @@ function App() {
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
     try {
-      const response = await invoke<SearchResponse>('search_files', {
-        params: {
-          query: searchState.query,
-          files_only: searchState.filesOnly,
-          directories_only: searchState.directoriesOnly,
-          sort_by: field,
-          sort_direction: direction
-        }
+      const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
+        sortBy: field,
+        sortDirection: direction,
+        start: 0,
+        end: 50
       });
       setTotalCount(response.total);
-      if (response.results.length > 0) {
-        setResults(response.results);
-      } else if (response.total > 0) {
-        const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50 });
-        setResults(range.results);
-      } else {
-        setResults([]);
-      }
+      setResults(response.results);
     } catch (e) {
-      console.error('Sort failed:', e);
+      console.error('Sort failed, falling back to re-search:', e);
+      try {
+        const response = await invoke<SearchResponse>('search_files', {
+          params: {
+            query: searchState.query,
+            files_only: searchState.filesOnly,
+            directories_only: searchState.directoriesOnly,
+            sort_by: field,
+            sort_direction: direction
+          }
+        });
+        setTotalCount(response.total);
+        setResults(response.results);
+      } catch (e2) {
+        console.error('Fallback sort also failed:', e2);
+      }
     }
   }, [searchState]);
 

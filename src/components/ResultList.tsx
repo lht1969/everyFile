@@ -209,7 +209,7 @@ function ResultList({ results, totalCount, onOpenFile, onOpenFolder, onDeleteFil
                 >
                   <div className="col-name">
                     <FileIcon path={result.path} isDirectory={result.is_directory} />
-                    {result.name}
+                    <span className="col-name-text" title={result.name}>{result.name}</span>
                   </div>
                   <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
                   <div className="col-size">{formatSize(result.size)}</div>

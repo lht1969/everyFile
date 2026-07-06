@@ -8,13 +8,16 @@ const CACHE_TTL_SECS: u64 = 3600;
 
 pub struct SearchCache {
     pub query: String,
-    pub sort_by: SortBy,
-    pub sort_direction: SortDirection,
     pub files_only: bool,
     pub directories_only: bool,
-    pub matched: Vec<(String, usize)>,
     pub total: usize,
     pub created_at: Instant,
+    pub matched: Vec<(String, usize)>,
+    // Lazily-computed ascending permutation vectors into `matched`
+    sorted_by_name: Option<Vec<usize>>,
+    sorted_by_path: Option<Vec<usize>>,
+    sorted_by_size: Option<Vec<usize>>,
+    sorted_by_modified: Option<Vec<usize>>,
 }
 
 impl SearchCache {
@@ -26,16 +29,89 @@ impl SearchCache {
         self.created_at = Instant::now();
     }
 
-    pub fn get_slice(&self, volumes: &HashMap<String, VolumeMonitor>, start: usize, end: usize) -> Vec<SearchResult> {
-        let end = end.min(self.matched.len());
-        if start >= self.matched.len() || start >= end {
+    pub fn get_sorted_slice(
+        &mut self,
+        volumes: &HashMap<String, VolumeMonitor>,
+        sort_by: SortBy,
+        sort_direction: SortDirection,
+        start: usize,
+        end: usize,
+    ) -> Vec<SearchResult> {
+        let matched = &self.matched;
+        let slot = match sort_by {
+            SortBy::Name => &mut self.sorted_by_name,
+            SortBy::Path => &mut self.sorted_by_path,
+            SortBy::Size => &mut self.sorted_by_size,
+            SortBy::ModifiedTime => &mut self.sorted_by_modified,
+            SortBy::Score => &mut self.sorted_by_name,
+        };
+        if slot.is_none() {
+            let t0 = Instant::now();
+            *slot = Some(build_sort_permutation(matched, volumes, sort_by));
+            log::info!("build_sort_permutation({:?}): {:?}", sort_by, t0.elapsed());
+        }
+        let indices = slot.as_ref().unwrap();
+        let n = indices.len();
+        if n == 0 {
             return Vec::new();
         }
-        self.matched[start..end].iter()
-            .filter_map(|(vol, idx)| {
-                volumes.get(vol).and_then(|m| m.files.get(*idx)).cloned()
-            })
-            .collect()
+
+        let (range_start, range_end) = match sort_direction {
+            SortDirection::Ascending => (start.min(n), end.min(n)),
+            SortDirection::Descending => {
+                let s = n.saturating_sub(end.max(start)).min(n);
+                let e = n.saturating_sub(start);
+                (s, e.max(s))
+            }
+        };
+
+        if range_start >= range_end || range_start >= n {
+            return Vec::new();
+        }
+
+        let iter: Box<dyn Iterator<Item = &usize>> = match sort_direction {
+            SortDirection::Ascending => Box::new(indices[range_start..range_end].iter()),
+            SortDirection::Descending => Box::new(indices[range_start..range_end].iter().rev()),
+        };
+
+        iter.filter_map(|idx| {
+            let (vol, file_idx) = &matched[*idx];
+            volumes.get(vol).and_then(|m| m.files.get(*file_idx)).cloned()
+        }).collect()
+    }
+}
+
+fn build_sort_permutation(matched: &[(String, usize)], volumes: &HashMap<String, VolumeMonitor>, sort_by: SortBy) -> Vec<usize> {
+    let n = matched.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Pre-fetch sort keys once to avoid HashMap lookups inside the comparator
+    match sort_by {
+        SortBy::Name | SortBy::Score => {
+            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[vol].files[*idx].name).collect();
+            let mut v: Vec<usize> = (0..n).collect();
+            v.sort_by(|&a, &b| keys[a].cmp(keys[b]));
+            v
+        }
+        SortBy::Path => {
+            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[vol].files[*idx].path).collect();
+            let mut v: Vec<usize> = (0..n).collect();
+            v.sort_by(|&a, &b| keys[a].cmp(keys[b]));
+            v
+        }
+        SortBy::Size => {
+            let keys: Vec<u64> = matched.iter().map(|(vol, idx)| volumes[vol].files[*idx].size).collect();
+            let mut v: Vec<usize> = (0..n).collect();
+            v.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+            v
+        }
+        SortBy::ModifiedTime => {
+            let keys: Vec<i64> = matched.iter().map(|(vol, idx)| volumes[vol].files[*idx].modified_time).collect();
+            let mut v: Vec<usize> = (0..n).collect();
+            v.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+            v
+        }
     }
 }
 
@@ -104,13 +180,7 @@ impl VolumeManager {
     }
 
     pub fn search_with_options(&mut self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
-        log::info!(
-            "search_with_options: query='{}', files_only={}, directories_only={}, volumes count={}",
-            query,
-            options.files_only,
-            options.directories_only,
-            self.volumes.len()
-        );
+        let t0 = Instant::now();
 
         let mut matched: Vec<(String, usize)> = Vec::new();
 
@@ -133,41 +203,40 @@ impl VolumeManager {
         }
 
         let total = matched.len();
-        log::info!("Matched: {} files", total);
+        log::info!("search_with_options: matched {} files, {:?}", total, t0.elapsed());
 
-        matched.sort_by(|a, b| {
-            let fa = &self.volumes[&a.0].files[a.1];
-            let fb = &self.volumes[&b.0].files[b.1];
-            self.compare_for_sort(fa, fb, options)
-        });
-
+        // Don't sort matched here — all sorting is lazy via permutation vectors.
+        // First batch is taken in insertion order for instant response.
         let first_batch: Vec<SearchResult> = matched.iter().take(50)
             .filter_map(|(vol, idx)| self.volumes.get(vol).and_then(|m| m.files.get(*idx)).cloned())
             .collect();
 
         self.search_cache = Some(SearchCache {
             query: query.to_string(),
-            sort_by: options.sort_by,
-            sort_direction: options.sort_direction,
             files_only: options.files_only,
             directories_only: options.directories_only,
             matched,
             total,
             created_at: Instant::now(),
+            sorted_by_name: None,
+            sorted_by_path: None,
+            sorted_by_size: None,
+            sorted_by_modified: None,
         });
+        log::info!("search_with_options total: {:?}", t0.elapsed());
 
         (first_batch, total)
     }
 
-    fn compare_for_sort(&self, a: &SearchResult, b: &SearchResult, options: &SearchOptions) -> std::cmp::Ordering {
-        let cmp = match options.sort_by {
+    fn compare_for_sort(&self, a: &SearchResult, b: &SearchResult, sort_by: &SortBy, sort_direction: &SortDirection) -> std::cmp::Ordering {
+        let cmp = match sort_by {
             SortBy::Name => a.name.cmp(&b.name),
             SortBy::Path => a.path.cmp(&b.path),
             SortBy::Size => a.size.cmp(&b.size),
             SortBy::ModifiedTime => a.modified_time.cmp(&b.modified_time),
             SortBy::Score => std::cmp::Ordering::Equal,
         };
-        match options.sort_direction {
+        match sort_direction {
             SortDirection::Ascending => cmp,
             SortDirection::Descending => cmp.reverse(),
         }
@@ -204,9 +273,10 @@ impl VolumeManager {
         for monitor in self.volumes.values_mut() {
             monitor.remove_file(file_path);
         }
+        self.search_cache = None;
     }
 
-    pub fn get_cached_slice(&mut self, start: usize, end: usize) -> Option<(Vec<SearchResult>, usize)> {
+    pub fn get_cached_slice(&mut self, sort_by: SortBy, sort_direction: SortDirection, start: usize, end: usize) -> Option<(Vec<SearchResult>, usize)> {
         let cache = self.search_cache.as_mut()?;
         if !cache.is_valid() {
             return None;
@@ -216,7 +286,7 @@ impl VolumeManager {
         if total == 0 {
             return Some((Vec::new(), 0));
         }
-        let results = cache.get_slice(&self.volumes, start, end);
+        let results = cache.get_sorted_slice(&self.volumes, sort_by, sort_direction, start, end);
         Some((results, total))
     }
 

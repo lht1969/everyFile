@@ -344,6 +344,10 @@ body {
   align-items: center;
   gap: 8px;
   overflow: hidden;
+}
+
+.col-name-text {
+  overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }

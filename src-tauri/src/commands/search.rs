@@ -1,10 +1,27 @@
 use crate::index::IndexManager;
-use crate::search::{SearchOptions, SearchResult};
+use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
+
+fn parse_sort_by(s: &str) -> SortBy {
+    match s {
+        "name" => SortBy::Name,
+        "path" => SortBy::Path,
+        "size" => SortBy::Size,
+        "modified" | "modified_time" => SortBy::ModifiedTime,
+        _ => SortBy::Score,
+    }
+}
+
+fn parse_sort_direction(s: &str) -> SortDirection {
+    match s {
+        "asc" => SortDirection::Ascending,
+        _ => SortDirection::Descending,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchParams {
@@ -41,21 +58,12 @@ pub async fn search_files(
 
     let mut options = SearchOptions::default();
 
-    if let Some(sort_by) = params.sort_by {
-        options.sort_by = match sort_by.as_str() {
-            "name" => crate::search::SortBy::Name,
-            "path" => crate::search::SortBy::Path,
-            "size" => crate::search::SortBy::Size,
-            "modified" | "modified_time" => crate::search::SortBy::ModifiedTime,
-            _ => crate::search::SortBy::Score,
-        };
+    if let Some(ref sort_by) = params.sort_by {
+        options.sort_by = parse_sort_by(sort_by);
     }
 
-    if let Some(dir) = params.sort_direction {
-        options.sort_direction = match dir.as_str() {
-            "asc" => crate::search::SortDirection::Ascending,
-            _ => crate::search::SortDirection::Descending,
-        };
+    if let Some(ref dir) = params.sort_direction {
+        options.sort_direction = parse_sort_direction(dir);
     }
 
     options.files_only = params.files_only.unwrap_or(true);
@@ -108,10 +116,34 @@ pub async fn get_records_range(
     state: State<'_, AppState>,
     start: usize,
     end: usize,
+    sort_by: String,
+    sort_direction: String,
 ) -> Result<RecordsRangeResponse, String> {
     let mut vm = state.volume_manager.lock().await;
 
-    if let Some((results, total)) = vm.get_cached_slice(start, end) {
+    if let Some((results, total)) = vm.get_cached_slice(parse_sort_by(&sort_by), parse_sort_direction(&sort_direction), start, end) {
+        Ok(RecordsRangeResponse {
+            results,
+            total,
+            start,
+            end,
+        })
+    } else {
+        Err("Cache expired or empty. Please search again.".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn get_sorted_range(
+    state: State<'_, AppState>,
+    sort_by: String,
+    sort_direction: String,
+    start: usize,
+    end: usize,
+) -> Result<RecordsRangeResponse, String> {
+    let mut vm = state.volume_manager.lock().await;
+
+    if let Some((results, total)) = vm.get_cached_slice(parse_sort_by(&sort_by), parse_sort_direction(&sort_direction), start, end) {
         Ok(RecordsRangeResponse {
             results,
             total,
