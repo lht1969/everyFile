@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 interface SearchPanelProps {
   onSearch: (query: string, filesOnly?: boolean, directoriesOnly?: boolean) => void;
@@ -11,21 +11,23 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [filterType, setFilterType] = useState<'files' | 'directories'>('files');
   const [exportFormat, setExportFormat] = useState('');
+  const prevQueryRef = useRef(query);
 
   useEffect(() => {
-    const debounce = setTimeout(() => {
-      if (query.trim()) {
-        fetchSuggestions(query);
-      } else {
-        setSuggestions([]);
-      }
-    }, 300);
-    return () => clearTimeout(debounce);
-  }, [query]);
-
-  useEffect(() => {
+    const prev = prevQueryRef.current;
+    prevQueryRef.current = query;
+    if (prev.trim() && !query.trim()) {
+      setSuggestions([]);
+      onSearch('', filterType === 'files', filterType === 'directories');
+      return;
+    }
+    if (!query.trim()) {
+      setSuggestions([]);
+      return;
+    }
     const debounce = setTimeout(() => {
       onSearch(query, filterType === 'files', filterType === 'directories');
+      fetchSuggestions(query);
     }, 150);
     return () => clearTimeout(debounce);
   }, [query, filterType]);
@@ -45,12 +47,11 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onSearch(query, filterType === 'files', filterType === 'directories');
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
-      onSearch(query, filterType === 'files', filterType === 'directories');
+      e.preventDefault();
     }
   };
 

@@ -11,22 +11,20 @@ pub async fn export_csv(results: Vec<SearchResult>, path: String) -> Result<(), 
     
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
     
-    writeln!(file, "Name,Path,Size,Created,Modified,Accessed,IsDirectory").map_err(|e| e.to_string())?;
-    
+    writeln!(file, "Name,Path,Size,Modified,IsDirectory").map_err(|e| e.to_string())?;
+
     for r in results {
         writeln!(
             file,
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{}",
             r.name,
             r.path,
             r.size,
-            r.formatted_created_time,
-            r.formatted_modified_time,
-            r.formatted_accessed_time,
+            SearchResult::format_time_static(r.modified_time),
             r.is_directory
         ).map_err(|e| e.to_string())?;
     }
-    
+
     Ok(())
 }
 
@@ -37,7 +35,7 @@ pub async fn export_txt(results: Vec<SearchResult>, path: String) -> Result<(), 
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
 
     for r in results {
-        writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size, r.formatted_modified_time, r.is_directory).map_err(|e| e.to_string())?;
+        writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size(), r.formatted_modified_time(), r.is_directory).map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -66,21 +64,24 @@ pub async fn export_all_results(
 ) -> Result<(), String> {
     log::info!("Exporting all results: query={}, format={}, path={}", query, format, path);
     
-    let vm = state.volume_manager.lock().await;
-    let results = vm.search_all(&query, files_only, directories_only);
+    let mut vm = state.volume_manager.lock().await;
+    let mut options = crate::search::SearchOptions::default();
+    options.files_only = files_only;
+    options.directories_only = directories_only;
+    let (results, _total) = vm.search_with_options(&query, &options);
     
     match format.as_str() {
         "csv" => {
             let mut file = File::create(&path).map_err(|e| e.to_string())?;
-            writeln!(file, "Name,Path,Size,Created,Modified,Accessed,IsDirectory").map_err(|e| e.to_string())?;
+            writeln!(file, "Name,Path,Size,Modified,IsDirectory").map_err(|e| e.to_string())?;
             for r in results {
-                writeln!(file, "{},{},{},{},{},{},{}", r.name, r.path, r.size, r.formatted_created_time, r.formatted_modified_time, r.formatted_accessed_time, r.is_directory).map_err(|e| e.to_string())?;
+                writeln!(file, "{},{},{},{},{}", r.name, r.path, r.size, SearchResult::format_time_static(r.modified_time), r.is_directory).map_err(|e| e.to_string())?;
             }
         },
         "txt" => {
             let mut file = File::create(&path).map_err(|e| e.to_string())?;
             for r in results {
-                writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size, r.formatted_modified_time, r.is_directory).map_err(|e| e.to_string())?;
+                writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size(), r.formatted_modified_time(), r.is_directory).map_err(|e| e.to_string())?;
             }
         },
         "json" => {

@@ -13,6 +13,7 @@ mod tray;
 use commands::search::AppState;
 use index::monitor::VolumeManager;
 use log::info;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -50,6 +51,8 @@ fn main() {
 
     // 创建卷管理器，使用 Arc<Mutex> 实现线程安全
     let volume_manager = Arc::new(Mutex::new(VolumeManager::new()));
+    let is_searching = Arc::new(AtomicBool::new(false));
+    let last_index_update = Arc::new(Mutex::new(String::new()));
 
     // 构建 Tauri 应用
     tauri::Builder::default()
@@ -63,17 +66,22 @@ fn main() {
             index_manager: index::IndexManager::new(std::path::Path::new("everything.db")).unwrap(),
             // 克隆卷管理器到应用状态
             volume_manager: volume_manager.clone(),
+            is_searching: is_searching.clone(),
+            last_index_update: last_index_update.clone(),
         })
         // 设置窗口事件处理
         .on_window_event(|window, event| {
-            // 处理窗口关闭事件
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // 阻止窗口关闭
-                api.prevent_close();
-                // 隐藏窗口到系统托盘
-                window.hide().unwrap();
-                // 记录日志
-                log::info!("Window minimized to system tray");
+                #[cfg(not(debug_assertions))]
+                {
+                    api.prevent_close();
+                    window.hide().unwrap();
+                    log::info!("Window minimized to system tray");
+                }
+                #[cfg(debug_assertions)]
+                {
+                    log::info!("Window close requested (debug mode: allowing close)");
+                }
             }
         })
         // 设置应用初始化
@@ -173,16 +181,23 @@ fn main() {
                     // 克隆卷管理器和应用句柄
                     let vm_clone = vm.clone();
                     let handle_clone = handle.clone();
-                    
+                    let is_searching_clone = is_searching.clone();
+                    let last_update_clone = last_index_update.clone();
+
                     // 启动增量更新任务
                     tauri::async_runtime::spawn(async move {
-                        // 无限循环，每60秒执行一次
+                        // 无限循环，每120秒执行一次
                         loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                            
+                            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+
+                            // 如果正在搜索，跳过增量更新
+                            if is_searching_clone.load(Ordering::SeqCst) {
+                                continue;
+                            }
+
                             // 获取卷管理器的锁
                             let mut volume_manager = vm_clone.lock().await;
-                            
+
                             // 对每个卷执行增量扫描
                             for drive_letter in volume_manager.volumes() {
                                 // 获取卷监控器
@@ -205,6 +220,10 @@ fn main() {
                                     volume_manager.return_monitor(&drive_letter, m);
                                 }
                             }
+
+                            // 更新最后索引更新时间
+                            let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                            *last_update_clone.lock().await = now;
                         }
                     });
                 }
@@ -227,6 +246,7 @@ fn main() {
             // 搜索相关命令
             commands::search::search_files,
             commands::search::get_search_suggestions,
+            commands::search::get_records_range,
             // 卷管理相关命令
             commands::volume::get_volumes,
             commands::volume::add_volume,

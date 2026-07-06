@@ -1,10 +1,43 @@
 use crate::error::Result;
-use crate::search::{SearchOptions, SearchResult, SortDirection};
+use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tauri::Emitter;
+
+const CACHE_TTL_SECS: u64 = 30;
+
+pub struct SearchCache {
+    pub query: String,
+    pub sort_by: SortBy,
+    pub sort_direction: SortDirection,
+    pub files_only: bool,
+    pub directories_only: bool,
+    pub matched: Vec<(String, usize)>,
+    pub total: usize,
+    pub created_at: Instant,
+}
+
+impl SearchCache {
+    pub fn is_valid(&self) -> bool {
+        self.created_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS)
+    }
+
+    pub fn get_slice(&self, volumes: &HashMap<String, VolumeMonitor>, start: usize, end: usize) -> Vec<SearchResult> {
+        let end = end.min(self.matched.len());
+        if start >= self.matched.len() || start >= end {
+            return Vec::new();
+        }
+        self.matched[start..end].iter()
+            .filter_map(|(vol, idx)| {
+                volumes.get(vol).and_then(|m| m.files.get(*idx)).cloned()
+            })
+            .collect()
+    }
+}
 
 pub struct VolumeManager {
     volumes: HashMap<String, VolumeMonitor>,
+    pub search_cache: Option<SearchCache>,
 }
 
 pub struct VolumeMonitor {
@@ -18,6 +51,7 @@ impl VolumeManager {
     pub fn new() -> Self {
         Self {
             volumes: HashMap::new(),
+            search_cache: None,
         }
     }
 
@@ -65,7 +99,7 @@ impl VolumeManager {
             .collect()
     }
 
-    pub fn search_with_options(&self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
+    pub fn search_with_options(&mut self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
         log::info!(
             "search_with_options: query='{}', files_only={}, directories_only={}, volumes count={}",
             query,
@@ -74,117 +108,65 @@ impl VolumeManager {
             self.volumes.len()
         );
 
-        let effective_limit = if query.trim().is_empty() {
-            usize::MAX
-        } else {
-            std::cmp::min(options.limit, 1000)
-        };
+        let mut matched: Vec<(String, usize)> = Vec::new();
 
-        let mut results: Vec<SearchResult> = Vec::new();
-        let mut total_count = 0;
-
-        for monitor in self.volumes.values() {
-            let volume_results = if query.trim().is_empty() {
-                monitor.get_all_files()
+        for (vol_key, monitor) in &self.volumes {
+            if query.trim().is_empty() {
+                for (idx, file) in monitor.files.iter().enumerate() {
+                    if options.files_only && file.is_directory { continue; }
+                    if options.directories_only && !file.is_directory { continue; }
+                    matched.push((vol_key.clone(), idx));
+                }
             } else {
                 let parsed_query = crate::search::query::SearchQuery::parse(query);
-                monitor.search_with_query(&parsed_query)
-            };
-
-            if query.trim().is_empty() {
-                for file in &monitor.files {
-                    if options.files_only && file.is_directory {
-                        continue;
-                    }
-                    if options.directories_only && !file.is_directory {
-                        continue;
-                    }
-
-                    total_count += 1;
-                }
-            } else {
-                for result in &volume_results {
-                    if options.files_only && result.is_directory {
-                        continue;
-                    }
-                    if options.directories_only && !result.is_directory {
-                        continue;
-                    }
-
-                    total_count += 1;
-                }
-            }
-
-            for result in volume_results {
-                if options.files_only && result.is_directory {
-                    continue;
-                }
-                if options.directories_only && !result.is_directory {
-                    continue;
-                }
-
-                results.push(result);
-
-                if results.len() >= effective_limit {
-                    break;
+                for (idx, file) in monitor.files.iter().enumerate() {
+                    if !crate::search::query::SearchQuery::matches(&parsed_query, file) { continue; }
+                    if options.files_only && file.is_directory { continue; }
+                    if options.directories_only && !file.is_directory { continue; }
+                    matched.push((vol_key.clone(), idx));
                 }
             }
         }
 
-        log::info!("After search_with_query: {} results, total: {}", results.len(), total_count);
+        let total = matched.len();
+        log::info!("Matched: {} files", total);
 
-        self.sort_results(&mut results, options);
+        matched.sort_by(|a, b| {
+            let fa = &self.volumes[&a.0].files[a.1];
+            let fb = &self.volumes[&b.0].files[b.1];
+            self.compare_for_sort(fa, fb, options)
+        });
 
-        (results, total_count)
-    }
-
-    pub fn search_all(
-        &self,
-        query: &str,
-        files_only: bool,
-        directories_only: bool,
-    ) -> Vec<SearchResult> {
-        let parsed_query = crate::search::query::SearchQuery::parse(query);
-
-        let mut results: Vec<SearchResult> = self
-            .volumes
-            .values()
-            .flat_map(|v| v.search_with_query(&parsed_query))
+        let first_batch: Vec<SearchResult> = matched.iter().take(50)
+            .filter_map(|(vol, idx)| self.volumes.get(vol).and_then(|m| m.files.get(*idx)).cloned())
             .collect();
 
-        if files_only {
-            results.retain(|r| !r.is_directory);
-        }
+        self.search_cache = Some(SearchCache {
+            query: query.to_string(),
+            sort_by: options.sort_by,
+            sort_direction: options.sort_direction,
+            files_only: options.files_only,
+            directories_only: options.directories_only,
+            matched,
+            total,
+            created_at: Instant::now(),
+        });
 
-        if directories_only {
-            results.retain(|r| r.is_directory);
-        }
-
-        results.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
-        results
+        (first_batch, total)
     }
 
-    fn sort_results(&self, results: &mut Vec<SearchResult>, options: &SearchOptions) {
-        results.sort_by(|a, b| {
-            let comparison = match options.sort_by {
-                crate::search::SortBy::Name => a.name.cmp(&b.name),
-                crate::search::SortBy::Path => a.path.cmp(&b.path),
-                crate::search::SortBy::Size => a.size.cmp(&b.size),
-                crate::search::SortBy::ModifiedTime => a.modified_time.cmp(&b.modified_time),
-                crate::search::SortBy::CreatedTime => a.created_time.cmp(&b.created_time),
-                crate::search::SortBy::AccessedTime => a.accessed_time.cmp(&b.accessed_time),
-                crate::search::SortBy::Score => a
-                    .score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            };
-
-            match options.sort_direction {
-                SortDirection::Ascending => comparison,
-                SortDirection::Descending => comparison.reverse(),
-            }
-        });
+    fn compare_for_sort(&self, a: &SearchResult, b: &SearchResult, options: &SearchOptions) -> std::cmp::Ordering {
+        let cmp = match options.sort_by {
+            SortBy::Name => a.name.cmp(&b.name),
+            SortBy::Path => a.path.cmp(&b.path),
+            SortBy::Size => a.size.cmp(&b.size),
+            SortBy::ModifiedTime => a.modified_time.cmp(&b.modified_time),
+            SortBy::Score => std::cmp::Ordering::Equal,
+        };
+        match options.sort_direction {
+            SortDirection::Ascending => cmp,
+            SortDirection::Descending => cmp.reverse(),
+        }
     }
 
     pub fn scan_all(
@@ -197,6 +179,7 @@ impl VolumeManager {
             log::info!("Scanned volume {}: {} files", drive_letter, count);
             total += count;
         }
+        self.search_cache = None;
         Ok(total)
     }
 
@@ -217,6 +200,24 @@ impl VolumeManager {
         for monitor in self.volumes.values_mut() {
             monitor.remove_file(file_path);
         }
+    }
+
+    pub fn get_cached_slice(&self, start: usize, end: usize) -> Option<(Vec<SearchResult>, usize)> {
+        self.search_cache.as_ref().and_then(|cache| {
+            if !cache.is_valid() {
+                return None;
+            }
+            let total = cache.total;
+            if total == 0 {
+                return Some((Vec::new(), 0));
+            }
+            let results = cache.get_slice(&self.volumes, start, end);
+            Some((results, total))
+        })
+    }
+
+    pub fn invalidate_cache(&mut self) {
+        self.search_cache = None;
     }
 }
 
@@ -273,36 +274,20 @@ impl VolumeMonitor {
                 (0, false, None, None, None)
             };
 
-            let now = chrono::Local::now();
+            let modified_ts = modified
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-            let created_time = created
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).with_timezone(&chrono::Local))
-                .unwrap_or(now);
-
-            let modified_time = modified
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).with_timezone(&chrono::Local))
-                .unwrap_or(now);
-
-            let accessed_time = accessed
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).with_timezone(&chrono::Local))
-                .unwrap_or(now);
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path_str = entry.path().to_string_lossy().to_string();
 
             let result = SearchResult {
                 file_id: count as u64,
-                name: entry.file_name().to_string_lossy().to_string(),
-                path: entry.path().to_string_lossy().to_string(),
-                parent_id: 0,
+                name: name.into(),
+                path: path_str.into(),
                 size,
-                created_time,
-                modified_time,
-                accessed_time,
+                modified_time: modified_ts,
                 is_directory: is_dir,
-                attributes: 0,
-                score: 1.0,
-                formatted_size: SearchResult::format_size_static(size),
-                formatted_created_time: created_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                formatted_modified_time: modified_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                formatted_accessed_time: accessed_time.format("%Y-%m-%d %H:%M:%S").to_string(),
             };
 
             self.files.push(result);
@@ -355,36 +340,20 @@ impl VolumeMonitor {
                 (0, false, None, None, None)
             };
 
-            let now = chrono::Local::now();
+            let modified_ts = modified
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-            let created_time = created
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).with_timezone(&chrono::Local))
-                .unwrap_or(now);
-
-            let modified_time = modified
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).with_timezone(&chrono::Local))
-                .unwrap_or(now);
-
-            let accessed_time = accessed
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).with_timezone(&chrono::Local))
-                .unwrap_or(now);
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path_str = entry.path().to_string_lossy().to_string();
 
             let result = SearchResult {
                 file_id: count as u64,
-                name: entry.file_name().to_string_lossy().to_string(),
-                path: entry.path().to_string_lossy().to_string(),
-                parent_id: 0,
+                name: name.into(),
+                path: path_str.into(),
                 size,
-                created_time,
-                modified_time,
-                accessed_time,
+                modified_time: modified_ts,
                 is_directory: is_dir,
-                attributes: 0,
-                score: 1.0,
-                formatted_size: SearchResult::format_size_static(size),
-                formatted_created_time: created_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                formatted_modified_time: modified_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                formatted_accessed_time: accessed_time.format("%Y-%m-%d %H:%M:%S").to_string(),
             };
 
             self.files.push(result);
@@ -417,7 +386,7 @@ impl VolumeMonitor {
     }
 
     pub fn remove_file(&mut self, file_path: &str) {
-        self.files.retain(|f| f.path != file_path);
+        self.files.retain(|f| f.path.as_ref() != file_path);
     }
 
     fn search(&self, query: &str) -> Vec<SearchResult> {
@@ -426,99 +395,12 @@ impl VolumeMonitor {
         self.files
             .iter()
             .filter(|f| {
-                f.name.to_lowercase().contains(&query_lower)
-                    || f.path.to_lowercase().contains(&query_lower)
+                let name_lower = f.name_lower();
+                let path_lower = f.path_lower();
+                name_lower.contains(&query_lower)
+                    || path_lower.contains(&query_lower)
             })
             .cloned()
             .collect()
-    }
-
-    fn search_with_query(&self, query: &crate::search::query::SearchQuery) -> Vec<SearchResult> {
-        let mut results = Vec::new();
-
-        let keywords_lower: Vec<String> = query.keywords.iter()
-            .map(|kw| kw.to_lowercase())
-            .collect();
-
-        let path_filter_lower = query.path_filter.as_ref()
-            .map(|pf| pf.to_lowercase());
-
-        for f in &self.files {
-            // 检查关键字 - AND 逻辑：所有关键词都必须匹配
-            if !keywords_lower.is_empty() {
-                let name_lower = f.name.to_lowercase();
-                // 使用 all() 确保所有关键词都被匹配（AND 逻辑）
-                let all_keywords_match = keywords_lower.iter().all(|kw| name_lower.contains(kw));
-                if !all_keywords_match {
-                    continue;
-                }
-            }
-
-            // 检查大小过滤
-            if let Some(ref size_filter) = query.size_filter {
-                if !size_filter.matches(f.size) {
-                    continue;
-                }
-            }
-
-            // 检查日期过滤
-            if let Some(ref date_filter) = query.date_filter {
-                if let Some(ref target_date) = date_filter.date {
-                    let time = match date_filter.date_type {
-                        crate::search::query::DateType::Created => &f.created_time,
-                        crate::search::query::DateType::Modified => &f.modified_time,
-                        crate::search::query::DateType::Accessed => &f.accessed_time,
-                    };
-
-                    let target_date_only = target_date.date_naive();
-                    let file_date_only = time.date_naive();
-
-                    let matches = match date_filter.operator {
-                        crate::search::query::DateOperator::Equal => {
-                            file_date_only == target_date_only
-                        }
-                        crate::search::query::DateOperator::GreaterThan => {
-                            file_date_only > target_date_only
-                        }
-                        crate::search::query::DateOperator::LessThan => {
-                            file_date_only < target_date_only
-                        }
-                        crate::search::query::DateOperator::GreaterOrEqual => {
-                            file_date_only >= target_date_only
-                        }
-                        crate::search::query::DateOperator::LessOrEqual => {
-                            file_date_only <= target_date_only
-                        }
-                    };
-
-                    if !matches {
-                        continue;
-                    }
-                }
-            }
-
-            // 检查路径过滤
-            if let Some(ref path_filter) = path_filter_lower {
-                if !f.path.to_lowercase().contains(path_filter) {
-                    continue;
-                }
-            }
-
-            // 检查 path:folders 只返回文件夹
-            if query.path_filter_dir_only && !f.is_directory {
-                continue;
-            }
-
-            // 检查正则表达式
-            if let Some(ref regex_pattern) = query.regex_pattern {
-                if !regex_pattern.is_match(&f.name) {
-                    continue;
-                }
-            }
-
-            results.push(f.clone());
-        }
-
-        results
     }
 }

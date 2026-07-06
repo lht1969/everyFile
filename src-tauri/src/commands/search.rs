@@ -1,6 +1,7 @@
 use crate::index::IndexManager;
 use crate::search::{SearchOptions, SearchResult};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
@@ -14,22 +15,19 @@ pub struct SearchParams {
     pub directories_only: Option<bool>,
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
-    pub page: Option<usize>,
-    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
-    pub results: Vec<SearchResult>,
     pub total: usize,
-    pub page: usize,
-    pub page_size: usize,
-    pub total_pages: usize,
+    pub results: Vec<SearchResult>,
 }
 
 pub struct AppState {
     pub index_manager: IndexManager,
     pub volume_manager: Arc<Mutex<crate::index::monitor::VolumeManager>>,
+    pub is_searching: Arc<AtomicBool>,
+    pub last_index_update: Arc<Mutex<String>>,
 }
 
 #[tauri::command]
@@ -39,56 +37,42 @@ pub async fn search_files(
 ) -> Result<SearchResponse, String> {
     log::info!("Searching for: {}", params.query);
 
+    state.is_searching.store(true, Ordering::SeqCst);
+
     let mut options = SearchOptions::default();
-    
+
     if let Some(sort_by) = params.sort_by {
         options.sort_by = match sort_by.as_str() {
             "name" => crate::search::SortBy::Name,
             "path" => crate::search::SortBy::Path,
             "size" => crate::search::SortBy::Size,
-            "modified" => crate::search::SortBy::ModifiedTime,
-            "created" => crate::search::SortBy::CreatedTime,
-            "accessed" => crate::search::SortBy::AccessedTime,
+            "modified" | "modified_time" => crate::search::SortBy::ModifiedTime,
             _ => crate::search::SortBy::Score,
         };
     }
-    
+
     if let Some(dir) = params.sort_direction {
         options.sort_direction = match dir.as_str() {
             "asc" => crate::search::SortDirection::Ascending,
             _ => crate::search::SortDirection::Descending,
         };
     }
-    
+
     options.files_only = params.files_only.unwrap_or(true);
     options.directories_only = params.directories_only.unwrap_or(false);
     options.min_size = params.min_size;
     options.max_size = params.max_size;
 
-    let page = params.page.unwrap_or(1);
-    let page_size = params.page_size.unwrap_or(100);
-    let max_results = 5000000;
+    let mut vm = state.volume_manager.lock().await;
+    let (all_results, total) = vm.search_with_options(&params.query, &options);
 
-    let vm = state.volume_manager.lock().await;
-    let (all_results, total_matches) = vm.search_with_options(&params.query, &options);
-    
-    let total = total_matches;
-    let total_pages = (total + page_size - 1) / page_size;
-    
-    let start = (page - 1) * page_size;
-    let end = start + page_size;
-    let paged_results: Vec<SearchResult> = all_results
-        .into_iter()
-        .skip(start)
-        .take(page_size)
-        .collect();
-    
+    let first_batch: Vec<SearchResult> = all_results.into_iter().take(50).collect();
+
+    state.is_searching.store(false, Ordering::SeqCst);
+
     Ok(SearchResponse {
-        results: paged_results,
         total,
-        page,
-        page_size,
-        total_pages,
+        results: first_batch,
     })
 }
 
@@ -101,12 +85,40 @@ pub async fn get_search_suggestions(
     let results = state.index_manager.search(&query, limit, 0)
         .await
         .map_err(|e| e.to_string())?;
-    
+
     let suggestions: Vec<String> = results
         .into_iter()
-        .map(|r| r.name)
+        .map(|r| r.name.into())
         .take(limit)
         .collect();
-    
+
     Ok(suggestions)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordsRangeResponse {
+    pub results: Vec<SearchResult>,
+    pub total: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[tauri::command]
+pub async fn get_records_range(
+    state: State<'_, AppState>,
+    start: usize,
+    end: usize,
+) -> Result<RecordsRangeResponse, String> {
+    let vm = state.volume_manager.lock().await;
+
+    if let Some((results, total)) = vm.get_cached_slice(start, end) {
+        Ok(RecordsRangeResponse {
+            results,
+            total,
+            start,
+            end,
+        })
+    } else {
+        Err("Cache expired or empty. Please search again.".to_string())
+    }
 }

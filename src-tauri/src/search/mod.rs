@@ -1,57 +1,56 @@
 pub mod query;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub file_id: u64,
-    pub name: String,
-    pub path: String,
-    pub parent_id: u64,
+    pub name: Box<str>,
+    pub path: Box<str>,
     pub size: u64,
-    pub created_time: DateTime<Local>,
-    pub modified_time: DateTime<Local>,
-    pub accessed_time: DateTime<Local>,
+    pub modified_time: i64,
     pub is_directory: bool,
-    pub attributes: u32,
-    pub score: f32,
-    pub formatted_size: String,
-    pub formatted_created_time: String,
-    pub formatted_modified_time: String,
-    pub formatted_accessed_time: String,
 }
 
 impl SearchResult {
     pub fn new(file_id: u64, name: String, path: String) -> Self {
-        let now = Local::now();
-        let formatted_size = Self::format_size_static(0);
-        let formatted_time = Self::format_time_static(&now);
-        
         Self {
             file_id,
-            name,
-            path,
-            parent_id: 0,
+            name: name.into(),
+            path: path.into(),
             size: 0,
-            created_time: now,
-            modified_time: now,
-            accessed_time: now,
+            modified_time: Utc::now().timestamp(),
             is_directory: false,
-            attributes: 0,
-            score: 1.0,
-            formatted_size,
-            formatted_created_time: formatted_time.clone(),
-            formatted_modified_time: formatted_time.clone(),
-            formatted_accessed_time: formatted_time,
         }
     }
-    
+
+    #[inline]
+    pub fn name_lower(&self) -> String {
+        self.name.to_lowercase()
+    }
+
+    #[inline]
+    pub fn path_lower(&self) -> String {
+        self.path.to_lowercase()
+    }
+
+    #[inline]
+    pub fn formatted_size(&self) -> String {
+        Self::format_size_static(self.size)
+    }
+
+    #[inline]
+    pub fn formatted_modified_time(&self) -> String {
+        let dt: DateTime<Utc> = Utc.timestamp_opt(self.modified_time, 0).single().unwrap_or_default();
+        dt.format("%Y/%m/%d %H:%M:%S").to_string()
+    }
+
     pub fn format_size_static(size: u64) -> String {
         const KILOBYTE: u64 = 1024;
         const MEGABYTE: u64 = KILOBYTE * 1024;
         const GIGABYTE: u64 = MEGABYTE * 1024;
-        
+
         match size {
             s if s >= GIGABYTE => format!("{:.1} GB", s as f64 / GIGABYTE as f64),
             s if s >= MEGABYTE => format!("{:.1} MB", s as f64 / MEGABYTE as f64),
@@ -59,9 +58,10 @@ impl SearchResult {
             s => format!("{} B", s),
         }
     }
-    
-    pub fn format_time_static(time: &DateTime<Local>) -> String {
-        time.format("%Y-%m-%d %H:%M:%S").to_string()
+
+    pub fn format_time_static(timestamp: i64) -> String {
+        let dt: DateTime<Utc> = Utc.timestamp_opt(timestamp, 0).single().unwrap_or_default();
+        dt.format("%Y/%m/%d %H:%M:%S").to_string()
     }
 }
 
@@ -71,8 +71,6 @@ pub enum SortBy {
     Path,
     Size,
     ModifiedTime,
-    CreatedTime,
-    AccessedTime,
     Score,
 }
 

@@ -1,33 +1,45 @@
-import { useState, useMemo, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect } from 'react';
+import { useVirtualScroll } from '../hooks/useVirtualScroll';
 
 interface SearchResult {
   file_id: number;
   name: string;
   path: string;
   size: number;
-  modified_time: string;
+  modified_time: number;
   is_directory: boolean;
-  formatted_size: string;
-  formatted_modified_time: string;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+function formatTime(ts: number): string {
+  const d = new Date(ts * 1000);
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 interface ResultListProps {
   results: SearchResult[];
+  totalCount: number;
   onOpenFile: (path: string) => void;
   onOpenFolder: (path: string) => void;
   onDeleteFile?: (path: string) => void;
-  pagination?: {
-    page: number;
-    total: number;
-    total_pages: number;
-    onPageChange: (page: number) => void;
-  };
+  onVisibleRangeChange?: (startIndex: number, endIndex: number) => void;
+  onSortChange?: (field: SortField, direction: SortDirection) => void;
+  scrollToTop?: number;
 }
 
-type SortField = 'name' | 'size' | 'modified_time';
+type SortField = 'name' | 'size' | 'modified_time' | 'path';
 type SortDirection = 'asc' | 'desc';
 
-function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultListProps) {
+const ROW_HEIGHT = 28;
+
+function ResultList({ results, totalCount, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop }: ResultListProps) {
   const [sortField, setSortField] = useState<SortField>('name');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -36,7 +48,14 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
   const [showTooltip, setShowTooltip] = useState(false);
   const resultBodyRef = useRef<HTMLDivElement>(null);
   const hoverTimeoutRef = useRef<number | null>(null);
-  const ROW_HEIGHT = 24;
+
+  const { startIndex, offsetY, spacerHeight, scrollToIndex } = useVirtualScroll({
+    totalItems: totalCount,
+    itemHeight: ROW_HEIGHT,
+    overscan: 5,
+    containerRef: resultBodyRef,
+    onRangeChange: onVisibleRangeChange,
+  });
 
   const getDirectoryPath = (path: string, isDirectory: boolean): string => {
     if (isDirectory) {
@@ -57,30 +76,23 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
     };
   }, []);
 
-  const sortedResults = useMemo(() => {
-    return [...results].sort((a, b) => {
-      let comparison = 0;
-      switch (sortField) {
-        case 'name':
-          comparison = a.name.localeCompare(b.name);
-          break;
-        case 'size':
-          comparison = a.size - b.size;
-          break;
-        case 'modified_time':
-          comparison = a.modified_time.localeCompare(b.modified_time);
-          break;
-      }
-      return sortDirection === 'asc' ? comparison : -comparison;
-    });
-  }, [results, sortField, sortDirection]);
+  useEffect(() => {
+    if (scrollToTop !== undefined && resultBodyRef.current) {
+      resultBodyRef.current.scrollTop = 0;
+    }
+  }, [scrollToTop]);
 
   const handleSort = (field: SortField) => {
+    let newDirection: SortDirection;
     if (field === sortField) {
-      setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+      newDirection = sortDirection === 'asc' ? 'desc' : 'asc';
     } else {
-      setSortField(field);
-      setSortDirection('asc');
+      newDirection = 'asc';
+    }
+    setSortField(field);
+    setSortDirection(newDirection);
+    if (onSortChange) {
+      onSortChange(field, newDirection);
     }
   };
 
@@ -96,27 +108,11 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
     }
   };
 
-  const scrollToIndex = (index: number) => {
-    if (resultBodyRef.current) {
-      const container = resultBodyRef.current;
-      const scrollTop = container.scrollTop;
-      const containerHeight = container.clientHeight;
-      const itemTop = index * ROW_HEIGHT;
-      const itemBottom = itemTop + ROW_HEIGHT;
-      
-      if (itemTop < scrollTop) {
-        container.scrollTop = itemTop;
-      } else if (itemBottom > scrollTop + containerHeight) {
-        container.scrollTop = itemBottom - containerHeight;
-      }
-    }
-  };
-
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       setSelectedIndex(prev => {
-        const newIndex = Math.min(prev + 1, sortedResults.length - 1);
+        const newIndex = Math.min(prev + 1, totalCount - 1);
         scrollToIndex(newIndex);
         return newIndex;
       });
@@ -130,29 +126,33 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
     } else if (e.key === 'Home') {
       e.preventDefault();
       setSelectedIndex(0);
-      if (resultBodyRef.current) resultBodyRef.current.scrollTop = 0;
+      scrollToIndex(0);
     } else if (e.key === 'End') {
       e.preventDefault();
-      const lastIndex = sortedResults.length - 1;
+      const lastIndex = totalCount - 1;
       setSelectedIndex(lastIndex);
-      if (resultBodyRef.current) resultBodyRef.current.scrollTop = resultBodyRef.current.scrollHeight;
+      scrollToIndex(lastIndex);
     } else if (e.key === 'PageDown') {
       e.preventDefault();
       if (resultBodyRef.current) {
-        const newIndex = Math.min(selectedIndex + Math.floor(resultBodyRef.current.clientHeight / ROW_HEIGHT), sortedResults.length - 1);
+        const step = Math.floor(resultBodyRef.current.clientHeight / ROW_HEIGHT);
+        const newIndex = Math.min(selectedIndex + step, totalCount - 1);
         setSelectedIndex(newIndex);
         scrollToIndex(newIndex);
       }
     } else if (e.key === 'PageUp') {
       e.preventDefault();
       if (resultBodyRef.current) {
-        const newIndex = Math.max(selectedIndex - Math.floor(resultBodyRef.current.clientHeight / ROW_HEIGHT), 0);
+        const step = Math.floor(resultBodyRef.current.clientHeight / ROW_HEIGHT);
+        const newIndex = Math.max(selectedIndex - step, 0);
         setSelectedIndex(newIndex);
         scrollToIndex(newIndex);
       }
     } else if (e.key === 'Enter' && selectedIndex >= 0) {
-      const item = sortedResults[selectedIndex];
-      handleRowDoubleClick(item.path, item.is_directory);
+      const item = results.find((_, i) => i === selectedIndex - startIndex);
+      if (item) {
+        handleRowDoubleClick(item.path, item.is_directory);
+      }
     }
   };
 
@@ -176,11 +176,11 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
   const handleMouseEnter = (e: React.MouseEvent, index: number, data: SearchResult) => {
     const rect = (e.target as HTMLElement).getBoundingClientRect();
     setHoveredItem({ index, x: rect.left, y: rect.bottom, data });
-    
+
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
     }
-    
+
     hoverTimeoutRef.current = setTimeout(() => {
       setShowTooltip(true);
     }, 500);
@@ -202,7 +202,8 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
           <div className="col-name" onClick={() => handleSort('name')}>
             名称{getSortIcon('name')}
           </div>
-          <div className="col-path">路径</div>
+          <div className="col-path" onClick={() => handleSort('path')}>
+            路径{getSortIcon('path')}</div>
           <div className="col-size" onClick={() => handleSort('size')}>
             大小{getSortIcon('size')}
           </div>
@@ -211,30 +212,37 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
           </div>
         </div>
         <div className="result-body" ref={resultBodyRef}>
-          {sortedResults.map((result, index) => (
-            <div
-              key={result.path}
-              className={`result-row ${index === selectedIndex ? 'selected' : ''}`}
-              onClick={() => handleRowClick(index)}
-              onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
-              onContextMenu={(e) => handleContextMenu(e, result.path, result.is_directory)}
-              onMouseEnter={(e) => handleMouseEnter(e, index, result)}
-              onMouseLeave={handleMouseLeave}
-            >
-              <div className="col-name">
-                <span className="file-icon">{result.is_directory ? '📁' : '📄'}</span>
-                {result.name}
-              </div>
-              <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
-              <div className="col-size">{result.formatted_size}</div>
-              <div className="col-modified">{result.formatted_modified_time}</div>
-            </div>
-          ))}
+          <div className="virtual-spacer" style={{ height: spacerHeight }} />
+          <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)` }}>
+            {results.map((result, i) => {
+              const globalIndex = startIndex + i;
+              return (
+                <div
+                  key={result.path}
+                  className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
+                  style={{ height: ROW_HEIGHT }}
+                  onClick={() => handleRowClick(globalIndex)}
+                  onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
+                  onContextMenu={(e) => handleContextMenu(e, result.path, result.is_directory)}
+                  onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
+                  onMouseLeave={handleMouseLeave}
+                >
+                  <div className="col-name">
+                    <span className="file-icon">{result.is_directory ? '📁' : '📄'}</span>
+                    {result.name}
+                  </div>
+                  <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
+                  <div className="col-size">{formatSize(result.size)}</div>
+                  <div className="col-modified">{formatTime(result.modified_time)}</div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
       {contextMenu && (
-        <div 
-          className="context-menu" 
+        <div
+          className="context-menu"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -255,13 +263,13 @@ function ResultList({ results, onOpenFile, onOpenFolder, onDeleteFile }: ResultL
         </div>
       )}
       {hoveredItem && showTooltip && (
-        <div 
+        <div
           className="hover-tooltip"
           style={{ left: hoveredItem.x, top: hoveredItem.y }}
         >
           <div className="hover-tooltip-row"><strong>名称:</strong> {hoveredItem.data.name}</div>
-          <div className="hover-tooltip-row"><strong>大小:</strong> {hoveredItem.data.formatted_size}</div>
-          <div className="hover-tooltip-row"><strong>日期:</strong> {hoveredItem.data.formatted_modified_time}</div>
+          <div className="hover-tooltip-row"><strong>大小:</strong> {formatSize(hoveredItem.data.size)}</div>
+          <div className="hover-tooltip-row"><strong>日期:</strong> {formatTime(hoveredItem.data.modified_time)}</div>
           <div className="hover-tooltip-row"><strong>路径:</strong> {hoveredItem.data.path}</div>
         </div>
       )}

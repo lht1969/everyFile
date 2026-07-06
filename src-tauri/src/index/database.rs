@@ -57,43 +57,33 @@ impl IndexDatabase {
 
     pub async fn search(&self, query: &str, limit: usize, offset: usize) -> Result<Vec<SearchResult>> {
         let conn = self.conn.lock().await;
-        
+
         let mut stmt = conn.prepare(
-            "SELECT id, file_id, name, path, parent_id, size, created_time, modified_time, 
-                    accessed_time, is_directory, attributes 
-             FROM files 
+            "SELECT id, file_id, name, path, size, modified_time, is_directory
+             FROM files
              WHERE name LIKE ?1 OR path LIKE ?1
-             ORDER BY name 
+             ORDER BY name
              LIMIT ?2 OFFSET ?3"
         )?;
 
         let search_pattern = format!("%{}%", query);
-        
-        let rows = stmt.query_map(params![search_pattern, limit as i64, offset as i64], |row| {
-            let created_str: Option<String> = row.get(6)?;
-            let modified_str: Option<String> = row.get(7)?;
-            let accessed_str: Option<String> = row.get(8)?;
 
-            let created_time = created_str.as_ref().and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()).map(|dt| dt.with_timezone(&Local)).unwrap_or_else(Local::now);
-            let modified_time = modified_str.as_ref().and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()).map(|dt| dt.with_timezone(&Local)).unwrap_or_else(Local::now);
-            let accessed_time = accessed_str.as_ref().and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()).map(|dt| dt.with_timezone(&Local)).unwrap_or_else(Local::now);
+        let rows = stmt.query_map(params![search_pattern, limit as i64, offset as i64], |row| {
+            let name: String = row.get(2)?;
+            let path: String = row.get(3)?;
+            let modified_str: Option<String> = row.get(5)?;
+            let modified_ts = modified_str.as_ref()
+                .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+                .map(|dt| dt.and_utc().timestamp())
+                .unwrap_or(0);
 
             Ok(SearchResult {
                 file_id: row.get(1)?,
-                name: row.get(2)?,
-                path: row.get(3)?,
-                parent_id: row.get(4)?,
-                size: row.get(5)?,
-                created_time,
-                modified_time,
-                accessed_time,
-                is_directory: row.get::<_, i32>(9)? != 0,
-                attributes: row.get(10)?,
-                score: 1.0,
-                formatted_size: SearchResult::format_size_static(row.get(5)?),
-                formatted_created_time: created_str.unwrap_or_default(),
-                formatted_modified_time: modified_str.unwrap_or_default(),
-                formatted_accessed_time: accessed_str.unwrap_or_default(),
+                name: name.into(),
+                path: path.into(),
+                size: row.get(4)?,
+                modified_time: modified_ts,
+                is_directory: row.get::<_, i32>(6)? != 0,
             })
         })?;
 
@@ -109,40 +99,30 @@ impl IndexDatabase {
 
     pub async fn get_all_files(&self) -> Result<Vec<SearchResult>> {
         let conn = self.conn.lock().await;
-        
+
         let mut stmt = conn.prepare(
-            "SELECT id, file_id, name, path, parent_id, size, created_time, modified_time, 
-                    accessed_time, is_directory, attributes 
-             FROM files 
-             ORDER BY name 
+            "SELECT id, file_id, name, path, size, modified_time, is_directory
+             FROM files
+             ORDER BY name
              LIMIT 10000"
         )?;
 
         let rows = stmt.query_map([], |row| {
-            let created_str: Option<String> = row.get(6)?;
-            let modified_str: Option<String> = row.get(7)?;
-            let accessed_str: Option<String> = row.get(8)?;
-
-            let created_time = created_str.as_ref().and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()).map(|dt| dt.with_timezone(&Local)).unwrap_or_else(Local::now);
-            let modified_time = modified_str.as_ref().and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()).map(|dt| dt.with_timezone(&Local)).unwrap_or_else(Local::now);
-            let accessed_time = accessed_str.as_ref().and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()).map(|dt| dt.with_timezone(&Local)).unwrap_or_else(Local::now);
+            let name: String = row.get(2)?;
+            let path: String = row.get(3)?;
+            let modified_str: Option<String> = row.get(5)?;
+            let modified_ts = modified_str.as_ref()
+                .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+                .map(|dt| dt.and_utc().timestamp())
+                .unwrap_or(0);
 
             Ok(SearchResult {
                 file_id: row.get(1)?,
-                name: row.get(2)?,
-                path: row.get(3)?,
-                parent_id: row.get(4)?,
-                size: row.get(5)?,
-                created_time,
-                modified_time,
-                accessed_time,
-                is_directory: row.get::<_, i32>(9)? != 0,
-                attributes: row.get(10)?,
-                score: 1.0,
-                formatted_size: SearchResult::format_size_static(row.get(5)?),
-                formatted_created_time: created_str.unwrap_or_default(),
-                formatted_modified_time: modified_str.unwrap_or_default(),
-                formatted_accessed_time: accessed_str.unwrap_or_default(),
+                name: name.into(),
+                path: path.into(),
+                size: row.get(4)?,
+                modified_time: modified_ts,
+                is_directory: row.get::<_, i32>(6)? != 0,
             })
         })?;
 
@@ -158,22 +138,22 @@ impl IndexDatabase {
 
     pub async fn upsert_file(&self, file: &SearchResult, volume_id: i64) -> Result<()> {
         let conn = self.conn.lock().await;
-        
+
+        let modified_str = chrono::DateTime::from_timestamp(file.modified_time, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+
         conn.execute(
-            "INSERT OR REPLACE INTO files 
-             (file_id, name, path, parent_id, size, created_time, modified_time, accessed_time, is_directory, attributes, volume_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO files
+             (file_id, name, path, size, modified_time, is_directory, volume_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 file.file_id as i64,
-                file.name,
-                file.path,
-                file.parent_id as i64,
+                file.name.as_ref(),
+                file.path.as_ref(),
                 file.size as i64,
-                file.created_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                file.modified_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                file.accessed_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+                modified_str,
                 file.is_directory as i32,
-                file.attributes as i32,
                 volume_id
             ],
         )?;

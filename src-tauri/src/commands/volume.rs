@@ -33,6 +33,14 @@ pub struct IndexStatusResponse {
     pub file_count: usize,
     pub progress: f32,
     pub message: String,
+    pub volumes: Vec<String>,
+    pub last_update: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoredVolumeInfo {
+    pub drive_letter: String,
+    pub file_count: usize,
 }
 
 #[tauri::command]
@@ -138,18 +146,21 @@ pub async fn get_index_status(
     let vm = state.volume_manager.lock().await;
     let file_count = vm.total_file_count();
     let volumes = vm.volumes();
-    
+    let last_update = state.last_index_update.lock().await.clone();
+
     let message = if volumes.is_empty() {
         "等待扫描...".to_string()
     } else {
-        format!("已加载卷: {}，索引 {} 个文件", volumes.join(", "), file_count)
+        "就绪".to_string()
     };
-    
+
     Ok(IndexStatusResponse {
         status: "ready".to_string(),
         file_count,
         progress: 1.0,
         message,
+        volumes,
+        last_update,
     })
 }
 

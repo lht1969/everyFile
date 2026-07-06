@@ -99,6 +99,49 @@ impl SearchQuery {
         }
     }
 
+    pub fn matches(&self, file: &crate::search::SearchResult) -> bool {
+        if !self.keywords.is_empty() {
+            let name_lower = file.name.to_lowercase();
+            if !self.keywords.iter().all(|kw| name_lower.contains(&kw.to_lowercase())) {
+                return false;
+            }
+        }
+        if let Some(ref size_filter) = self.size_filter {
+            if !size_filter.matches(file.size) {
+                return false;
+            }
+        }
+        if let Some(ref date_filter) = self.date_filter {
+            if let Some(ref target_date) = date_filter.date {
+                let file_ts = file.modified_time;
+                let target_ts = target_date.timestamp();
+                let target_end_ts = target_date.timestamp() + 86399;
+                let matches = match date_filter.operator {
+                    DateOperator::Equal => file_ts >= target_ts && file_ts <= target_end_ts,
+                    DateOperator::GreaterThan => file_ts > target_end_ts,
+                    DateOperator::LessThan => file_ts < target_ts,
+                    DateOperator::GreaterOrEqual => file_ts >= target_ts,
+                    DateOperator::LessOrEqual => file_ts <= target_end_ts,
+                };
+                if !matches { return false; }
+            }
+        }
+        if let Some(ref path_filter) = self.path_filter {
+            if !file.path.to_lowercase().contains(&path_filter.to_lowercase()) {
+                return false;
+            }
+        }
+        if self.path_filter_dir_only && !file.is_directory {
+            return false;
+        }
+        if let Some(ref regex_pattern) = self.regex_pattern {
+            if !regex_pattern.is_match(&file.name) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn parse_size_filter(part: &str) -> Option<SizeFilter> {
         let value_str = part[5..].trim();
 
