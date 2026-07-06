@@ -1,6 +1,8 @@
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::result::Result;
+use winreg::enums::*;
+use winreg::RegKey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigResponse {
@@ -16,6 +18,16 @@ pub struct ConfigResponse {
     pub startup: bool,
 }
 
+fn startup_registry_enabled() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = match hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let value: Result<String, _> = key.get_value("Everything Tauri");
+    value.is_ok()
+}
+
 impl From<Config> for ConfigResponse {
     fn from(c: Config) -> Self {
         Self {
@@ -28,7 +40,7 @@ impl From<Config> for ConfigResponse {
             include_system_files: c.index_settings.include_system_files,
             update_interval: c.index_settings.update_interval,
             monitored_volumes: c.monitored_volumes,
-            startup: c.startup,
+            startup: startup_registry_enabled(),
         }
     }
 }

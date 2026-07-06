@@ -1,6 +1,5 @@
-use crate::error::{AppError, Result};
-use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
-use chrono::{DateTime, Local};
+use crate::error::Result;
+use crate::search::SearchResult;
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Arc;
@@ -97,6 +96,7 @@ impl IndexDatabase {
         Ok(results)
     }
 
+    #[allow(dead_code)]
     pub async fn get_all_files(&self) -> Result<Vec<SearchResult>> {
         let conn = self.conn.lock().await;
 
@@ -136,6 +136,7 @@ impl IndexDatabase {
         Ok(results)
     }
 
+    #[allow(dead_code)]
     pub async fn upsert_file(&self, file: &SearchResult, volume_id: i64) -> Result<()> {
         let conn = self.conn.lock().await;
 
@@ -161,6 +162,7 @@ impl IndexDatabase {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn optimize(&self) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute_batch("VACUUM; ANALYZE;")?;

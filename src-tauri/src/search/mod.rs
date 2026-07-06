@@ -14,17 +14,6 @@ pub struct SearchResult {
 }
 
 impl SearchResult {
-    pub fn new(file_id: u64, name: String, path: String) -> Self {
-        Self {
-            file_id,
-            name: name.into(),
-            path: path.into(),
-            size: 0,
-            modified_time: Utc::now().timestamp(),
-            is_directory: false,
-        }
-    }
-
     #[inline]
     pub fn name_lower(&self) -> String {
         self.name.to_lowercase()

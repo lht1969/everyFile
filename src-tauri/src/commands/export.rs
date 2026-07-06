@@ -1,9 +1,7 @@
 use crate::search::SearchResult;
-use crate::commands::search::AppState;
 use std::fs::File;
 use std::io::Write;
 use tauri::State;
-use tokio::sync::Mutex;
 
 #[tauri::command]
 pub async fn export_csv(results: Vec<SearchResult>, path: String) -> Result<(), String> {

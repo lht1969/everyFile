@@ -154,7 +154,7 @@ fn main() {
                 // 扫描所有卷
                 for drive_letter in volume_manager.volumes() {
                     // 获取卷监控器
-                    let mut monitor = volume_manager.take_monitor(&drive_letter);
+                    let monitor = volume_manager.take_monitor(&drive_letter);
                     if let Some(mut m) = monitor {
                         // 克隆应用句柄
                         let handle_clone = handle.clone();
@@ -201,7 +201,7 @@ fn main() {
                             // 对每个卷执行增量扫描
                             for drive_letter in volume_manager.volumes() {
                                 // 获取卷监控器
-                                let mut monitor = volume_manager.take_monitor(&drive_letter);
+                    let mut monitor = volume_manager.take_monitor(&drive_letter);
                                 if let Some(ref mut m) = monitor {
                                     // 执行增量扫描
                                     if let Ok(count) = m.scan() {
@@ -254,7 +254,6 @@ fn main() {
             commands::volume::remove_volume,
             commands::volume::refresh_volumes,
             commands::volume::rebuild_index,
-            commands::volume::optimize_index,
             commands::volume::get_index_status,
             commands::volume::get_monitored_volumes,
             // 文件操作相关命令

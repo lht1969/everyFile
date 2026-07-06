@@ -1,8 +1,6 @@
 use crate::fs::{get_ntfs_volumes, VolumeInfo};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::State;
-use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeResponse {
@@ -35,12 +33,6 @@ pub struct IndexStatusResponse {
     pub message: String,
     pub volumes: Vec<String>,
     pub last_update: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitoredVolumeInfo {
-    pub drive_letter: String,
-    pub file_count: usize,
 }
 
 #[tauri::command]
@@ -130,12 +122,6 @@ pub async fn rebuild_index(
     let mut vm = state.volume_manager.lock().await;
     vm.scan_all(None).map_err(|e| e.to_string())?;
     
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn optimize_index() -> Result<(), String> {
-    log::info!("Optimizing index...");
     Ok(())
 }
 

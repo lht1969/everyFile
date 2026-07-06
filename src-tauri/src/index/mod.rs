@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 pub struct IndexManager {
     database: Arc<Mutex<database::IndexDatabase>>,
+    #[allow(dead_code)]
     volume_manager: Arc<Mutex<monitor::VolumeManager>>,
 }
 
@@ -26,10 +27,7 @@ impl IndexManager {
         self.database.lock().await.search(query, limit, offset).await
     }
 
-    pub async fn get_all_files(&self) -> Result<Vec<crate::search::SearchResult>> {
-        self.database.lock().await.get_all_files().await
-    }
-
+    #[allow(dead_code)]
     pub async fn initialize(&self, is_admin: bool) -> Result<()> {
         log::info!("Initializing index manager...");
 
@@ -60,6 +58,7 @@ impl IndexManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_file_count(&self) -> usize {
         self.volume_manager.blocking_lock().total_file_count()
     }

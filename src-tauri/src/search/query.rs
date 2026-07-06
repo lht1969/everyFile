@@ -1,7 +1,5 @@
-use crate::search::{SearchOptions, SearchResult};
 use chrono::{DateTime, Local};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct SearchQuery {

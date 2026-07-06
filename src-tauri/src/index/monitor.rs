@@ -7,9 +7,12 @@ use tauri::Emitter;
 const CACHE_TTL_SECS: u64 = 3600;
 
 pub struct SearchCache {
-    pub query: String,
-    pub files_only: bool,
-    pub directories_only: bool,
+    #[allow(dead_code)]
+    query: String,
+    #[allow(dead_code)]
+    files_only: bool,
+    #[allow(dead_code)]
+    directories_only: bool,
     pub total: usize,
     pub created_at: Instant,
     pub matched: Vec<(String, usize)>,
@@ -124,6 +127,7 @@ pub struct VolumeMonitor {
     drive_letter: String,
     files: Vec<SearchResult>,
     include_hidden_files: bool,
+    #[allow(dead_code)]
     include_system_files: bool,
 }
 
@@ -149,6 +153,7 @@ impl VolumeManager {
         self.volumes.keys().cloned().collect()
     }
 
+    #[allow(dead_code)]
     pub fn get_monitor_mut(&mut self, drive_letter: &str) -> Option<&mut VolumeMonitor> {
         self.volumes.get_mut(drive_letter)
     }
@@ -165,6 +170,7 @@ impl VolumeManager {
         self.volumes.values().map(|v| v.files.len()).sum()
     }
 
+    #[allow(dead_code)]
     pub fn get_file_count(&self, drive_letter: &str) -> usize {
         self.volumes
             .get(drive_letter)
@@ -172,6 +178,7 @@ impl VolumeManager {
             .unwrap_or(0)
     }
 
+    #[allow(dead_code)]
     pub fn get_all_files(&self) -> Vec<SearchResult> {
         self.volumes
             .values()
@@ -228,6 +235,7 @@ impl VolumeManager {
         (first_batch, total)
     }
 
+    #[allow(dead_code)]
     fn compare_for_sort(&self, a: &SearchResult, b: &SearchResult, sort_by: &SortBy, sort_direction: &SortDirection) -> std::cmp::Ordering {
         let cmp = match sort_by {
             SortBy::Name => a.name.cmp(&b.name),
@@ -256,15 +264,18 @@ impl VolumeManager {
         Ok(total)
     }
 
+    #[allow(dead_code)]
     pub fn start_listening_all(&mut self) -> Result<()> {
         log::info!("Started listening to all volumes");
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn stop_listening_all(&mut self) {
         log::info!("Stopped listening to all volumes");
     }
 
+    #[allow(dead_code)]
     pub fn process_all_events(&mut self) -> Result<usize> {
         Ok(0)
     }
@@ -290,6 +301,7 @@ impl VolumeManager {
         Some((results, total))
     }
 
+    #[allow(dead_code)]
     pub fn invalidate_cache(&mut self) {
         self.search_cache = None;
     }
@@ -336,7 +348,7 @@ impl VolumeMonitor {
 
         for entry in walker.filter_map(|e| e.ok()) {
             let metadata = entry.metadata().ok();
-            let (size, is_dir, created, modified, accessed) = if let Some(ref m) = metadata {
+            let (size, is_dir, _created, modified, _accessed) = if let Some(ref m) = metadata {
                 (
                     m.len(),
                     m.is_dir(),
@@ -402,7 +414,7 @@ impl VolumeMonitor {
 
         for entry in walker.filter_map(|e| e.ok()) {
             let metadata = entry.metadata().ok();
-            let (size, is_dir, created, modified, accessed) = if let Some(ref m) = metadata {
+            let (size, is_dir, _created, modified, _accessed) = if let Some(ref m) = metadata {
                 (
                     m.len(),
                     m.is_dir(),
@@ -444,6 +456,7 @@ impl VolumeMonitor {
         Ok(count)
     }
 
+    #[allow(dead_code)]
     pub fn scan_with_progress(
         &mut self,
         _callback: Option<Box<dyn FnMut(usize, &str) + Send>>,
@@ -451,10 +464,12 @@ impl VolumeMonitor {
         self.scan()
     }
 
+    #[allow(dead_code)]
     pub fn get_all_files(&self) -> Vec<SearchResult> {
         self.files.clone()
     }
 
+    #[allow(dead_code)]
     pub fn clear_index(&mut self) {
         self.files.clear();
     }
@@ -463,6 +478,7 @@ impl VolumeMonitor {
         self.files.retain(|f| f.path.as_ref() != file_path);
     }
 
+    #[allow(dead_code)]
     fn search(&self, query: &str) -> Vec<SearchResult> {
         let query_lower = query.to_lowercase();
 

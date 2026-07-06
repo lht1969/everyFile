@@ -6,7 +6,6 @@ pub enum AppError {
     Io(std::io::Error),
     Database(rusqlite::Error),
     Regex(regex::Error),
-    InvalidInput(String),
 }
 
 impl fmt::Display for AppError {
@@ -16,7 +15,6 @@ impl fmt::Display for AppError {
             AppError::Io(e) => write!(f, "IO error: {}", e),
             AppError::Database(e) => write!(f, "Database error: {}", e),
             AppError::Regex(e) => write!(f, "Regex error: {}", e),
-            AppError::InvalidInput(s) => write!(f, "Invalid input: {}", s),
         }
     }
 }

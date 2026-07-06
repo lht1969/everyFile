@@ -2,21 +2,21 @@
 // mft and usn functionality moved to index/monitor.rs for simplified implementation
 
 use crate::error::{AppError, Result};
-use std::path::Path;
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceExW, GetLogicalDrives, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetDiskFreeSpaceExW, GetLogicalDrives, GetVolumeInformationW,
 };
 
 #[derive(Debug, Clone)]
 pub struct VolumeInfo {
     pub drive_letter: String,
+    #[allow(dead_code)]
     pub device_path: String,
     pub volume_name: String,
     pub file_system: String,
     pub total_size: u64,
     pub free_space: u64,
+    #[allow(dead_code)]
     pub serial_number: u32,
 }
 

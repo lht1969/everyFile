@@ -250,7 +250,7 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
                     }
                   }}
                 />
-                开机启动（以管理员身份运行）
+                开机启动
               </label>
               <p className="setting-hint">开启后，程序将随系统启动并以静默模式运行</p>
             </section>
@@ -263,16 +263,7 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
             <button className="rebuild-button" onClick={onRebuildIndex}>
               重建索引
             </button>
-            <button className="optimize-button" onClick={async () => {
-              try {
-                await invoke('optimize_index');
-                alert('索引优化完成');
-              } catch (e) {
-                console.error('Failed to optimize index:', e);
-              }
-            }}>
-              优化索引
-            </button>
+
           </section>
         </div>
 
