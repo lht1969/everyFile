@@ -226,9 +226,10 @@ impl VolumeManager {
                 }
             } else {
                 let parsed_query = crate::search::query::SearchQuery::parse(query);
+                let query_controls_dir = parsed_query.path_filter_dir_only;
                 for (idx, file) in monitor.files.iter().enumerate() {
                     if !crate::search::query::SearchQuery::matches(&parsed_query, file) { continue; }
-                    if options.files_only && file.is_directory { continue; }
+                    if !query_controls_dir && options.files_only && file.is_directory { continue; }
                     if options.directories_only && !file.is_directory { continue; }
                     matched.push((vol_key.clone(), idx));
                 }

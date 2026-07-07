@@ -197,8 +197,8 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
             </div>
             <div className="help-section">
               <h4>路径搜索</h4>
-              <p><code>path:</code> 路径过滤，加 <code>folders</code> 仅匹配文件夹</p>
-              <div className="help-example"><code>path:Downloads</code> <code>path:C:\Users folders</code></div>
+              <p><code>path:</code> 路径过滤，加 <code>:folder</code> 仅匹配文件夹</p>
+              <div className="help-example"><code>path:Downloads</code> <code>path:C:\Users :folder</code></div>
             </div>
             <div className="help-section">
               <h4>正则搜索</h4>

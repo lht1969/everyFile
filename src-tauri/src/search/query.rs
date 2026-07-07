@@ -68,8 +68,9 @@ impl SearchQuery {
         let mut regex_pattern = None;
 
         let parts: Vec<&str> = query_str.split_whitespace().collect();
-
-        for part in parts {
+        let mut i = 0;
+        while i < parts.len() {
+            let part = parts[i];
             if part.starts_with("size:") {
                 size_filter = Self::parse_size_filter(part);
             } else if part.starts_with("datemodified:")
@@ -82,16 +83,20 @@ impl SearchQuery {
                 date_filter = Self::parse_date_filter(part);
             } else if part.starts_with("path:") {
                 let path_part = &part[5..];
-                if path_part.ends_with(" folders") || path_part.ends_with(" folder") {
-                    path_filter_dir_only = true;
-                    path_filter = Some(path_part[..path_part.len() - 8].trim_end().to_string());
-                } else {
-                    path_filter = Some(path_part.to_string());
+                path_filter = Some(path_part.to_string());
+                if i + 1 < parts.len() {
+                    let next = parts[i + 1];
+                    if next == ":folders" || next == ":folder" {
+                        path_filter_dir_only = true;
+                        i += 1;
+                    }
                 }
             } else if part.starts_with("regex:") {
                 if let Ok(re) = Regex::new(&part[6..]) {
                     regex_pattern = Some(re);
                 }
+            } else if part == ":folders" || part == ":folder" {
+                path_filter_dir_only = true;
             } else if Self::contains_glob_chars(part) {
                 if let Ok(pattern) = Pattern::new(part) {
                     glob_patterns.push(pattern);
@@ -101,6 +106,7 @@ impl SearchQuery {
             } else {
                 keywords.push(part.to_string());
             }
+            i += 1;
         }
 
         Self {
@@ -117,7 +123,11 @@ impl SearchQuery {
     pub fn matches(&self, file: &crate::search::SearchResult) -> bool {
         if !self.keywords.is_empty() {
             let name_lower = file.name.to_lowercase();
-            if !self.keywords.iter().all(|kw| name_lower.contains(&kw.to_lowercase())) {
+            let path_lower = file.path.to_lowercase();
+            if !self.keywords.iter().all(|kw| {
+                let kw_lower = kw.to_lowercase();
+                name_lower.contains(&kw_lower) || path_lower.contains(&kw_lower)
+            }) {
                 return false;
             }
         }
@@ -314,5 +324,109 @@ impl SizeFilter {
             SizeOperator::GreaterOrEqual => size >= self.value,
             SizeOperator::LessOrEqual => size <= self.value,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_folder_modifier_standalone() {
+        let q = SearchQuery::parse(":folder");
+        assert!(q.path_filter_dir_only);
+        assert!(q.keywords.is_empty());
+
+        let q = SearchQuery::parse(":folders");
+        assert!(q.path_filter_dir_only);
+        assert!(q.keywords.is_empty());
+    }
+
+    #[test]
+    fn test_folder_modifier_after_path() {
+        let q = SearchQuery::parse("path:C:\\Users :folder");
+        assert!(q.path_filter_dir_only);
+        assert_eq!(q.path_filter, Some("C:\\Users".into()));
+        assert!(q.keywords.is_empty());
+    }
+
+    #[test]
+    fn test_folder_modifier_before_path() {
+        let q = SearchQuery::parse(":folder path:C:\\Users");
+        assert!(q.path_filter_dir_only);
+        assert_eq!(q.path_filter, Some("C:\\Users".into()));
+        assert!(q.keywords.is_empty());
+    }
+
+    #[test]
+    fn test_folder_modifier_with_keyword() {
+        let q = SearchQuery::parse("local :folder path:C:\\Users");
+        assert!(q.path_filter_dir_only);
+        assert_eq!(q.path_filter, Some("C:\\Users".into()));
+        assert_eq!(q.keywords, vec!["local"]);
+    }
+
+    #[test]
+    fn test_bare_folders_is_keyword() {
+        // bare "folders" should now be a plain keyword, not a modifier
+        let q = SearchQuery::parse("folders");
+        assert!(!q.path_filter_dir_only);
+        assert_eq!(q.keywords, vec!["folders"]);
+    }
+
+    #[test]
+    fn test_folder_modifier_matches_directory() {
+        let q = SearchQuery::parse(":folder");
+        assert!(q.matches(&crate::search::SearchResult {
+            file_id: 1,
+            name: "test".into(),
+            path: "C:\\Users\\test".into(),
+            size: 0,
+            modified_time: 0,
+            is_directory: true,
+        }));
+        assert!(!q.matches(&crate::search::SearchResult {
+            file_id: 2,
+            name: "file.txt".into(),
+            path: "C:\\Users\\file.txt".into(),
+            size: 100,
+            modified_time: 0,
+            is_directory: false,
+        }));
+    }
+
+    #[test]
+    fn test_keyword_matches_path() {
+        let q = SearchQuery::parse("local");
+        assert!(q.matches(&crate::search::SearchResult {
+            file_id: 1,
+            name: "EBWebView".into(),
+            path: "C:\\Users\\lht\\AppData\\Local\\EBWebView".into(),
+            size: 0,
+            modified_time: 0,
+            is_directory: true,
+        }));
+    }
+
+    #[test]
+    fn test_folder_modifier_with_path_keyword() {
+        // user scenario: find folders under C:\Users with "local" anywhere in path
+        let q = SearchQuery::parse("local :folder path:C:\\Users");
+        assert!(q.matches(&crate::search::SearchResult {
+            file_id: 1,
+            name: "EBWebView".into(),
+            path: "C:\\Users\\lht\\AppData\\Local\\EBWebView".into(),
+            size: 0,
+            modified_time: 0,
+            is_directory: true,
+        }));
+        assert!(!q.matches(&crate::search::SearchResult {
+            file_id: 2,
+            name: "EBWebView".into(),
+            path: "C:\\Users\\lht\\AppData\\Local\\EBWebView".into(),
+            size: 0,
+            modified_time: 0,
+            is_directory: false,
+        }));
     }
 }
