@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 
 interface SearchPanelProps {
   onSearch: (query: string, filesOnly?: boolean, directoriesOnly?: boolean) => void;
@@ -69,7 +70,6 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
 
   const fetchSuggestions = async (searchQuery: string) => {
     try {
-      const { invoke } = await import('@tauri-apps/api/core');
       const result = await invoke<string[]>('get_search_suggestions', {
         query: searchQuery,
         limit: 10
@@ -78,10 +78,6 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
     } catch (e) {
       console.error('Failed to get suggestions:', e);
     }
-  };
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -103,7 +99,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
 
   return (
     <div className="search-panel">
-      <form onSubmit={handleSubmit} className="search-form">
+      <form onSubmit={(e) => e.preventDefault()} className="search-form">
         <div className="search-input-container">
           <input
             type="text"

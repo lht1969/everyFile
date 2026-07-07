@@ -55,12 +55,10 @@ windows = { version = "0.52", features = [
 rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
 
 # 异步运行时
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = ["sync", "time", "rt-multi-thread"] }
 
 # 并发工具
-crossbeam-channel = "0.5"
 parking_lot = "0.12"
-rayon = "1.8"
 
 # Base64 encoding for icon data URLs
 base64 = "0.22"

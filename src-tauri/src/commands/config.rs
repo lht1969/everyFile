@@ -67,7 +67,7 @@ pub struct SaveConfigParams {
 
 #[tauri::command]
 pub fn save_config(params: SaveConfigParams) -> Result<(), String> {
-    println!("Received save_config request: {:?}", params);
+    log::info!("Received save_config request");
     
     let config = Config {
         scan_all_volumes: params.scan_all_volumes,
@@ -84,16 +84,13 @@ pub fn save_config(params: SaveConfigParams) -> Result<(), String> {
         startup: params.startup,
     };
     
-    println!("Saving config: {:?}", config);
-    
-    // 保存配置
     match config.save() {
         Ok(_) => {
-            println!("Config saved successfully");
+            log::info!("Config saved successfully");
             Ok(())
         },
         Err(e) => {
-            println!("Failed to save config: {:?}", e);
+            log::warn!("Failed to save config: {:?}", e);
             Err(e.to_string())
         }
     }

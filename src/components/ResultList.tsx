@@ -1,32 +1,14 @@
 import { useState, useRef, useEffect } from 'react';
 import { useVirtualScroll } from '../hooks/useVirtualScroll';
 import { useFileIcon } from '../hooks/useFileIcon';
-
-interface SearchResult {
-  file_id: number;
-  name: string;
-  path: string;
-  size: number;
-  modified_time: number;
-  is_directory: boolean;
-}
-
-function formatSize(bytes: number): string {
-  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
-  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
-  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return bytes + ' B';
-}
-
-function formatTime(ts: number): string {
-  const d = new Date(ts * 1000);
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
+import type { SearchResult, SortField, SortDirection } from '../types';
+import { formatSize, formatTime } from '../utils/format';
 
 interface ResultListProps {
   results: SearchResult[];
   totalCount: number;
+  sortField: SortField;
+  sortDirection: SortDirection;
   onOpenFile: (path: string) => void;
   onOpenFolder: (path: string) => void;
   onDeleteFile?: (path: string) => void;
@@ -34,9 +16,6 @@ interface ResultListProps {
   onSortChange?: (field: SortField, direction: SortDirection) => void;
   scrollToTop?: number;
 }
-
-type SortField = 'name' | 'size' | 'modified_time' | 'path';
-type SortDirection = 'asc' | 'desc';
 
 const ROW_HEIGHT = 28;
 
@@ -54,9 +33,7 @@ function FileIcon({ path, isDirectory }: { path: string; isDirectory: boolean })
   return <img className="file-icon-img" src={iconUrl} alt="" draggable={false} />;
 }
 
-function ResultList({ results, totalCount, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop }: ResultListProps) {
-  const [sortField, setSortField] = useState<SortField>('name');
-  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+function ResultList({ results, totalCount, sortField, sortDirection, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop }: ResultListProps) {
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string; isDirectory: boolean } | null>(null);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
@@ -94,8 +71,6 @@ function ResultList({ results, totalCount, onOpenFile, onOpenFolder, onDeleteFil
 
   const handleSort = (field: SortField) => {
     const newDirection = field === sortField ? (sortDirection === 'asc' ? 'desc' : 'asc') : 'asc';
-    setSortField(field);
-    setSortDirection(newDirection);
     onSortChange?.(field, newDirection);
   };
 

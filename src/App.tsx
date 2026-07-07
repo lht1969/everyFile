@@ -1,46 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { save } from '@tauri-apps/plugin-dialog';
+import { save, ask } from '@tauri-apps/plugin-dialog';
 import SearchPanel from './components/SearchPanel';
 import ResultList from './components/ResultList';
 import StatusBar from './components/StatusBar';
 import SettingsModal from './components/SettingsModal';
+import type { SearchResult, SearchResponse, RecordsRangeResponse, IndexStatus, AppConfig, SortField, SortDirection } from './types';
 import './App.css';
-
-interface SearchResult {
-  file_id: number;
-  name: string;
-  path: string;
-  size: number;
-  modified_time: number;
-  is_directory: boolean;
-}
-
-interface SearchResponse {
-  total: number;
-  results: SearchResult[];
-}
-
-interface RecordsRangeResponse {
-  results: SearchResult[];
-  total: number;
-  start: number;
-  end: number;
-}
-
-interface IndexStatus {
-  status: string;
-  file_count: number;
-  progress: number;
-  message: string;
-  volumes: string[];
-  last_update: string;
-}
-
-interface AppConfig {
-  update_interval: number;
-}
 
 function App() {
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -51,7 +18,7 @@ function App() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [searchState, setSearchState] = useState({ query: '', filesOnly: true, directoriesOnly: false });
-  const [sortState, setSortState] = useState({ field: 'name' as string, direction: 'asc' as string });
+  const [sortState, setSortState] = useState<{ field: SortField; direction: SortDirection }>({ field: 'name', direction: 'asc' });
   const [scrollTrigger, setScrollTrigger] = useState(0);
   const rebuildingRef = useRef(false);
 
@@ -101,9 +68,6 @@ function App() {
   }, [isAdmin, config?.update_interval]);
 
   useEffect(() => {
-    const unlistenProgress = listen<{ volume: string; count: number }>('scan-progress', (_event) => {
-    });
-
     const unlistenComplete = listen<{ volume: string; count: number }>('scan-complete', (_event) => {
       loadIndexStatus();
     });
@@ -113,7 +77,6 @@ function App() {
     });
 
     return () => {
-      unlistenProgress.then(fn => fn());
       unlistenComplete.then(fn => fn());
       unlistenUpdated.then(fn => fn());
     };
@@ -210,7 +173,7 @@ function App() {
     }
   }, [sortState]);
 
-  const handleSortChange = useCallback(async (field: string, direction: string) => {
+  const handleSortChange = useCallback(async (field: SortField, direction: SortDirection) => {
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
     try {
@@ -263,7 +226,8 @@ function App() {
   };
 
   const handleDeleteFile = async (path: string) => {
-    if (!confirm(`确定要删除 "${path}" 吗？`)) return;
+    const confirmed = await ask(`确定要删除 "${path}" 吗？`, { title: '确认删除', kind: 'warning' });
+    if (!confirmed) return;
     try {
       await invoke('delete_file', { path });
       loadAllFiles();
@@ -324,6 +288,8 @@ function App() {
         <ResultList
           results={results}
           totalCount={totalCount}
+          sortField={sortState.field}
+          sortDirection={sortState.direction}
           onOpenFile={handleOpenFile}
           onOpenFolder={handleOpenFolder}
           onDeleteFile={handleDeleteFile}
@@ -340,7 +306,6 @@ function App() {
 
       {showSettings && (
         <SettingsModal
-          key={Date.now()}
           onClose={() => setShowSettings(false)}
           onRebuildIndex={handleRebuildIndex}
           indexStatus={indexStatus}

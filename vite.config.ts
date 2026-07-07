@@ -9,7 +9,6 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       "@": resolve(__dirname, "./src"),
-      "@vue": resolve(__dirname, "./src-vue"),
     },
   },
   clearScreen: false,

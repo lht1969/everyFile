@@ -1,34 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-
-interface VolumeResponse {
-  drive_letter: string;
-  volume_name: string;
-  file_system: string;
-  total_size: number;
-  free_space: number;
-  file_count: number;
-}
-
-interface ConfigResponse {
-  scan_all_volumes: boolean;
-  default_volume: string;
-  max_cache_items: number;
-  max_history_items: number;
-  enable_usn_journal: boolean;
-  include_hidden_files: boolean;
-  include_system_files: boolean;
-  update_interval: number;
-  monitored_volumes: string[];
-  startup: boolean;
-}
-
-interface IndexStatus {
-  status: string;
-  file_count: number;
-  progress: number;
-  message: string;
-}
+import type { VolumeResponse, ConfigResponse, IndexStatus } from '../types';
+import { formatSize } from '../utils/format';
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -54,7 +27,6 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
       const monitored = await invoke<VolumeResponse[]>('get_monitored_volumes');
       setMonitoredVolumes(monitored);
     } catch (e) {
-      alert('加载卷失败: ' + e);
       console.error('Failed to load volumes:', e);
     }
   };
@@ -64,7 +36,6 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
       const cfg = await invoke<ConfigResponse>('get_config');
       setConfig(cfg);
     } catch (e) {
-      alert('加载配置失败: ' + e);
       console.error('Failed to load config:', e);
     }
   };
@@ -95,54 +66,34 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
     }
   };
 
-  const handleSaveConfig = () => {
-    console.log('handleSaveConfig called');
-    if (!config) {
-      alert('配置正在加载中，请稍后再试');
-      return;
-    }
+  const handleSaveConfig = async () => {
+    if (!config) return;
 
-    console.log('Config before processing:', config);
     const { monitored_volumes, ...configWithoutVolumes } = config;
     const configToSave = {
       ...configWithoutVolumes,
       monitored_volumes: monitoredVolumes.map(v => v.drive_letter),
     };
-    console.log('Saving config:', configToSave);
 
-    // 调用 save_config 命令，传递用户修改后的配置
-    console.log('Before invoke save_config');
-    invoke('save_config', {
-      params: {
-        scan_all_volumes: configToSave.scan_all_volumes,
-        default_volume: configToSave.default_volume,
-        max_cache_items: configToSave.max_cache_items,
-        max_history_items: configToSave.max_history_items,
-        enable_usn_journal: configToSave.enable_usn_journal,
-        include_hidden_files: configToSave.include_hidden_files,
-        include_system_files: configToSave.include_system_files,
-        update_interval: configToSave.update_interval,
-        monitored_volumes: configToSave.monitored_volumes,
-        startup: configToSave.startup
-      }
-    })
-      .then(result => {
-        console.log('Save config result:', result);
-        console.log('Config saved successfully');
-        console.log('Calling onClose()');
-        onClose();
-        console.log('onClose() called');
-      })
-      .catch(error => {
-        console.error('Error invoking save_config:', error);
-        console.error('Error details:', JSON.stringify(error, null, 2));
-        alert('保存失败: ' + error);
+    try {
+      await invoke('save_config', {
+        params: {
+          scan_all_volumes: configToSave.scan_all_volumes,
+          default_volume: configToSave.default_volume,
+          max_cache_items: configToSave.max_cache_items,
+          max_history_items: configToSave.max_history_items,
+          enable_usn_journal: configToSave.enable_usn_journal,
+          include_hidden_files: configToSave.include_hidden_files,
+          include_system_files: configToSave.include_system_files,
+          update_interval: configToSave.update_interval,
+          monitored_volumes: configToSave.monitored_volumes,
+          startup: configToSave.startup
+        }
       });
-  };
-
-  const formatSize = (bytes: number) => {
-    const gb = bytes / (1024 * 1024 * 1024);
-    return `${gb.toFixed(1)} GB`;
+      onClose();
+    } catch (error) {
+      console.error('Failed to save config:', error);
+    }
   };
 
   return (
@@ -238,15 +189,12 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
                     try {
                       if (e.target.checked) {
                         await invoke('add_startup');
-                        alert('开机启动已开启');
                       } else {
                         await invoke('remove_startup');
-                        alert('开机启动已关闭');
                       }
                     } catch (e) {
-                      alert('设置开机启动失败: ' + e);
                       console.error('Failed to set startup:', e);
-                      setConfig({ ...config, startup: false });
+                      setConfig(prev => prev ? { ...prev, startup: false } : prev);
                     }
                   }}
                 />

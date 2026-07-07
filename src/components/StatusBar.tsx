@@ -1,13 +1,8 @@
+import type { IndexStatus } from '../types';
+
 interface StatusBarProps {
   message: string;
-  indexStatus: {
-    status: string;
-    file_count: number;
-    progress: number;
-    message: string;
-    volumes: string[];
-    last_update: string;
-  };
+  indexStatus: IndexStatus;
   isAdmin: boolean;
 }
 

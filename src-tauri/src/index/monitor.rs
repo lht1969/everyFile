@@ -216,19 +216,25 @@ impl VolumeManager {
         let t0 = Instant::now();
 
         let mut matched: Vec<(String, usize)> = Vec::new();
+        let is_empty_query = query.trim().is_empty();
+        let parsed_query = if is_empty_query {
+            None
+        } else {
+            Some(crate::search::query::SearchQuery::parse(query))
+        };
+        let query_controls_dir = parsed_query.as_ref().map_or(false, |q| q.path_filter_dir_only);
 
         for (vol_key, monitor) in &self.volumes {
-            if query.trim().is_empty() {
+            if is_empty_query {
                 for (idx, file) in monitor.files.iter().enumerate() {
                     if options.files_only && file.is_directory { continue; }
                     if options.directories_only && !file.is_directory { continue; }
                     matched.push((vol_key.clone(), idx));
                 }
             } else {
-                let parsed_query = crate::search::query::SearchQuery::parse(query);
-                let query_controls_dir = parsed_query.path_filter_dir_only;
+                let pq = parsed_query.as_ref().unwrap();
                 for (idx, file) in monitor.files.iter().enumerate() {
-                    if !crate::search::query::SearchQuery::matches(&parsed_query, file) { continue; }
+                    if !crate::search::query::SearchQuery::matches(pq, file) { continue; }
                     if !query_controls_dir && options.files_only && file.is_directory { continue; }
                     if options.directories_only && !file.is_directory { continue; }
                     matched.push((vol_key.clone(), idx));
@@ -350,42 +356,42 @@ impl VolumeMonitor {
         self.include_system_files = include_system_files;
     }
 
-    pub fn scan(&mut self) -> Result<usize> {
-        self.files.clear();
-
+    /// Build a walkdir walker configured for this volume's settings.
+    fn build_walker(&self) -> walkdir::WalkDir {
         let path = if self.drive_letter.ends_with('\\') {
             self.drive_letter.clone()
         } else {
             format!("{}\\" , self.drive_letter)
         };
 
-        let walker = walkdir::WalkDir::new(&path)
+        walkdir::WalkDir::new(&path)
             .max_depth(10)
             .follow_links(false)
+    }
+
+    /// Process a walker iterator, pushing results into self.files.
+    /// Returns the count of files scanned.
+    fn process_walker(
+        &mut self,
+        walker: walkdir::WalkDir,
+        mut on_progress: Option<&mut dyn FnMut(usize)>,
+    ) -> Result<usize> {
+        let start_id = self.files.len() as u64;
+        let mut count = 0usize;
+        let include_hidden = self.include_hidden_files;
+        let include_system = self.include_system_files;
+
+        for entry in walker
             .into_iter()
-            .filter_entry(|e| {
+            .filter_entry(move |e| {
                 let name = e.file_name().to_string_lossy();
-
-                if name.eq_ignore_ascii_case("$Recycle.Bin") {
-                    return false;
-                }
-
-                if !self.include_system_files {
-                    if name.eq_ignore_ascii_case("System Volume Information") {
-                        return false;
-                    }
-                }
-
-                if !self.include_hidden_files && name.starts_with('.') {
-                    return false;
-                }
-
+                if name.eq_ignore_ascii_case("$Recycle.Bin") { return false; }
+                if !include_system && name.eq_ignore_ascii_case("System Volume Information") { return false; }
+                if !include_hidden && name.starts_with('.') { return false; }
                 true
-            });
-
-        let mut count = 0;
-
-        for entry in walker.filter_map(|e| e.ok()) {
+            })
+            .filter_map(|e| e.ok())
+        {
             let metadata = entry.metadata().ok();
             if let Some(ref m) = metadata {
                 if should_skip_by_attr(self.include_hidden_files, self.include_system_files, m) {
@@ -412,7 +418,7 @@ impl VolumeMonitor {
             let path_str = entry.path().to_string_lossy().to_string();
 
             let result = SearchResult {
-                file_id: count as u64,
+                file_id: start_id + count as u64,
                 name: name.into(),
                 path: path_str.into(),
                 size,
@@ -422,93 +428,34 @@ impl VolumeMonitor {
 
             self.files.push(result);
             count += 1;
+
+            if count % 20000 == 0 {
+                if let Some(ref mut cb) = on_progress {
+                    cb(count);
+                }
+            }
         }
 
         Ok(count)
     }
 
+    pub fn scan(&mut self) -> Result<usize> {
+        self.files.clear();
+        let walker = self.build_walker();
+        self.process_walker(walker, None)
+    }
+
     pub fn scan_with_progress_callback(&mut self, handle: &tauri::AppHandle) -> Result<usize> {
         self.files.clear();
-
-        let path = if self.drive_letter.ends_with('\\') {
-            self.drive_letter.clone()
-        } else {
-            format!("{}\\" , self.drive_letter)
+        let walker = self.build_walker();
+        let drive_letter = self.drive_letter.clone();
+        let mut on_progress = |count: usize| {
+            let _ = handle.emit(
+                "scan-progress",
+                serde_json::json!({"volume": drive_letter, "count": count}),
+            );
         };
-
-        let walker = walkdir::WalkDir::new(&path)
-            .max_depth(10)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-
-                if name.eq_ignore_ascii_case("$Recycle.Bin") {
-                    return false;
-                }
-
-                if !self.include_system_files {
-                    if name.eq_ignore_ascii_case("System Volume Information") {
-                        return false;
-                    }
-                }
-
-                if !self.include_hidden_files && name.starts_with('.') {
-                    return false;
-                }
-
-                true
-            });
-
-        let mut count = 0;
-
-        for entry in walker.filter_map(|e| e.ok()) {
-            let metadata = entry.metadata().ok();
-            if let Some(ref m) = metadata {
-                if should_skip_by_attr(self.include_hidden_files, self.include_system_files, m) {
-                    continue;
-                }
-            }
-            let (size, is_dir, _created, modified, _accessed) = if let Some(ref m) = metadata {
-                (
-                    m.len(),
-                    m.is_dir(),
-                    m.created().ok(),
-                    m.modified().ok(),
-                    m.accessed().ok(),
-                )
-            } else {
-                (0, false, None, None, None)
-            };
-
-            let modified_ts = modified
-                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
-                .unwrap_or_else(|| chrono::Utc::now().timestamp());
-
-            let name = entry.file_name().to_string_lossy().to_string();
-            let path_str = entry.path().to_string_lossy().to_string();
-
-            let result = SearchResult {
-                file_id: count as u64,
-                name: name.into(),
-                path: path_str.into(),
-                size,
-                modified_time: modified_ts,
-                is_directory: is_dir,
-            };
-
-            self.files.push(result);
-            count += 1;
-
-            if count > 0 && count % 20000 == 0 {
-                let _ = handle.emit(
-                    "scan-progress",
-                    serde_json::json!({"volume": self.drive_letter, "count": count}),
-                );
-            }
-        }
-
-        Ok(count)
+        self.process_walker(walker, Some(&mut on_progress))
     }
 
     #[allow(dead_code)]

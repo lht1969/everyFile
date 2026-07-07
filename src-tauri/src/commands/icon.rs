@@ -95,7 +95,7 @@ fn extract_icon_base64(key: &str, is_directory: bool) -> Result<String, String> 
         }
         let hbmp = hbmp_result.unwrap();
 
-        let old = SelectObject(hdc, std::mem::transmute::<HBITMAP, HGDIOBJ>(hbmp));
+        let old = SelectObject(hdc, HGDIOBJ(hbmp.0));
 
         let _ = DrawIconEx(hdc, 0, 0, icon, width, height, 0, None, DI_NORMAL);
 

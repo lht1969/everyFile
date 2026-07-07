@@ -58,14 +58,18 @@ pub async fn add_volume(
     vm.add_volume(&volume, is_admin, include_hidden_files, include_system_files).map_err(|e| e.to_string())?;
     
     if let Some(mut monitor) = vm.take_monitor(&volume) {
-        let _ = monitor.scan();
+        if let Err(e) = monitor.scan() {
+            log::warn!("Failed to scan new volume {}: {:?}", volume, e);
+        }
         vm.return_monitor(&volume, monitor);
     }
     
     if let Ok(mut config) = crate::config::Config::load() {
         if !config.monitored_volumes.contains(&volume) {
             config.monitored_volumes.push(volume.clone());
-            let _ = config.save();
+            if let Err(e) = config.save() {
+                log::warn!("Failed to save config after adding volume: {:?}", e);
+            }
         }
     }
     
@@ -84,7 +88,9 @@ pub async fn remove_volume(
     
     if let Ok(mut config) = crate::config::Config::load() {
         config.monitored_volumes.retain(|v| v != &volume);
-        let _ = config.save();
+        if let Err(e) = config.save() {
+            log::warn!("Failed to save config after removing volume: {:?}", e);
+        }
     }
     
     Ok(())
