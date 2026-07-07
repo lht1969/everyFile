@@ -11,10 +11,15 @@ pub fn setup_tray(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     let menu = Menu::with_items(&app, &[&show_item, &hide_item, &quit_item])?;
 
-    let _ = TrayIconBuilder::new()
-        .icon(app.default_window_icon().cloned().unwrap())
+    let tray_builder = TrayIconBuilder::new()
         .menu(&menu)
-        .tooltip("Everything - 极速文件搜索")
+        .tooltip("Everything - 极速文件搜索");
+    let tray_builder = if let Some(icon) = app.default_window_icon().cloned() {
+        tray_builder.icon(icon)
+    } else {
+        tray_builder
+    };
+    let _ = tray_builder
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
                 if let Some(window) = app.get_webview_window("main") {

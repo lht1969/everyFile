@@ -1,9 +1,11 @@
 use chrono::{DateTime, Local};
+use glob::Pattern;
 use regex::Regex;
 
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub keywords: Vec<String>,
+    pub glob_patterns: Vec<Pattern>,
     pub size_filter: Option<SizeFilter>,
     pub date_filter: Option<DateFilter>,
     pub path_filter: Option<String>,
@@ -52,8 +54,13 @@ pub enum DateType {
 }
 
 impl SearchQuery {
+    fn contains_glob_chars(s: &str) -> bool {
+        s.contains('*') || s.contains('?') || s.contains('[') || s.contains(']')
+    }
+
     pub fn parse(query_str: &str) -> Self {
         let mut keywords = Vec::new();
+        let mut glob_patterns = Vec::new();
         let mut size_filter = None;
         let mut date_filter = None;
         let mut path_filter = None;
@@ -68,6 +75,9 @@ impl SearchQuery {
             } else if part.starts_with("datemodified:")
                 || part.starts_with("datecreated:")
                 || part.starts_with("dateaccessed:")
+                || part.starts_with("dm:")
+                || part.starts_with("dc:")
+                || part.starts_with("da:")
             {
                 date_filter = Self::parse_date_filter(part);
             } else if part.starts_with("path:") {
@@ -82,6 +92,12 @@ impl SearchQuery {
                 if let Ok(re) = Regex::new(&part[6..]) {
                     regex_pattern = Some(re);
                 }
+            } else if Self::contains_glob_chars(part) {
+                if let Ok(pattern) = Pattern::new(part) {
+                    glob_patterns.push(pattern);
+                } else {
+                    keywords.push(part.to_string());
+                }
             } else {
                 keywords.push(part.to_string());
             }
@@ -89,6 +105,7 @@ impl SearchQuery {
 
         Self {
             keywords,
+            glob_patterns,
             size_filter,
             date_filter,
             path_filter,
@@ -101,6 +118,11 @@ impl SearchQuery {
         if !self.keywords.is_empty() {
             let name_lower = file.name.to_lowercase();
             if !self.keywords.iter().all(|kw| name_lower.contains(&kw.to_lowercase())) {
+                return false;
+            }
+        }
+        if !self.glob_patterns.is_empty() {
+            if !self.glob_patterns.iter().all(|p| p.matches_path(std::path::Path::new(file.name.as_ref()))) {
                 return false;
             }
         }
@@ -199,10 +221,16 @@ impl SearchQuery {
     fn parse_date_filter(part: &str) -> Option<DateFilter> {
         let (date_type_str, after_prefix) = if part.starts_with("datemodified:") {
             (DateType::Modified, &part[13..])
+        } else if part.starts_with("dm:") {
+            (DateType::Modified, &part[3..])
         } else if part.starts_with("datecreated:") {
             (DateType::Created, &part[12..])
+        } else if part.starts_with("dc:") {
+            (DateType::Created, &part[3..])
         } else if part.starts_with("dateaccessed:") {
             (DateType::Accessed, &part[13..])
+        } else if part.starts_with("da:") {
+            (DateType::Accessed, &part[3..])
         } else {
             return None;
         };

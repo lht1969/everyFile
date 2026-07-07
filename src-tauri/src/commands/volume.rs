@@ -118,10 +118,33 @@ pub async fn rebuild_index(
     state: State<'_, super::search::AppState>,
 ) -> Result<(), String> {
     log::info!("Rebuilding index...");
-    
+
+    let config = crate::config::Config::load().ok();
+    let include_hidden_files = config
+        .as_ref()
+        .map(|c| c.index_settings.include_hidden_files)
+        .unwrap_or(false);
+    let include_system_files = config
+        .as_ref()
+        .map(|c| c.index_settings.include_system_files)
+        .unwrap_or(false);
+    log::info!(
+        "Rebuild with include_hidden_files={}, include_system_files={}",
+        include_hidden_files,
+        include_system_files
+    );
+
     let mut vm = state.volume_manager.lock().await;
+
+    // 在重建索引前，将当前配置的隐藏/系统文件设置同步到已加载的卷监视器
+    for letter in vm.volumes() {
+        if let Some(monitor) = vm.get_monitor_mut(&letter) {
+            monitor.update_settings(include_hidden_files, include_system_files);
+        }
+    }
+
     vm.scan_all(None).map_err(|e| e.to_string())?;
-    
+
     Ok(())
 }
 

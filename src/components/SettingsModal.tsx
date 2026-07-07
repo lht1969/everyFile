@@ -260,8 +260,29 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
             <h3>索引管理</h3>
             <p>已索引文件: {indexStatus.file_count} 个</p>
             <p>索引状态: {indexStatus.message}</p>
+            {config && (
+              <div className="interval-setting">
+                <label className="interval-label" htmlFor="rebuild-interval">
+                  后台定时重建间隔（分钟）：
+                </label>
+                <input
+                  id="rebuild-interval"
+                  className="interval-input"
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={Math.round(config.update_interval / 60)}
+                  onChange={(e) => {
+                    const minutes = Math.max(0, parseInt(e.target.value) || 0);
+                    setConfig({ ...config, update_interval: minutes * 60 });
+                  }}
+                />
+                <span className="interval-hint">设为 0 表示不自动重建</span>
+                <span className="interval-hint interval-hint-note">（仅用于普通用户）</span>
+              </div>
+            )}
             <button className="rebuild-button" onClick={onRebuildIndex}>
-              重建索引
+              立即重建索引
             </button>
 
           </section>

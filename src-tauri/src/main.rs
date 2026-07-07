@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod config;
 mod error;
+mod file_logger; // 文件日志模块：将启动信息写入 %APPDATA%\Everything\logs\
 mod fs;
 mod index;
 mod search;
-mod config;
+mod tray_notification; // 托盘气泡通知模块：开机自启动时显示通知
 
 #[cfg(desktop)]
 mod tray;
@@ -20,7 +22,7 @@ use tokio::sync::Mutex;
 
 /**
  * 主函数，程序的入口点
- * 
+ *
  * 功能：
  * 1. 初始化日志系统
  * 2. 解析命令行参数，检查是否为静默模式
@@ -31,22 +33,86 @@ use tokio::sync::Mutex;
  * 7. 注册命令处理函数
  * 8. 运行应用
  */
+/// 检查单例实例，如果已有实例在运行则将其窗口置前并退出。
+/// 使用 Windows 命名 Mutex 实现跨进程检测。
+fn ensure_single_instance() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::SetLastError;
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+
+        unsafe {
+            SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
+            let name = "Everything_Tauri_Single_Instance\0";
+            let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = CreateMutexW(None, false, windows::core::PCWSTR(name_wide.as_ptr()));
+
+            // 通过 Error::from_win32() 检查是否已存在（ERROR_ALREADY_EXISTS = 183）
+            if windows::core::Error::from_win32().code().0 & 0x0000FFFF == 183 {
+                log::info!("Another instance detected, activating existing window");
+                // 查找已有窗口并置前
+                let title = "Everything - 极速文件搜索\0";
+                let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                let hwnd = FindWindowW(
+                    windows::core::PCWSTR(std::ptr::null()),
+                    windows::core::PCWSTR(title_wide.as_ptr()),
+                );
+                if hwnd.0 != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                }
+                return false;
+            }
+            // 第一个实例，创建的 mutex 句柄在进程退出时由 OS 自动清理
+        }
+    }
+    true
+}
+
 fn main() {
-    // 初始化日志系统，默认日志级别为 info
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    // 单例检查：确保只有一个实例在运行
+    if !ensure_single_instance() {
+        std::process::exit(0);
+    }
+
+    // 初始化文件日志（先于 env_logger，确保所有启动信息都能记录到文件）
+    // 日志文件位置: %APPDATA%\Everything\logs\everything-YYYY-MM-DD.log
+    file_logger::init();
+
+    // 初始化日志系统，使用自定义 DualLogger 同时输出到 stderr 和文件
+    // 这样开机启动（无控制台）时仍能在日志文件中查看
+    log::set_logger(&file_logger::DualLogger)
+        .map(|()| log::set_max_level(log::LevelFilter::Info))
+        .ok();
 
     // 记录应用启动信息
+    info!("=================================================");
     info!("Starting Everything Tauri v{}", env!("CARGO_PKG_VERSION"));
+    info!("Log directory: {:?}", file_logger::log_dir_path());
+    info!("=================================================");
 
     // 解析命令行参数，检查是否包含 -s 或 -S 参数（静默启动）
     let args: Vec<String> = std::env::args().collect();
     let silent_mode = args.contains(&"-s".to_string()) || args.contains(&"-S".to_string());
-    
+
+    // 获取程序自身路径（用于启动通知等）
+    let exe_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    info!("Executable path: {}", exe_path);
+    info!("Launch arguments: {:?}", args);
+
+    // 记录当前工作目录（从 Run 键启动时可能与预期不同）
+    if let Ok(cwd) = std::env::current_dir() {
+        info!("Current working directory: {:?}", cwd);
+    }
+
     // 如果是静默模式，记录日志
+    // 通知将在 Tauri setup 完成、托盘创建之后显示（见下方 setup 回调）
     if silent_mode {
-        info!("Starting in silent mode");
+        info!("Starting in silent mode (started with -s/-S flag)");
     }
 
     // 创建卷管理器，使用 Arc<Mutex> 实现线程安全
@@ -58,19 +124,40 @@ fn main() {
     let db_path = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("Everything");
-    std::fs::create_dir_all(&db_path).ok();
+    info!("Database directory: {:?}", db_path);
+    match std::fs::create_dir_all(&db_path) {
+        Ok(_) => info!("Database directory created/verified"),
+        Err(e) => log::error!("Failed to create database directory: {}", e),
+    }
     let db_path = db_path.join("everything.db");
+    info!("Database path: {:?}", db_path);
+
+    // 初始化索引管理器
+    info!("Initializing index manager...");
+    let index_manager = match index::IndexManager::new(&db_path) {
+        Ok(m) => {
+            info!("Index manager initialized successfully");
+            m
+        }
+        Err(e) => {
+            log::error!("FATAL: Failed to initialize index manager: {}", e);
+            eprintln!("FATAL: Failed to initialize index manager: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // 构建 Tauri 应用
+    info!("Building Tauri application...");
     tauri::Builder::default()
         // 注册 shell 插件
         .plugin(tauri_plugin_shell::init())
         // 注册 dialog 插件
         .plugin(tauri_plugin_dialog::init())
+        // 注册 notification 插件（用于开机启动时显示 Toast 通知）
+        .plugin(tauri_plugin_notification::init())
         // 管理应用状态
         .manage(AppState {
-            // 创建索引管理器
-            index_manager: index::IndexManager::new(&db_path).unwrap(),
+            index_manager,
             // 克隆卷管理器到应用状态
             volume_manager: volume_manager.clone(),
             is_searching: is_searching.clone(),
@@ -93,7 +180,7 @@ fn main() {
             let vm = volume_manager.clone();
             let handle = app.handle().clone();
             let handle_for_tray = app.handle().clone();
-            
+
             // 如果不是静默模式，显示窗口
             if !silent_mode {
                 if let Some(window) = app.get_webview_window("main") {
@@ -101,52 +188,89 @@ fn main() {
                     log::info!("Main window shown in normal mode");
                 }
             }
-           
+
             // 启动异步任务
             tauri::async_runtime::spawn(async move {
                 // 检查是否以管理员身份运行
                 let is_admin = fs::is_elevated();
                 // 获取卷管理器的锁
                 let mut volume_manager = vm.lock().await;
-                
+
                 // 加载配置
                 let config = crate::config::Config::load().ok();
                 // 获取配置中的监控卷
-                let monitored_from_config = config.as_ref().map(|c| c.monitored_volumes.clone()).unwrap_or_default();
+                let monitored_from_config = config
+                    .as_ref()
+                    .map(|c| c.monitored_volumes.clone())
+                    .unwrap_or_default();
                 // 获取配置中的索引设置
-                let include_hidden_files = config.as_ref().map(|c| c.index_settings.include_hidden_files).unwrap_or(false);
-                let include_system_files = config.as_ref().map(|c| c.index_settings.include_system_files).unwrap_or(false);
+                let include_hidden_files = config
+                    .as_ref()
+                    .map(|c| c.index_settings.include_hidden_files)
+                    .unwrap_or(false);
+                let include_system_files = config
+                    .as_ref()
+                    .map(|c| c.index_settings.include_system_files)
+                    .unwrap_or(false);
                 // 获取配置中的扫描所有卷选项
                 let scan_all_volumes = config.as_ref().map(|c| c.scan_all_volumes).unwrap_or(false);
-                
-                // 如果配置中启用了扫描所有卷，添加所有 NTFS 卷
-                if scan_all_volumes && is_admin {
+                log::info!(
+                    "Config: scan_all_volumes={}, admin={}, monitored={:?}",
+                    scan_all_volumes, is_admin, monitored_from_config
+                );
+
+                if scan_all_volumes {
+                    // 扫描所有卷（不依赖管理员权限，非管理员也能尝试添加可访问的卷）
+                    log::info!("scan_all_volumes is enabled, adding all NTFS volumes");
                     if let Ok(volumes) = fs::get_ntfs_volumes() {
                         for volume in &volumes {
-                            if let Err(e) = volume_manager.add_volume(&volume.drive_letter, is_admin, include_hidden_files, include_system_files) {
+                            if let Err(e) = volume_manager.add_volume(
+                                &volume.drive_letter,
+                                is_admin,
+                                include_hidden_files,
+                                include_system_files,
+                            ) {
                                 log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
                             }
                         }
                     }
                 } else if !monitored_from_config.is_empty() {
                     // 如果配置中有监控卷，添加这些卷
+                    log::info!("Adding volumes from config: {:?}", monitored_from_config);
                     for volume in &monitored_from_config {
-                        if let Err(e) = volume_manager.add_volume(volume, is_admin, include_hidden_files, include_system_files) {
+                        if let Err(e) = volume_manager.add_volume(
+                            volume,
+                            is_admin,
+                            include_hidden_files,
+                            include_system_files,
+                        ) {
                             log::warn!("Failed to add volume {} from config: {}", volume, e);
                         }
                     }
                 } else if is_admin {
                     // 如果以管理员身份运行，添加所有 NTFS 卷
+                    log::info!("Admin mode: adding all NTFS volumes");
                     if let Ok(volumes) = fs::get_ntfs_volumes() {
                         for volume in &volumes {
-                            if let Err(e) = volume_manager.add_volume(&volume.drive_letter, is_admin, include_hidden_files, include_system_files) {
+                            if let Err(e) = volume_manager.add_volume(
+                                &volume.drive_letter,
+                                is_admin,
+                                include_hidden_files,
+                                include_system_files,
+                            ) {
                                 log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
                             }
                         }
                     }
                 } else {
                     // 如果不是管理员，默认添加 C 盘
-                    if let Err(e) = volume_manager.add_volume("C:", is_admin, include_hidden_files, include_system_files) {
+                    log::info!("Non-admin mode: adding default C: volume");
+                    if let Err(e) = volume_manager.add_volume(
+                        "C:",
+                        is_admin,
+                        include_hidden_files,
+                        include_system_files,
+                    ) {
                         log::warn!("Failed to add volume C:: {}", e);
                     }
                 }
@@ -163,16 +287,19 @@ fn main() {
                             // 记录扫描结果
                             log::info!("Scanned volume {}: {} files", drive_letter, count);
                             // 发送扫描完成事件
-                            let _ = handle.emit("scan-complete", serde_json::json!({
-                                "volume": drive_letter,
-                                "count": count
-                            }));
+                            let _ = handle.emit(
+                                "scan-complete",
+                                serde_json::json!({
+                                    "volume": drive_letter,
+                                    "count": count
+                                }),
+                            );
                         }
                         // 将监控器返回给卷管理器
                         volume_manager.return_monitor(&drive_letter, m);
                     }
                 }
-                
+
                 // 释放卷管理器锁
                 drop(volume_manager);
 
@@ -201,17 +328,24 @@ fn main() {
                             // 对每个卷执行增量扫描
                             for drive_letter in volume_manager.volumes() {
                                 // 获取卷监控器
-                    let mut monitor = volume_manager.take_monitor(&drive_letter);
+                                let mut monitor = volume_manager.take_monitor(&drive_letter);
                                 if let Some(ref mut m) = monitor {
                                     // 执行增量扫描
                                     if let Ok(count) = m.scan() {
                                         // 如果有新文件或修改的文件，发送索引更新事件
                                         if count > 0 {
-                                            log::info!("Incremental update for {}: {} new/changed files", drive_letter, count);
-                                            let _ = handle_clone.emit("index-updated", serde_json::json!({
-                                                "volume": drive_letter,
-                                                "count": count
-                                            }));
+                                            log::info!(
+                                                "Incremental update for {}: {} new/changed files",
+                                                drive_letter,
+                                                count
+                                            );
+                                            let _ = handle_clone.emit(
+                                                "index-updated",
+                                                serde_json::json!({
+                                                    "volume": drive_letter,
+                                                    "count": count
+                                                }),
+                                            );
                                         }
                                     }
                                 }
@@ -232,9 +366,19 @@ fn main() {
             // 桌面平台设置系统托盘
             #[cfg(desktop)]
             {
-                if let Err(e) = tray::setup_tray(handle_for_tray) {
+                if let Err(e) = tray::setup_tray(handle_for_tray.clone()) {
                     log::error!("Failed to setup tray: {}", e);
                 }
+            }
+
+            // 静默启动时显示 Toast 通知（延迟3秒，确保托盘和系统UI就绪）
+            if silent_mode {
+                let app_handle_for_notify = handle_for_tray.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    log::info!("显示开机启动通知...");
+                    tray_notification::show_startup_notification(&app_handle_for_notify);
+                });
             }
 
             // 记录应用设置完成
@@ -281,5 +425,11 @@ fn main() {
         // 运行应用
         .run(tauri::generate_context!())
         // 处理应用运行错误
-        .expect("error while running tauri application");
+        .unwrap_or_else(|e| {
+            log::error!("Tauri application exited with error: {}", e);
+            eprintln!("Tauri application exited with error: {}", e);
+            std::process::exit(1);
+        });
+
+    info!("Application exited normally");
 }

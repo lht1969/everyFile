@@ -4,7 +4,28 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tauri::Emitter;
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
 const CACHE_TTL_SECS: u64 = 3600;
+
+/// Check if a file entry should be skipped based on hidden/system attribute settings.
+/// Returns true if the entry should be excluded (skipped).
+///
+/// Uses `#[cfg(windows)]` internally — on non-Windows always returns false.
+fn should_skip_by_attr(include_hidden: bool, include_system: bool, meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        let attrs = meta.file_attributes();
+        if !include_hidden && (attrs & 0x2) != 0 {
+            return true;
+        }
+        if !include_system && (attrs & 0x4) != 0 {
+            return true;
+        }
+    }
+    false
+}
 
 pub struct SearchCache {
     #[allow(dead_code)]
@@ -127,7 +148,6 @@ pub struct VolumeMonitor {
     drive_letter: String,
     files: Vec<SearchResult>,
     include_hidden_files: bool,
-    #[allow(dead_code)]
     include_system_files: bool,
 }
 
@@ -150,7 +170,13 @@ impl VolumeManager {
     }
 
     pub fn volumes(&self) -> Vec<String> {
-        self.volumes.keys().cloned().collect()
+        let mut vols: Vec<String> = self.volumes.keys().cloned().collect();
+        vols.sort_by(|a, b| {
+            let a_letter = a.trim_end_matches(':').to_uppercase();
+            let b_letter = b.trim_end_matches(':').to_uppercase();
+            a_letter.cmp(&b_letter)
+        });
+        vols
     }
 
     #[allow(dead_code)]
@@ -317,6 +343,12 @@ impl VolumeMonitor {
         }
     }
 
+    /// Update settings without recreating the monitor or clearing its file list.
+    pub fn update_settings(&mut self, include_hidden_files: bool, include_system_files: bool) {
+        self.include_hidden_files = include_hidden_files;
+        self.include_system_files = include_system_files;
+    }
+
     pub fn scan(&mut self) -> Result<usize> {
         self.files.clear();
 
@@ -328,13 +360,19 @@ impl VolumeMonitor {
 
         let walker = walkdir::WalkDir::new(&path)
             .max_depth(10)
-            .follow_links(self.include_hidden_files)
+            .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
 
                 if name.eq_ignore_ascii_case("$Recycle.Bin") {
                     return false;
+                }
+
+                if !self.include_system_files {
+                    if name.eq_ignore_ascii_case("System Volume Information") {
+                        return false;
+                    }
                 }
 
                 if !self.include_hidden_files && name.starts_with('.') {
@@ -348,6 +386,11 @@ impl VolumeMonitor {
 
         for entry in walker.filter_map(|e| e.ok()) {
             let metadata = entry.metadata().ok();
+            if let Some(ref m) = metadata {
+                if should_skip_by_attr(self.include_hidden_files, self.include_system_files, m) {
+                    continue;
+                }
+            }
             let (size, is_dir, _created, modified, _accessed) = if let Some(ref m) = metadata {
                 (
                     m.len(),
@@ -394,13 +437,19 @@ impl VolumeMonitor {
 
         let walker = walkdir::WalkDir::new(&path)
             .max_depth(10)
-            .follow_links(self.include_hidden_files)
+            .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
 
                 if name.eq_ignore_ascii_case("$Recycle.Bin") {
                     return false;
+                }
+
+                if !self.include_system_files {
+                    if name.eq_ignore_ascii_case("System Volume Information") {
+                        return false;
+                    }
                 }
 
                 if !self.include_hidden_files && name.starts_with('.') {
@@ -414,6 +463,11 @@ impl VolumeMonitor {
 
         for entry in walker.filter_map(|e| e.ok()) {
             let metadata = entry.metadata().ok();
+            if let Some(ref m) = metadata {
+                if should_skip_by_attr(self.include_hidden_files, self.include_system_files, m) {
+                    continue;
+                }
+            }
             let (size, is_dir, _created, modified, _accessed) = if let Some(ref m) = metadata {
                 (
                     m.len(),
