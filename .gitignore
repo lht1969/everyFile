@@ -3,3 +3,5 @@ src-tauri/target/
 .trae/
 node_modules
 .vscode/
+.mimocode/
+dist/
