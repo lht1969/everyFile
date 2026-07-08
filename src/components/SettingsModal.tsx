@@ -8,9 +8,10 @@ interface SettingsModalProps {
   onRebuildIndex: () => void;
   indexStatus: IndexStatus;
   onVolumeChange?: () => void;
+  rebuilding: boolean;
 }
 
-function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }: SettingsModalProps) {
+function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, rebuilding }: SettingsModalProps) {
   const [volumes, setVolumes] = useState<VolumeResponse[]>([]);
   const [monitoredVolumes, setMonitoredVolumes] = useState<VolumeResponse[]>([]);
   const [config, setConfig] = useState<ConfigResponse | null>(null);
@@ -97,11 +98,13 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
   };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className={`modal-overlay${rebuilding ? ' rebuilding' : ''}`} onClick={rebuilding ? undefined : onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <h2>设置</h2>
-          <button className="close-button" onClick={onClose}>×</button>
+          {!rebuilding && (
+            <button className="close-button" onClick={onClose}>×</button>
+          )}
         </div>
 
         <div className="modal-body">
@@ -229,16 +232,16 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange }:
                 <span className="interval-hint interval-hint-note">（仅用于普通用户）</span>
               </div>
             )}
-            <button className="rebuild-button" onClick={onRebuildIndex}>
-              立即重建索引
+            <button className="rebuild-button" onClick={onRebuildIndex} disabled={rebuilding}>
+              {rebuilding ? '正在重建索引...' : '立即重建索引'}
             </button>
 
           </section>
         </div>
 
         <div className="modal-footer">
-          <button type="button" className="cancel-button" onClick={onClose}>取消</button>
-          <button type="button" className="save-button" onClick={handleSaveConfig}>保存</button>
+          <button type="button" className="cancel-button" onClick={onClose} disabled={rebuilding}>取消</button>
+          <button type="button" className="save-button" onClick={handleSaveConfig} disabled={rebuilding}>保存</button>
         </div>
       </div>
     </div>

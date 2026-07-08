@@ -1,6 +1,8 @@
 use crate::fs::{get_ntfs_volumes, VolumeInfo};
 use serde::{Deserialize, Serialize};
 use tauri::State;
+#[allow(unused_imports)]
+use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeResponse {
@@ -121,6 +123,7 @@ pub async fn refresh_volumes(
 
 #[tauri::command]
 pub async fn rebuild_index(
+    app_handle: tauri::AppHandle,
     state: State<'_, super::search::AppState>,
 ) -> Result<(), String> {
     log::info!("Rebuilding index...");
@@ -149,7 +152,9 @@ pub async fn rebuild_index(
         }
     }
 
-    vm.scan_all(None).map_err(|e| e.to_string())?;
+    vm.scan_all_with_progress(&app_handle).map_err(|e| e.to_string())?;
+
+    let _ = app_handle.emit("rebuild-complete", ());
 
     Ok(())
 }

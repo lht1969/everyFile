@@ -861,3 +861,30 @@ body {
   width: 40px;
   color: var(--text-secondary);
 }
+
+.rebuild-button:disabled,
+.cancel-button:disabled,
+.save-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.rebuild-button:disabled:hover,
+.cancel-button:disabled:hover,
+.save-button:disabled:hover {
+  background: #fff;
+  border-color: var(--border-color);
+}
+
+.rebuild-button:disabled {
+  animation: pulse-text 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-text {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.modal-overlay.rebuilding {
+  cursor: wait;
+}

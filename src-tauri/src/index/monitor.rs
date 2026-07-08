@@ -9,6 +9,13 @@ use std::os::windows::fs::MetadataExt;
 
 const CACHE_TTL_SECS: u64 = 3600;
 
+pub struct IncrementalResult {
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub total: usize,
+}
+
 /// Check if a file entry should be skipped based on hidden/system attribute settings.
 /// Returns true if the entry should be excluded (skipped).
 ///
@@ -297,6 +304,18 @@ impl VolumeManager {
         Ok(total)
     }
 
+    pub fn scan_all_with_progress(&mut self, handle: &tauri::AppHandle) -> Result<usize> {
+        let mut total = 0;
+        for (drive_letter, monitor) in self.volumes.iter_mut() {
+            let count = monitor.scan_with_progress_callback(handle)?;
+            log::info!("Scanned volume {}: {} files", drive_letter, count);
+            total += count;
+            let _ = handle.emit("scan-complete", serde_json::json!({"volume": drive_letter, "count": count}));
+        }
+        self.search_cache = None;
+        Ok(total)
+    }
+
     #[allow(dead_code)]
     pub fn start_listening_all(&mut self) -> Result<()> {
         log::info!("Started listening to all volumes");
@@ -429,7 +448,7 @@ impl VolumeMonitor {
             self.files.push(result);
             count += 1;
 
-            if count % 20000 == 0 {
+            if count % 5000 == 0 {
                 if let Some(ref mut cb) = on_progress {
                     cb(count);
                 }
@@ -456,6 +475,116 @@ impl VolumeMonitor {
             );
         };
         self.process_walker(walker, Some(&mut on_progress))
+    }
+
+    pub fn scan_incremental(&mut self, handle: &tauri::AppHandle) -> Result<IncrementalResult> {
+        let include_hidden = self.include_hidden_files;
+        let include_system = self.include_system_files;
+
+        // Build path→index map from existing files
+        let mut path_map: HashMap<String, usize> = HashMap::with_capacity(self.files.len());
+        for (i, f) in self.files.iter().enumerate() {
+            path_map.insert(f.path.to_string(), i);
+        }
+
+        let mut visited: Vec<bool> = vec![false; self.files.len()];
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        let drive_letter = self.drive_letter.clone();
+
+        let walker = self.build_walker();
+        for entry in walker
+            .into_iter()
+            .filter_entry(move |e| {
+                let name = e.file_name().to_string_lossy();
+                if name.eq_ignore_ascii_case("$Recycle.Bin") { return false; }
+                if !include_system && name.eq_ignore_ascii_case("System Volume Information") { return false; }
+                if !include_hidden && name.starts_with('.') { return false; }
+                true
+            })
+            .filter_map(|e| e.ok())
+        {
+            let metadata = entry.metadata().ok();
+            if let Some(ref m) = metadata {
+                if should_skip_by_attr(self.include_hidden_files, self.include_system_files, m) {
+                    continue;
+                }
+            }
+            let (size, is_dir, _created, modified, _accessed) = if let Some(ref m) = metadata {
+                (m.len(), m.is_dir(), m.created().ok(), m.modified().ok(), m.accessed().ok())
+            } else {
+                (0, false, None, None, None)
+            };
+
+            let modified_ts = modified
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path_str = entry.path().to_string_lossy().to_string();
+
+            if let Some(&idx) = path_map.get(&path_str) {
+                // Existing file — check if modified
+                visited[idx] = true;
+                let existing = &self.files[idx];
+                if existing.modified_time != modified_ts || existing.size != size {
+                    self.files[idx] = SearchResult {
+                        file_id: existing.file_id,
+                        name: name.into(),
+                        path: path_str.into(),
+                        size,
+                        modified_time: modified_ts,
+                        is_directory: is_dir,
+                    };
+                    updated += 1;
+                }
+            } else {
+                // New file
+                let file_id = self.files.len() as u64;
+                self.files.push(SearchResult {
+                    file_id,
+                    name: name.into(),
+                    path: path_str.clone().into(),
+                    size,
+                    modified_time: modified_ts,
+                    is_directory: is_dir,
+                });
+                path_map.insert(path_str, self.files.len() - 1);
+                visited.push(true);
+                added += 1;
+            }
+
+            let total_processed = added + updated;
+            if total_processed > 0 && total_processed % 5000 == 0 {
+                let _ = handle.emit(
+                    "scan-progress",
+                    serde_json::json!({"volume": drive_letter, "count": total_processed}),
+                );
+            }
+        }
+
+        // Remove files that were not visited (deleted files)
+        let old_len = self.files.len();
+        let mut new_files = Vec::with_capacity(self.files.len());
+        for (i, file) in self.files.iter().enumerate() {
+            if i < visited.len() && visited[i] {
+                new_files.push(file.clone());
+            }
+        }
+        let removed = old_len - new_files.len();
+        self.files = new_files;
+
+        // Reassign file_ids to eliminate gaps
+        for (i, f) in self.files.iter_mut().enumerate() {
+            f.file_id = i as u64;
+        }
+
+        log::info!(
+            "Incremental scan {}: +{} ~{} -{} (total: {})",
+            drive_letter, added, updated, removed, self.files.len()
+        );
+
+        Ok(IncrementalResult { added, updated, removed, total: self.files.len() })
     }
 
     #[allow(dead_code)]

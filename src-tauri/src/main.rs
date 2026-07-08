@@ -330,20 +330,21 @@ fn main() {
                                 // 获取卷监控器
                                 let mut monitor = volume_manager.take_monitor(&drive_letter);
                                 if let Some(ref mut m) = monitor {
-                                    // 执行增量扫描
-                                    if let Ok(count) = m.scan() {
-                                        // 如果有新文件或修改的文件，发送索引更新事件
-                                        if count > 0 {
+                                    // 执行真正的增量扫描
+                                    if let Ok(result) = m.scan_incremental(&handle_clone) {
+                                        if result.added > 0 || result.updated > 0 || result.removed > 0 {
                                             log::info!(
-                                                "Incremental update for {}: {} new/changed files",
-                                                drive_letter,
-                                                count
+                                                "Incremental {}: +{} ~{} -{} (total: {})",
+                                                drive_letter, result.added, result.updated, result.removed, result.total
                                             );
                                             let _ = handle_clone.emit(
                                                 "index-updated",
                                                 serde_json::json!({
                                                     "volume": drive_letter,
-                                                    "count": count
+                                                    "added": result.added,
+                                                    "updated": result.updated,
+                                                    "removed": result.removed,
+                                                    "total": result.total
                                                 }),
                                             );
                                         }

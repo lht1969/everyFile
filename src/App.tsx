@@ -20,6 +20,7 @@ function App() {
   const [searchState, setSearchState] = useState({ query: '', filesOnly: true, directoriesOnly: false });
   const [sortState, setSortState] = useState<{ field: SortField; direction: SortDirection }>({ field: 'name', direction: 'asc' });
   const [scrollTrigger, setScrollTrigger] = useState(0);
+  const [rebuilding, setRebuilding] = useState(false);
   const rebuildingRef = useRef(false);
 
   useEffect(() => {
@@ -237,12 +238,15 @@ function App() {
   };
 
   const handleRebuildIndex = async () => {
+    setRebuilding(true);
     try {
       await invoke('rebuild_index');
       await loadIndexStatus();
       loadAllFiles();
     } catch (e) {
       console.error('Failed to rebuild index:', e);
+    } finally {
+      setRebuilding(false);
     }
   };
 
@@ -310,6 +314,7 @@ function App() {
           onRebuildIndex={handleRebuildIndex}
           indexStatus={indexStatus}
           onVolumeChange={() => loadAllFiles()}
+          rebuilding={rebuilding}
         />
       )}
     </div>

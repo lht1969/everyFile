@@ -63,7 +63,7 @@ pub fn add_startup() -> std::result::Result<(), String> {
 #[tauri::command]
 pub fn remove_startup() -> std::result::Result<(), String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu.open_subkey(startup_key_path())
+    let key = hkcu.open_subkey_with_flags(startup_key_path(), KEY_WRITE)
         .map_err(|e| format!("打开注册表 HKCU\\{} 失败: {}", startup_key_path(), e))?;
 
     match key.delete_value("Everything Tauri") {
