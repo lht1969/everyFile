@@ -41,7 +41,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
     const debounce = setTimeout(() => {
       onSearch(query, filterType === 'files', filterType === 'directories');
       fetchSuggestions(query);
-    }, 150);
+    }, 350);
     return () => clearTimeout(debounce);
   }, [query, filterType]);
 
@@ -170,8 +170,8 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
           </div>
           <div className="help-popup-body">
             <div className="help-section">
-              <h4>文件名搜索（Glob 通配符）</h4>
-              <p>直接输入关键词搜索文件名，不区分大小写。支持通配符：</p>
+              <h4>文件名搜索</h4>
+              <p>输入关键词搜索文件名（不含路径），不区分大小写。支持通配符：</p>
               <div className="help-example"><code>*</code> 任意字符，<code>?</code> 单个字符，<code>[...]</code> 字符集</div>
               <div className="help-example"><code>chs*</code> 以 chs 开头</div>
               <div className="help-example"><code>*.rs</code> 所有 Rust 源文件</div>

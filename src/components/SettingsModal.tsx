@@ -229,7 +229,6 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
                   }}
                 />
                 <span className="interval-hint">设为 0 表示不自动重建</span>
-                <span className="interval-hint interval-hint-note">（仅用于普通用户）</span>
               </div>
             )}
             <button className="rebuild-button" onClick={onRebuildIndex} disabled={rebuilding}>

@@ -303,65 +303,86 @@ fn main() {
                 // 释放卷管理器锁
                 drop(volume_manager);
 
-                // 如果以管理员身份运行，启动增量更新任务
-                if is_admin {
-                    // 克隆卷管理器和应用句柄
-                    let vm_clone = vm.clone();
-                    let handle_clone = handle.clone();
-                    let is_searching_clone = is_searching.clone();
-                    let last_update_clone = last_index_update.clone();
+                // 启动增量更新任务（所有用户）
+                let vm_clone = vm.clone();
+                let handle_clone = handle.clone();
+                let is_searching_clone = is_searching.clone();
+                let last_update_clone = last_index_update.clone();
 
-                    // 启动增量更新任务
-                    tauri::async_runtime::spawn(async move {
-                        // 无限循环，每120秒执行一次
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+                tauri::async_runtime::spawn(async move {
+                    let mut next_scan: Option<tokio::time::Instant> = None;
 
-                            // 如果正在搜索，跳过增量更新
-                            if is_searching_clone.load(Ordering::SeqCst) {
-                                continue;
-                            }
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-                            // 获取卷管理器的锁
-                            let mut volume_manager = vm_clone.lock().await;
+                        let config = crate::config::Config::load().ok();
+                        let interval = config
+                            .as_ref()
+                            .map(|c| c.index_settings.update_interval as u64)
+                            .unwrap_or(300);
 
-                            // 对每个卷执行增量扫描
-                            for drive_letter in volume_manager.volumes() {
-                                // 获取卷监控器
-                                let mut monitor = volume_manager.take_monitor(&drive_letter);
-                                if let Some(ref mut m) = monitor {
-                                    // 执行真正的增量扫描
-                                    if let Ok(result) = m.scan_incremental(&handle_clone) {
-                                        if result.added > 0 || result.updated > 0 || result.removed > 0 {
-                                            log::info!(
-                                                "Incremental {}: +{} ~{} -{} (total: {})",
-                                                drive_letter, result.added, result.updated, result.removed, result.total
-                                            );
-                                            let _ = handle_clone.emit(
-                                                "index-updated",
-                                                serde_json::json!({
-                                                    "volume": drive_letter,
-                                                    "added": result.added,
-                                                    "updated": result.updated,
-                                                    "removed": result.removed,
-                                                    "total": result.total
-                                                }),
-                                            );
-                                        }
+                        if interval == 0 {
+                            next_scan = None;
+                            continue;
+                        }
+
+                        let now = tokio::time::Instant::now();
+                        let should_scan = match next_scan {
+                            Some(t) => now >= t,
+                            None => true,
+                        };
+                        if !should_scan {
+                            continue;
+                        }
+
+                        if is_searching_clone.load(Ordering::SeqCst) {
+                            continue;
+                        }
+
+                        let include_hidden = config
+                            .as_ref()
+                            .map(|c| c.index_settings.include_hidden_files)
+                            .unwrap_or(false);
+                        let include_system = config
+                            .as_ref()
+                            .map(|c| c.index_settings.include_system_files)
+                            .unwrap_or(false);
+
+                        let mut volume_manager = vm_clone.lock().await;
+
+                        for drive_letter in volume_manager.volumes() {
+                            let mut monitor = volume_manager.take_monitor(&drive_letter);
+                            if let Some(ref mut m) = monitor {
+                                m.update_settings(include_hidden, include_system);
+                                if let Ok(result) = m.scan_incremental(&handle_clone) {
+                                    if result.added > 0 || result.updated > 0 || result.removed > 0 {
+                                        log::info!(
+                                            "Incremental {}: +{} ~{} -{} (total: {})",
+                                            drive_letter, result.added, result.updated, result.removed, result.total
+                                        );
+                                        let _ = handle_clone.emit(
+                                            "index-updated",
+                                            serde_json::json!({
+                                                "volume": drive_letter,
+                                                "added": result.added,
+                                                "updated": result.updated,
+                                                "removed": result.removed,
+                                                "total": result.total
+                                            }),
+                                        );
                                     }
                                 }
-                                // 将监控器返回给卷管理器
-                                if let Some(m) = monitor {
-                                    volume_manager.return_monitor(&drive_letter, m);
-                                }
                             }
-
-                            // 更新最后索引更新时间
-                            let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                            *last_update_clone.lock().await = now;
+                            if let Some(m) = monitor {
+                                volume_manager.return_monitor(&drive_letter, m);
+                            }
                         }
-                    });
-                }
+
+                        let now_str = chrono::Local::now().format("%H:%M:%S").to_string();
+                        *last_update_clone.lock().await = now_str;
+                        next_scan = Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(interval));
+                    }
+                });
             });
 
             // 桌面平台设置系统托盘

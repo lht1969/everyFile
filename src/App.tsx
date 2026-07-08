@@ -6,7 +6,7 @@ import SearchPanel from './components/SearchPanel';
 import ResultList from './components/ResultList';
 import StatusBar from './components/StatusBar';
 import SettingsModal from './components/SettingsModal';
-import type { SearchResult, SearchResponse, RecordsRangeResponse, IndexStatus, AppConfig, SortField, SortDirection } from './types';
+import type { SearchResult, SearchResponse, RecordsRangeResponse, IndexStatus, SortField, SortDirection } from './types';
 import './App.css';
 
 function App() {
@@ -16,57 +16,16 @@ function App() {
   const [indexStatus, setIndexStatus] = useState<IndexStatus>({ status: 'ready', file_count: 0, progress: 1, message: '', volumes: [], last_update: '' });
   const [showSettings, setShowSettings] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [config, setConfig] = useState<AppConfig | null>(null);
   const [searchState, setSearchState] = useState({ query: '', filesOnly: true, directoriesOnly: false });
   const [sortState, setSortState] = useState<{ field: SortField; direction: SortDirection }>({ field: 'name', direction: 'asc' });
   const [scrollTrigger, setScrollTrigger] = useState(0);
   const [rebuilding, setRebuilding] = useState(false);
-  const rebuildingRef = useRef(false);
 
   useEffect(() => {
-    loadConfig();
     loadIndexStatus();
     checkAdmin();
     loadAllFiles();
   }, []);
-
-  const loadConfig = async () => {
-    try {
-      const cfg = await invoke<AppConfig>('get_config');
-      setConfig(cfg);
-    } catch (e) {
-      console.error('Failed to load config:', e);
-    }
-  };
-
-  // 设置面板关闭后重新加载配置，使定时器拿到最新值
-  useEffect(() => {
-    if (!showSettings) {
-      loadConfig();
-    }
-  }, [showSettings]);
-
-  // 后台定时重建索引（仅非管理员用户启用）
-  useEffect(() => {
-    if (isAdmin || !config || config.update_interval <= 0) return;
-
-    const intervalMs = config.update_interval * 1000;
-    const timer = setInterval(async () => {
-      if (rebuildingRef.current) return;
-      rebuildingRef.current = true;
-      try {
-        await invoke('rebuild_index');
-        await loadIndexStatus();
-        loadAllFiles();
-      } catch (e) {
-        console.error('Background rebuild failed:', e);
-      } finally {
-        rebuildingRef.current = false;
-      }
-    }, intervalMs);
-
-    return () => clearInterval(timer);
-  }, [isAdmin, config?.update_interval]);
 
   useEffect(() => {
     const unlistenComplete = listen<{ volume: string; count: number }>('scan-complete', (_event) => {

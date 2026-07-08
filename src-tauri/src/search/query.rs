@@ -123,11 +123,7 @@ impl SearchQuery {
     pub fn matches(&self, file: &crate::search::SearchResult) -> bool {
         if !self.keywords.is_empty() {
             let name_lower = file.name.to_lowercase();
-            let path_lower = file.path.to_lowercase();
-            if !self.keywords.iter().all(|kw| {
-                let kw_lower = kw.to_lowercase();
-                name_lower.contains(&kw_lower) || path_lower.contains(&kw_lower)
-            }) {
+            if !self.keywords.iter().all(|kw| name_lower.contains(&kw.to_lowercase())) {
                 return false;
             }
         }
@@ -396,9 +392,9 @@ mod tests {
     }
 
     #[test]
-    fn test_keyword_matches_path() {
+    fn test_keyword_name_only_not_path() {
         let q = SearchQuery::parse("local");
-        assert!(q.matches(&crate::search::SearchResult {
+        assert!(!q.matches(&crate::search::SearchResult {
             file_id: 1,
             name: "EBWebView".into(),
             path: "C:\\Users\\lht\\AppData\\Local\\EBWebView".into(),
@@ -406,12 +402,20 @@ mod tests {
             modified_time: 0,
             is_directory: true,
         }));
+        assert!(q.matches(&crate::search::SearchResult {
+            file_id: 2,
+            name: "local".into(),
+            path: "C:\\Somewhere".into(),
+            size: 0,
+            modified_time: 0,
+            is_directory: true,
+        }));
     }
 
     #[test]
-    fn test_folder_modifier_with_path_keyword() {
-        // user scenario: find folders under C:\Users with "local" anywhere in path
-        let q = SearchQuery::parse("local :folder path:C:\\Users");
+    fn test_folder_modifier_matches_name_and_path_filter() {
+        // keyword matches name, :folder ensures directory-only, path: filters by path
+        let q = SearchQuery::parse("EBWebView :folder path:C:\\Users");
         assert!(q.matches(&crate::search::SearchResult {
             file_id: 1,
             name: "EBWebView".into(),

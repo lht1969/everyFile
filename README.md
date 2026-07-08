@@ -87,9 +87,8 @@ datemodified:>=today   # 今天及之后修改的文件
 
 ```
 path:Downloads                  # 路径中包含 Downloads 的文件
-path:C:\Users :folder           # 仅匹配 C:\Users 路径下的文件夹
-path:D:\ :folders               # 仅匹配 D:\ 下的所有文件夹
-local :folder path:C:\Users     # 仅匹配 C:\Users 下名为 local 的文件夹
+path:C:\Users\Local :folder     # 仅匹配 C:\Users\Local 路径下的文件夹
+EBWebView :folder path:C:\Users # 仅匹配 C:\Users 下名为 EBWebView 的文件夹
 ```
 
 ### 正则搜索
