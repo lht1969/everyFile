@@ -134,8 +134,10 @@ function App() {
   }, [sortState]);
 
   const handleSortChange = useCallback(async (field: SortField, direction: SortDirection) => {
+    const myId = ++fetchCounterRef.current;
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
+    setResults([]);
     try {
       const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
         sortBy: field,
@@ -143,12 +145,14 @@ function App() {
         start: 0,
         end: 50
       });
-      setTotalCount(response.total);
-      setResults(response.results);
+      if (myId === fetchCounterRef.current) {
+        setTotalCount(response.total);
+        setResults(response.results);
+      }
     } catch (e) {
       console.error('Sort failed, falling back to re-search:', e);
       try {
-        const response = await invoke<SearchResponse>('search_files', {
+        await invoke<SearchResponse>('search_files', {
           params: {
             query: searchState.query,
             files_only: searchState.filesOnly,
@@ -157,8 +161,16 @@ function App() {
             sort_direction: direction
           }
         });
-        setTotalCount(response.total);
-        setResults(response.results);
+        const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
+          sortBy: field,
+          sortDirection: direction,
+          start: 0,
+          end: 50
+        });
+        if (myId === fetchCounterRef.current) {
+          setTotalCount(response.total);
+          setResults(response.results);
+        }
       } catch (e2) {
         console.error('Fallback sort also failed:', e2);
       }

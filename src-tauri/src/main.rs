@@ -370,6 +370,7 @@ fn main() {
                                                 "total": result.total
                                             }),
                                         );
+                                        volume_manager.invalidate_cache();
                                     }
                                 }
                             }
