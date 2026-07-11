@@ -1,6 +1,7 @@
-use crate::error::Result;
+﻿use crate::error::Result;
 use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tauri::Emitter;
 
@@ -14,6 +15,10 @@ pub struct IncrementalResult {
     pub updated: usize,
     pub removed: usize,
     pub total: usize,
+    /// old_index → Some(new_index) for surviving files, None for removed
+    pub index_map: Vec<Option<usize>>,
+    /// indices (in rebuilt files Vec) of newly added files to check against query
+    pub new_file_indices: Vec<usize>,
 }
 
 /// Check if a file entry should be skipped based on hidden/system attribute settings.
@@ -35,11 +40,8 @@ fn should_skip_by_attr(include_hidden: bool, include_system: bool, meta: &std::f
 }
 
 pub struct SearchCache {
-    #[allow(dead_code)]
     query: String,
-    #[allow(dead_code)]
     files_only: bool,
-    #[allow(dead_code)]
     directories_only: bool,
     pub total: usize,
     pub created_at: Instant,
@@ -353,6 +355,56 @@ impl VolumeManager {
         Some((results, total))
     }
 
+    pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) {
+        let cache = match self.search_cache.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut new_matched: Vec<(String, usize)> = Vec::with_capacity(cache.matched.len());
+
+        for (vol, idx) in cache.matched.drain(..) {
+            if vol != drive_letter {
+                new_matched.push((vol, idx));
+            } else if idx < result.index_map.len() {
+                if let Some(new_idx) = result.index_map[idx] {
+                    new_matched.push((vol, new_idx));
+                }
+            }
+        }
+
+        // Add new files that match the current search query
+        if !result.new_file_indices.is_empty() {
+            if let Some(volume) = self.volumes.get(drive_letter) {
+                let query = if cache.query.trim().is_empty() {
+                    None
+                } else {
+                    Some(crate::search::query::SearchQuery::parse(&cache.query))
+                };
+
+                for &new_idx in &result.new_file_indices {
+                    if new_idx >= volume.files.len() { continue; }
+                    let file = &volume.files[new_idx];
+
+                    if let Some(ref q) = query {
+                        if !crate::search::query::SearchQuery::matches(q, file) { continue; }
+                    }
+                    if cache.files_only && file.is_directory { continue; }
+                    if cache.directories_only && !file.is_directory { continue; }
+
+                    new_matched.push((drive_letter.to_string(), new_idx));
+                }
+            }
+        }
+
+        cache.matched = new_matched;
+        cache.total = cache.matched.len();
+        cache.sorted_by_name = None;
+        cache.sorted_by_path = None;
+        cache.sorted_by_size = None;
+        cache.sorted_by_modified = None;
+    }
+
     #[allow(dead_code)]
     pub fn invalidate_cache(&mut self) {
         self.search_cache = None;
@@ -488,6 +540,7 @@ impl VolumeMonitor {
         }
 
         let mut visited: Vec<bool> = vec![false; self.files.len()];
+        let mut added_paths: HashSet<String> = HashSet::new();
         let mut added = 0usize;
         let mut updated = 0usize;
         let drive_letter = self.drive_letter.clone();
@@ -549,6 +602,7 @@ impl VolumeMonitor {
                     modified_time: modified_ts,
                     is_directory: is_dir,
                 });
+                added_paths.insert(path_str.clone());
                 path_map.insert(path_str, self.files.len() - 1);
                 visited.push(true);
                 added += 1;
@@ -565,9 +619,11 @@ impl VolumeMonitor {
 
         // Remove files that were not visited (deleted files)
         let old_len = self.files.len();
+        let mut index_map = vec![None; old_len];
         let mut new_files = Vec::with_capacity(self.files.len());
         for (i, file) in self.files.iter().enumerate() {
             if i < visited.len() && visited[i] {
+                index_map[i] = Some(new_files.len());
                 new_files.push(file.clone());
             }
         }
@@ -579,12 +635,19 @@ impl VolumeMonitor {
             f.file_id = i as u64;
         }
 
+        // Find indices of newly added files for cache update
+        let new_file_indices: Vec<usize> = self.files.iter()
+            .enumerate()
+            .filter(|(_, f)| added_paths.contains(f.path.as_ref()))
+            .map(|(i, _)| i)
+            .collect();
+
         log::info!(
             "Incremental scan {}: +{} ~{} -{} (total: {})",
             drive_letter, added, updated, removed, self.files.len()
         );
 
-        Ok(IncrementalResult { added, updated, removed, total: self.files.len() })
+        Ok(IncrementalResult { added, updated, removed, total: self.files.len(), index_map, new_file_indices })
     }
 
     #[allow(dead_code)]

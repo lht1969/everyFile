@@ -32,8 +32,10 @@ function App() {
       loadIndexStatus();
     });
 
-    const unlistenUpdated = listen<{ volume: string; count: number }>('index-updated', (_event) => {
+    const unlistenUpdated = listen<{ volume: string; count: number }>('index-updated', async (_event) => {
       loadIndexStatus();
+      const { start, end } = visibleRangeRef.current;
+      fetchRecordsRange(start, end);
     });
 
     return () => {
@@ -90,6 +92,7 @@ function App() {
   sortStateRef.current = sortState;
 
   const fetchCounterRef = useRef(0);
+  const visibleRangeRef = useRef({ start: 0, end: 50 });
 
   const fetchRecordsRange = useCallback(async (start: number, end: number) => {
     const myId = ++fetchCounterRef.current;
@@ -137,7 +140,6 @@ function App() {
     const myId = ++fetchCounterRef.current;
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
-    setResults([]);
     try {
       const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
         sortBy: field,
@@ -178,6 +180,7 @@ function App() {
   }, [searchState]);
 
   const handleVisibleRangeChange = useCallback(async (start: number, end: number) => {
+    visibleRangeRef.current = { start, end };
     fetchRecordsRange(start, end);
   }, [fetchRecordsRange]);
 
