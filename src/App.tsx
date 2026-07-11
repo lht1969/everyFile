@@ -85,6 +85,7 @@ function App() {
       }
     } catch (e) {
       console.error('Failed to load all files:', e);
+      message(`加载文件失败: ${e}`, { title: '错误', kind: 'error' });
     }
   };
 
@@ -104,12 +105,17 @@ function App() {
       }
     } catch (e) {
       console.error('Failed to fetch records range:', e);
+      message(`获取数据失败: ${e}`, { title: '错误', kind: 'error' });
     }
   }, []);
 
+  const searchCounterRef = useRef(0);
+
   const handleSearch = useCallback(async (searchQuery: string, filesOnly?: boolean, directoriesOnly?: boolean) => {
+    const myId = ++searchCounterRef.current;
     setSearchState({ query: searchQuery, filesOnly: filesOnly ?? true, directoriesOnly: directoriesOnly ?? false });
     setScrollTrigger(prev => prev + 1);
+    setStatusMessage('搜索中...');
 
     try {
       const response = await invoke<SearchResponse>('search_files', {
@@ -121,18 +127,21 @@ function App() {
           sort_direction: sortState.direction
         }
       });
+      if (myId !== searchCounterRef.current) return;
       setTotalCount(response.total);
       if (response.results.length > 0) {
         setResults(response.results);
       } else if (response.total > 0) {
         const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50, sortBy: sortState.field, sortDirection: sortState.direction });
-        setResults(range.results);
+        if (myId === searchCounterRef.current) setResults(range.results);
       } else {
         setResults([]);
       }
       setStatusMessage(searchQuery.trim() ? `找到 ${response.total} 个结果` : '');
     } catch (e) {
+      if (myId !== searchCounterRef.current) return;
       console.error('Search failed:', e);
+      message(`搜索失败: ${e}`, { title: '错误', kind: 'error' });
     }
   }, [sortState]);
 
@@ -175,13 +184,21 @@ function App() {
         }
       } catch (e2) {
         console.error('Fallback sort also failed:', e2);
+        message(`排序失败: ${e2}`, { title: '错误', kind: 'error' });
       }
     }
   }, [searchState]);
 
-  const handleVisibleRangeChange = useCallback(async (start: number, end: number) => {
+  const rangeChangeTimerRef = useRef<number | null>(null);
+
+  const handleVisibleRangeChange = useCallback((start: number, end: number) => {
     visibleRangeRef.current = { start, end };
-    fetchRecordsRange(start, end);
+    if (rangeChangeTimerRef.current !== null) {
+      clearTimeout(rangeChangeTimerRef.current);
+    }
+    rangeChangeTimerRef.current = window.setTimeout(() => {
+      fetchRecordsRange(start, end);
+    }, 80);
   }, [fetchRecordsRange]);
 
   const handleOpenFile = async (path: string) => {
@@ -189,6 +206,7 @@ function App() {
       await invoke('open_file', { path });
     } catch (e) {
       console.error('Failed to open file:', e);
+      message(`无法打开文件: ${e}`, { title: '错误', kind: 'error' });
     }
   };
 
@@ -197,6 +215,7 @@ function App() {
       await invoke('open_folder', { path });
     } catch (e) {
       console.error('Failed to open folder:', e);
+      message(`无法打开文件夹: ${e}`, { title: '错误', kind: 'error' });
     }
   };
 
@@ -220,6 +239,7 @@ function App() {
       loadAllFiles();
     } catch (e) {
       console.error('Failed to rebuild index:', e);
+      message(`重建索引失败: ${e}`, { title: '错误', kind: 'error' });
     } finally {
       setRebuilding(false);
     }
@@ -253,6 +273,7 @@ function App() {
       });
     } catch (e) {
       console.error('Export failed:', e);
+      message(`导出失败: ${e}`, { title: '错误', kind: 'error' });
     }
   };
 

@@ -15,16 +15,6 @@ pub struct SearchResult {
 
 impl SearchResult {
     #[inline]
-    pub fn name_lower(&self) -> String {
-        self.name.to_lowercase()
-    }
-
-    #[inline]
-    pub fn path_lower(&self) -> String {
-        self.path.to_lowercase()
-    }
-
-    #[inline]
     pub fn formatted_size(&self) -> String {
         Self::format_size_static(self.size)
     }

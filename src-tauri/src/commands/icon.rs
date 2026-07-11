@@ -1,6 +1,6 @@
 use base64::Engine;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
@@ -8,7 +8,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 lazy_static::lazy_static! {
-    static ref ICON_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    static ref ICON_CACHE: RwLock<HashMap<String, String>> = RwLock::new(HashMap::new());
 }
 
 #[tauri::command]
@@ -24,7 +24,7 @@ pub async fn get_file_icon(file_path: String, is_directory: bool) -> Result<Stri
     };
 
     {
-        let cache = ICON_CACHE.lock().map_err(|e| e.to_string())?;
+        let cache = ICON_CACHE.read().map_err(|e| e.to_string())?;
         if let Some(icon) = cache.get(&key) {
             return Ok(icon.clone());
         }
@@ -36,7 +36,7 @@ pub async fn get_file_icon(file_path: String, is_directory: bool) -> Result<Stri
         .map_err(|e| e.to_string())??;
 
     {
-        let mut cache = ICON_CACHE.lock().map_err(|e| e.to_string())?;
+        let mut cache = ICON_CACHE.write().map_err(|e| e.to_string())?;
         cache.insert(key, icon_data.clone());
     }
 

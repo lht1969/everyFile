@@ -10,14 +10,10 @@ use windows::Win32::Storage::FileSystem::{
 #[derive(Debug, Clone)]
 pub struct VolumeInfo {
     pub drive_letter: String,
-    #[allow(dead_code)]
-    pub device_path: String,
     pub volume_name: String,
     pub file_system: String,
     pub total_size: u64,
     pub free_space: u64,
-    #[allow(dead_code)]
-    pub serial_number: u32,
 }
 
 pub fn get_ntfs_volumes() -> Result<Vec<VolumeInfo>> {
@@ -96,12 +92,10 @@ pub fn get_volume_info(drive_letter: &str) -> Result<VolumeInfo> {
 
     Ok(VolumeInfo {
         drive_letter: drive_letter.to_string(),
-        device_path: format!("\\\\.\\{}", drive_letter),
         volume_name,
         file_system,
         total_size: total_number_of_bytes,
         free_space: free_bytes_available,
-        serial_number,
     })
 }
 

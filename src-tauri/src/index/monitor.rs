@@ -188,7 +188,6 @@ impl VolumeManager {
         vols
     }
 
-    #[allow(dead_code)]
     pub fn get_monitor_mut(&mut self, drive_letter: &str) -> Option<&mut VolumeMonitor> {
         self.volumes.get_mut(drive_letter)
     }
@@ -205,20 +204,11 @@ impl VolumeManager {
         self.volumes.values().map(|v| v.files.len()).sum()
     }
 
-    #[allow(dead_code)]
     pub fn get_file_count(&self, drive_letter: &str) -> usize {
         self.volumes
             .get(drive_letter)
             .map(|v| v.files.len())
             .unwrap_or(0)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_all_files(&self) -> Vec<SearchResult> {
-        self.volumes
-            .values()
-            .flat_map(|v| v.files.clone())
-            .collect()
     }
 
     pub fn search_with_options(&mut self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
@@ -277,35 +267,6 @@ impl VolumeManager {
         (first_batch, total)
     }
 
-    #[allow(dead_code)]
-    fn compare_for_sort(&self, a: &SearchResult, b: &SearchResult, sort_by: &SortBy, sort_direction: &SortDirection) -> std::cmp::Ordering {
-        let cmp = match sort_by {
-            SortBy::Name => a.name.cmp(&b.name),
-            SortBy::Path => a.path.cmp(&b.path),
-            SortBy::Size => a.size.cmp(&b.size),
-            SortBy::ModifiedTime => a.modified_time.cmp(&b.modified_time),
-            SortBy::Score => std::cmp::Ordering::Equal,
-        };
-        match sort_direction {
-            SortDirection::Ascending => cmp,
-            SortDirection::Descending => cmp.reverse(),
-        }
-    }
-
-    pub fn scan_all(
-        &mut self,
-        _callback: Option<Box<dyn FnMut(usize, &str) + Send>>,
-    ) -> Result<usize> {
-        let mut total = 0;
-        for (drive_letter, monitor) in self.volumes.iter_mut() {
-            let count = monitor.scan()?;
-            log::info!("Scanned volume {}: {} files", drive_letter, count);
-            total += count;
-        }
-        self.search_cache = None;
-        Ok(total)
-    }
-
     pub fn scan_all_with_progress(&mut self, handle: &tauri::AppHandle) -> Result<usize> {
         let mut total = 0;
         for (drive_letter, monitor) in self.volumes.iter_mut() {
@@ -316,22 +277,6 @@ impl VolumeManager {
         }
         self.search_cache = None;
         Ok(total)
-    }
-
-    #[allow(dead_code)]
-    pub fn start_listening_all(&mut self) -> Result<()> {
-        log::info!("Started listening to all volumes");
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn stop_listening_all(&mut self) {
-        log::info!("Stopped listening to all volumes");
-    }
-
-    #[allow(dead_code)]
-    pub fn process_all_events(&mut self) -> Result<usize> {
-        Ok(0)
     }
 
     pub fn remove_file(&mut self, file_path: &str) {
@@ -403,11 +348,6 @@ impl VolumeManager {
         cache.sorted_by_path = None;
         cache.sorted_by_size = None;
         cache.sorted_by_modified = None;
-    }
-
-    #[allow(dead_code)]
-    pub fn invalidate_cache(&mut self) {
-        self.search_cache = None;
     }
 }
 
@@ -650,41 +590,7 @@ impl VolumeMonitor {
         Ok(IncrementalResult { added, updated, removed, total: self.files.len(), index_map, new_file_indices })
     }
 
-    #[allow(dead_code)]
-    pub fn scan_with_progress(
-        &mut self,
-        _callback: Option<Box<dyn FnMut(usize, &str) + Send>>,
-    ) -> Result<usize> {
-        self.scan()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_all_files(&self) -> Vec<SearchResult> {
-        self.files.clone()
-    }
-
-    #[allow(dead_code)]
-    pub fn clear_index(&mut self) {
-        self.files.clear();
-    }
-
     pub fn remove_file(&mut self, file_path: &str) {
         self.files.retain(|f| f.path.as_ref() != file_path);
-    }
-
-    #[allow(dead_code)]
-    fn search(&self, query: &str) -> Vec<SearchResult> {
-        let query_lower = query.to_lowercase();
-
-        self.files
-            .iter()
-            .filter(|f| {
-                let name_lower = f.name_lower();
-                let path_lower = f.path_lower();
-                name_lower.contains(&query_lower)
-                    || path_lower.contains(&query_lower)
-            })
-            .cloned()
-            .collect()
     }
 }

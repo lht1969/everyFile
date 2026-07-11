@@ -1,7 +1,6 @@
 use crate::fs::{get_ntfs_volumes, VolumeInfo};
 use serde::{Deserialize, Serialize};
 use tauri::State;
-#[allow(unused_imports)]
 use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
