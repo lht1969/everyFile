@@ -54,7 +54,12 @@ pub async fn delete_file(path: String, state: State<'_, super::search::AppState>
 
     let path_clone = path.clone();
     tokio::task::spawn_blocking(move || {
-        std::fs::remove_file(&path_clone).map_err(|e| e.to_string())?;
+        let p = Path::new(&path_clone);
+        if p.is_dir() {
+            std::fs::remove_dir_all(p).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::remove_file(p).map_err(|e| e.to_string())?;
+        }
         Ok::<(), String>(())
     })
     .await

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { save, ask } from '@tauri-apps/plugin-dialog';
+import { save, ask, message } from '@tauri-apps/plugin-dialog';
 import SearchPanel from './components/SearchPanel';
 import ResultList from './components/ResultList';
 import StatusBar from './components/StatusBar';
@@ -201,13 +201,14 @@ function App() {
   };
 
   const handleDeleteFile = async (path: string) => {
-    const confirmed = await ask(`确定要删除 "${path}" 吗？`, { title: '确认删除', kind: 'warning' });
-    if (!confirmed) return;
     try {
+      const confirmed = await ask(`确定要删除 "${path}" 吗？`, { title: '确认删除', kind: 'warning' });
+      if (!confirmed) return;
       await invoke('delete_file', { path });
-      loadAllFiles();
+      handleSearch(searchState.query, searchState.filesOnly, searchState.directoriesOnly);
     } catch (e) {
       console.error('Failed to delete file:', e);
+      message(`删除失败: ${e}`, { title: '错误', kind: 'error' });
     }
   };
 
