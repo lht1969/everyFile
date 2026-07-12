@@ -43,9 +43,10 @@ export function useVirtualScroll({
     : itemHeight;
 
   const spacerHeight = needsScaling ? SCROLL_SPACE : totalItems * itemHeight;
-  const startIndex = Math.floor(scrollTop / effectiveItemHeight);
+  const rawStartIndex = Math.floor(scrollTop / effectiveItemHeight);
+  const startIndex = totalItems > 0 ? Math.min(rawStartIndex, totalItems - 1) : 0;
   const visibleCount = Math.ceil(viewportHeight / effectiveItemHeight) + overscan;
-  const endIndex = Math.min(startIndex + visibleCount, totalItems);
+  const endIndex = totalItems > 0 ? Math.max(Math.min(startIndex + visibleCount, totalItems), startIndex + 1) : 0;
   const offsetY = startIndex * effectiveItemHeight;
 
   const handleScroll = useCallback(() => {
