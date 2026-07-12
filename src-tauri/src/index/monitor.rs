@@ -137,10 +137,10 @@ fn build_sort_permutation(matched: &[(u8, usize)], volumes: &HashMap<String, Vol
             v.par_sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         }
         SortBy::Size => {
-            v.par_sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].size);
+            v.sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].size);
         }
         SortBy::ModifiedTime => {
-            v.par_sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].modified_time);
+            v.sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].modified_time);
         }
     }
     v
