@@ -121,33 +121,28 @@ fn build_sort_permutation(matched: &[(u8, usize)], volumes: &HashMap<String, Vol
     if n == 0 {
         return Vec::new();
     }
-    // Pre-fetch sort keys once to avoid HashMap lookups inside the comparator
+    let mut v: Vec<usize> = (0..n).collect();
     match sort_by {
         SortBy::Name | SortBy::Score => {
-            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].name).collect();
-            let mut v: Vec<usize> = (0..n).collect();
-            v.sort_by(|&a, &b| keys[a].cmp(keys[b]));
-            v
+            let keys: Vec<&str> = matched.iter()
+                .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].name)
+                .collect();
+            v.sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         }
         SortBy::Path => {
-            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].path).collect();
-            let mut v: Vec<usize> = (0..n).collect();
-            v.sort_by(|&a, &b| keys[a].cmp(keys[b]));
-            v
+            let keys: Vec<&str> = matched.iter()
+                .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].path)
+                .collect();
+            v.sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         }
         SortBy::Size => {
-            let keys: Vec<u64> = matched.iter().map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx].size).collect();
-            let mut v: Vec<usize> = (0..n).collect();
-            v.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
-            v
+            v.sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].size);
         }
         SortBy::ModifiedTime => {
-            let keys: Vec<i64> = matched.iter().map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx].modified_time).collect();
-            let mut v: Vec<usize> = (0..n).collect();
-            v.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
-            v
+            v.sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].modified_time);
         }
     }
+    v
 }
 
 pub struct VolumeManager {
