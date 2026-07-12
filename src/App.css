@@ -291,6 +291,29 @@ body {
   border-bottom: none;
 }
 
+.suggestion-header {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.history-icon {
+  font-size: 12px;
+  margin-right: 4px;
+}
+
+.suggestion-clear {
+  color: var(--danger-color);
+  font-size: 12px;
+  text-align: center;
+}
+
+.suggestion-clear:hover {
+  background: #fee2e2;
+}
+
 .admin-warning {
   margin-top: 8px;
   padding: 8px 12px;
@@ -932,4 +955,50 @@ body {
 
 .modal-overlay.rebuilding {
   cursor: wait;
+}
+
+/* 滚动条美化 */
+.result-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.result-body::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+
+.result-body::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+.result-body::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
+
+/* 行悬停过渡效果 */
+.result-row:not(.header) {
+  transition: background-color 0.15s ease;
+}
+
+.result-row.selected {
+  background: #dbeafe !important;
+  box-shadow: inset 2px 0 0 var(--primary-color);
+}
+
+/* 搜索输入框聚焦效果 */
+.search-input:focus {
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.1);
+}
+
+/* 按钮点击效果 */
+.context-menu-item:active,
+.suggestion-item:active {
+  background: #e5e7eb;
+}
+
+/* 列头悬停效果 */
+.result-row.header > div:hover {
+  background: #f3f4f6;
 }

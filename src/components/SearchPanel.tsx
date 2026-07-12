@@ -14,10 +14,24 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
   const [filterType, setFilterType] = useState<'files' | 'directories'>('files');
   const [exportFormat, setExportFormat] = useState('');
   const [helpVisible, setHelpVisible] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('searchHistory') || '[]'); } catch { return []; }
+  });
   const prevQueryRef = useRef(query);
   const prevFilterRef = useRef(filterType);
   const helpRef = useRef<HTMLDivElement>(null);
   const helpBtnRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const addToHistory = (q: string) => {
+    if (!q.trim()) return;
+    setSearchHistory(prev => {
+      const next = [q, ...prev.filter(h => h !== q)].slice(0, 20);
+      localStorage.setItem('searchHistory', JSON.stringify(next));
+      return next;
+    });
+  };
 
   useEffect(() => {
     const prevQuery = prevQueryRef.current;
@@ -41,6 +55,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
     }
     const debounce = setTimeout(() => {
       onSearch(query, filterType === 'files', filterType === 'directories');
+      addToHistory(query);
       fetchSuggestions(query);
     }, 350);
     return () => clearTimeout(debounce);
@@ -98,17 +113,32 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
     setFilterType(value as 'files' | 'directories');
   };
 
+  const handleInputFocus = () => {
+    if (!query.trim()) setShowHistory(true);
+  };
+
+  const handleInputBlur = () => {
+    setTimeout(() => setShowHistory(false), 200);
+  };
+
+  const filteredHistory = query.trim()
+    ? searchHistory.filter(h => h.toLowerCase().includes(query.toLowerCase()))
+    : searchHistory;
+
   return (
     <div className="search-panel">
       <form onSubmit={(e) => e.preventDefault()} className="search-form">
         <div className="search-input-container">
           <input
+            ref={inputRef}
             type="text"
             className="search-input"
             placeholder="搜索文件...ESC清空"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => { setQuery(e.target.value); setShowHistory(false); }}
             onKeyDown={handleKeyDown}
+            onFocus={handleInputFocus}
+            onBlur={handleInputBlur}
             autoFocus
             autoComplete="off"
           />
@@ -206,6 +236,19 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
               <p>空格分隔，全部条件需同时满足（AND 逻辑）。</p>
               <div className="help-example"><code>*.jpg size:&lt;500KB path:C:\Photos</code></div>
             </div>
+          </div>
+        </div>
+      )}
+      {(showHistory && filteredHistory.length > 0) && (
+        <div className="suggestions">
+          <div className="suggestion-header">搜索历史</div>
+          {filteredHistory.slice(0, 10).map((h, i) => (
+            <div key={i} className="suggestion-item" onClick={() => { setQuery(h); onSearch(h); setShowHistory(false); }}>
+              <span className="history-icon">🕐</span> {h}
+            </div>
+          ))}
+          <div className="suggestion-item suggestion-clear" onClick={() => { setSearchHistory([]); localStorage.removeItem('searchHistory'); setShowHistory(false); }}>
+            清除历史
           </div>
         </div>
       )}
