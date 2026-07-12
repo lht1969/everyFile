@@ -301,6 +301,9 @@ impl VolumeManager {
     }
 
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) {
+        // 分离借用：先获取 volume files 引用，避免与 search_cache 的可变借用冲突
+        let volume_files: Option<&[SearchResult]> = self.volumes.get(drive_letter).map(|v| v.files());
+
         let cache = match self.search_cache.as_mut() {
             Some(c) => c,
             None => return,
@@ -320,7 +323,7 @@ impl VolumeManager {
 
         // Add new files that match the current search query
         if !result.new_file_indices.is_empty() {
-            if let Some(volume) = self.volumes.get(drive_letter) {
+            if let Some(files) = volume_files {
                 let query = if cache.query.trim().is_empty() {
                     None
                 } else {
@@ -328,8 +331,8 @@ impl VolumeManager {
                 };
 
                 for &new_idx in &result.new_file_indices {
-                    if new_idx >= volume.files.len() { continue; }
-                    let file = &volume.files[new_idx];
+                    if new_idx >= files.len() { continue; }
+                    let file = &files[new_idx];
 
                     if let Some(ref q) = query {
                         if !crate::search::query::SearchQuery::matches(q, file) { continue; }
@@ -344,6 +347,8 @@ impl VolumeManager {
 
         cache.matched = new_matched;
         cache.total = cache.matched.len();
+
+        // 数据变化后标记排列失效，下次 get_sorted_slice 时按需重建
         cache.sorted_by_name = None;
         cache.sorted_by_path = None;
         cache.sorted_by_size = None;
@@ -365,6 +370,10 @@ impl VolumeMonitor {
     pub fn update_settings(&mut self, include_hidden_files: bool, include_system_files: bool) {
         self.include_hidden_files = include_hidden_files;
         self.include_system_files = include_system_files;
+    }
+
+    pub fn files(&self) -> &[SearchResult] {
+        &self.files
     }
 
     /// Build a walkdir walker configured for this volume's settings.
