@@ -34,8 +34,13 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const unlistenProgress = listen<{ volume: string; count: number }>('scan-progress', (_event) => {
+      setStatusMessage(`扫描中: ${_event.payload.volume} (${_event.payload.count.toLocaleString()} 个文件)`);
+    });
+
     const unlistenComplete = listen<{ volume: string; count: number }>('scan-complete', (_event) => {
       loadIndexStatus();
+      setStatusMessage(`扫描完成: ${_event.payload.volume} (${_event.payload.count.toLocaleString()} 个文件)`);
     });
 
     const unlistenUpdated = listen<{ volume: string; count: number; cache_total?: number }>('index-updated', async (_event) => {
@@ -48,6 +53,7 @@ function App() {
     });
 
     return () => {
+      unlistenProgress.then(fn => fn());
       unlistenComplete.then(fn => fn());
       unlistenUpdated.then(fn => fn());
     };
@@ -81,6 +87,7 @@ function App() {
   };
 
   const loadAllFiles = async () => {
+    setStatusMessage('加载中...');
     try {
       const response = await invoke<SearchResponse>('search_files', {
         params: { query: '', files_only: true, sort_by: sortState.field, sort_direction: sortState.direction }
@@ -154,6 +161,7 @@ function App() {
     setScrollTrigger(prev => prev + 1);
     setSearching(true);
     setSearchTime(null);
+    setStatusMessage('搜索中...');
     const startTime = performance.now();
 
     try {
@@ -197,6 +205,7 @@ function App() {
     rangeCacheRef.current.clear();
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
+    setStatusMessage('排序中...');
     try {
       const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
         sortBy: field,
