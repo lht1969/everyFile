@@ -139,7 +139,6 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
             onKeyDown={handleKeyDown}
             onFocus={handleInputFocus}
             onBlur={handleInputBlur}
-            autoFocus
             autoComplete="off"
           />
           {query.length > 0 && (
