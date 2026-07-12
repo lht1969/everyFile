@@ -372,11 +372,8 @@ impl VolumeManager {
         cache.matched = new_matched;
         cache.total = cache.matched.len();
 
-        // 数据变化后标记排列失效，下次 get_sorted_slice 时按需重建
-        cache.sorted_by_name = None;
-        cache.sorted_by_path = None;
-        cache.sorted_by_size = None;
-        cache.sorted_by_modified = None;
+        // 排列在增量更新后仍然有效（existing 条目位置不变，新条目追加在末尾）
+        // 只有当排序键数据变化时才需要重建（当前不会发生）
 
         cache.total
     }
