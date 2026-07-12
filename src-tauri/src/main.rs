@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
 mod config;
@@ -351,8 +351,8 @@ fn main() {
                         let mut volume_manager = vm_clone.lock().await;
 
                         for drive_letter in volume_manager.volumes() {
-                            let mut incremental_result = None;
                             let mut monitor = volume_manager.take_monitor(&drive_letter);
+                            let mut inc_result = None;
                             if let Some(ref mut m) = monitor {
                                 m.update_settings(include_hidden, include_system);
                                 if let Ok(result) = m.scan_incremental(&handle_clone) {
@@ -361,25 +361,26 @@ fn main() {
                                             "Incremental {}: +{} ~{} -{} (total: {})",
                                             drive_letter, result.added, result.updated, result.removed, result.total
                                         );
-                                        let _ = handle_clone.emit(
-                                            "index-updated",
-                                            serde_json::json!({
-                                                "volume": drive_letter,
-                                                "added": result.added,
-                                                "updated": result.updated,
-                                                "removed": result.removed,
-                                                "total": result.total
-                                            }),
-                                        );
-                                        incremental_result = Some(result);
+                                        inc_result = Some(result);
                                     }
                                 }
                             }
                             if let Some(m) = monitor {
                                 volume_manager.return_monitor(&drive_letter, m);
                             }
-                            if let Some(result) = incremental_result {
-                                volume_manager.apply_incremental(&drive_letter, &result);
+                            if let Some(result) = inc_result {
+                                let cache_total = volume_manager.apply_incremental(&drive_letter, &result);
+                                let _ = handle_clone.emit(
+                                    "index-updated",
+                                    serde_json::json!({
+                                        "volume": drive_letter,
+                                        "added": result.added,
+                                        "updated": result.updated,
+                                        "removed": result.removed,
+                                        "total": result.total,
+                                        "cache_total": cache_total
+                                    }),
+                                );
                             }
                         }
 

@@ -300,13 +300,13 @@ impl VolumeManager {
         Some((results, total))
     }
 
-    pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) {
+    pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
         // 分离借用：先获取 volume files 引用，避免与 search_cache 的可变借用冲突
         let volume_files: Option<&[SearchResult]> = self.volumes.get(drive_letter).map(|v| v.files());
 
         let cache = match self.search_cache.as_mut() {
             Some(c) => c,
-            None => return,
+            None => return 0,
         };
 
         let mut new_matched: Vec<(String, usize)> = Vec::with_capacity(cache.matched.len());
@@ -353,6 +353,8 @@ impl VolumeManager {
         cache.sorted_by_path = None;
         cache.sorted_by_size = None;
         cache.sorted_by_modified = None;
+
+        cache.total
     }
 }
 

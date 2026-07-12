@@ -11,6 +11,7 @@ import './App.css';
 
 function App() {
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [resultsOffset, setResultsOffset] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
   const [indexStatus, setIndexStatus] = useState<IndexStatus>({ status: 'ready', file_count: 0, progress: 1, message: '', volumes: [], last_update: '' });
@@ -32,8 +33,11 @@ function App() {
       loadIndexStatus();
     });
 
-    const unlistenUpdated = listen<{ volume: string; count: number }>('index-updated', async (_event) => {
+    const unlistenUpdated = listen<{ volume: string; count: number; cache_total?: number }>('index-updated', async (_event) => {
       loadIndexStatus();
+      if (_event.payload.cache_total !== undefined) {
+        setTotalCount(_event.payload.cache_total);
+      }
       const { start, end } = visibleRangeRef.current;
       fetchRecordsRange(start, end);
     });
@@ -78,9 +82,11 @@ function App() {
       });
       setTotalCount(response.total);
       if (response.results.length > 0) {
+        setResultsOffset(0);
         setResults(response.results);
       } else if (response.total > 0) {
         const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50, sortBy: sortState.field, sortDirection: sortState.direction });
+        setResultsOffset(0);
         setResults(range.results);
       }
     } catch (e) {
@@ -94,25 +100,51 @@ function App() {
 
   const fetchCounterRef = useRef(0);
   const visibleRangeRef = useRef({ start: 0, end: 50 });
+  const rangeCacheRef = useRef<Map<string, SearchResult[]>>(new Map());
+  const PAGE_SIZE = 100;
 
   const fetchRecordsRange = useCallback(async (start: number, end: number) => {
+    const cacheKey = `${start}-${end}`;
+    const cached = rangeCacheRef.current.get(cacheKey);
+    if (cached) {
+      setResultsOffset(start);
+      setResults(cached);
+      return;
+    }
+
     const myId = ++fetchCounterRef.current;
     const { field, direction } = sortStateRef.current;
     try {
       const response = await invoke<RecordsRangeResponse>('get_records_range', { start, end, sortBy: field, sortDirection: direction });
       if (myId === fetchCounterRef.current) {
+        rangeCacheRef.current.set(cacheKey, response.results);
+        if (rangeCacheRef.current.size > 20) {
+          const firstKey = rangeCacheRef.current.keys().next().value;
+          if (firstKey) rangeCacheRef.current.delete(firstKey);
+        }
+        setResultsOffset(start);
         setResults(response.results);
+      }
+
+      const nextStart = end;
+      const nextEnd = nextStart + PAGE_SIZE;
+      const nextKey = `${nextStart}-${nextEnd}`;
+      if (!rangeCacheRef.current.has(nextKey) && nextStart < (totalCount || 0)) {
+        invoke<RecordsRangeResponse>('get_records_range', { start: nextStart, end: nextEnd, sortBy: field, sortDirection: direction })
+          .then(resp => { rangeCacheRef.current.set(nextKey, resp.results); })
+          .catch(() => {});
       }
     } catch (e) {
       console.error('Failed to fetch records range:', e);
       message(`获取数据失败: ${e}`, { title: '错误', kind: 'error' });
     }
-  }, []);
+  }, [totalCount]);
 
   const searchCounterRef = useRef(0);
 
   const handleSearch = useCallback(async (searchQuery: string, filesOnly?: boolean, directoriesOnly?: boolean) => {
     const myId = ++searchCounterRef.current;
+    rangeCacheRef.current.clear();
     setSearchState({ query: searchQuery, filesOnly: filesOnly ?? true, directoriesOnly: directoriesOnly ?? false });
     setScrollTrigger(prev => prev + 1);
     setStatusMessage('搜索中...');
@@ -130,11 +162,16 @@ function App() {
       if (myId !== searchCounterRef.current) return;
       setTotalCount(response.total);
       if (response.results.length > 0) {
+        setResultsOffset(0);
         setResults(response.results);
       } else if (response.total > 0) {
         const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50, sortBy: sortState.field, sortDirection: sortState.direction });
-        if (myId === searchCounterRef.current) setResults(range.results);
+        if (myId === searchCounterRef.current) {
+          setResultsOffset(0);
+          setResults(range.results);
+        }
       } else {
+        setResultsOffset(0);
         setResults([]);
       }
       setStatusMessage(searchQuery.trim() ? `找到 ${response.total} 个结果` : '');
@@ -147,6 +184,7 @@ function App() {
 
   const handleSortChange = useCallback(async (field: SortField, direction: SortDirection) => {
     const myId = ++fetchCounterRef.current;
+    rangeCacheRef.current.clear();
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
     try {
@@ -158,6 +196,7 @@ function App() {
       });
       if (myId === fetchCounterRef.current) {
         setTotalCount(response.total);
+        setResultsOffset(0);
         setResults(response.results);
       }
     } catch (e) {
@@ -180,6 +219,7 @@ function App() {
         });
         if (myId === fetchCounterRef.current) {
           setTotalCount(response.total);
+          setResultsOffset(0);
           setResults(response.results);
         }
       } catch (e2) {
@@ -287,6 +327,7 @@ function App() {
         />
         <ResultList
           results={results}
+          resultsOffset={resultsOffset}
           totalCount={totalCount}
           sortField={sortState.field}
           sortDirection={sortState.direction}
