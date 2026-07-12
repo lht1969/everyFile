@@ -872,6 +872,12 @@ body {
   color: var(--danger-color);
 }
 
+.context-menu-separator {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 8px;
+}
+
 .context-menu-item.danger:hover {
   background: #fee2e2;
 }

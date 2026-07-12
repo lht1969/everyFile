@@ -234,9 +234,15 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
         <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(e) => e.stopPropagation()}>
           <div className="context-menu-item" onClick={() => { onOpenFile(contextMenu.path); closeContextMenu(); }}>打开</div>
           <div className="context-menu-item" onClick={() => { onOpenFolder(contextMenu.path); closeContextMenu(); }}>打开文件夹</div>
+          <div className="context-menu-separator" />
           <div className="context-menu-item" onClick={() => { navigator.clipboard.writeText(contextMenu.path); closeContextMenu(); }}>复制路径</div>
+          <div className="context-menu-item" onClick={() => { const name = contextMenu.path.split('\\').pop() || contextMenu.path; navigator.clipboard.writeText(name); closeContextMenu(); }}>复制名称</div>
+          <div className="context-menu-item" onClick={() => { const folder = contextMenu.path.substring(0, contextMenu.path.lastIndexOf('\\')); navigator.clipboard.writeText(folder); closeContextMenu(); }}>复制文件夹路径</div>
           {onDeleteFile && (
-            <div className="context-menu-item danger" onClick={() => { onDeleteFile(contextMenu.path); closeContextMenu(); }}>删除</div>
+            <>
+              <div className="context-menu-separator" />
+              <div className="context-menu-item danger" onClick={() => { onDeleteFile(contextMenu.path); closeContextMenu(); }}>删除</div>
+            </>
           )}
         </div>
       )}
