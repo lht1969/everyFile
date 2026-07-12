@@ -312,6 +312,9 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     let mut next_scan: Option<tokio::time::Instant> = None;
 
+                    // 启动后延迟 60 秒再开始增量更新，让前端先完成初始加载和排序
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
