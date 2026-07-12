@@ -258,8 +258,9 @@ impl VolumeManager {
         let total = matched.len();
         log::info!("search_with_options: matched {} files, {:?}", total, t0.elapsed());
 
-        // Don't sort matched here — all sorting is lazy via permutation vectors.
-        // First batch is taken in insertion order for instant response.
+        // 预计算当前排序字段的排列，避免首次请求时的 2s 延迟
+        let default_perm = build_sort_permutation(&matched, &self.volumes, &self.vol_names, options.sort_by);
+
         let first_batch: Vec<SearchResult> = matched.iter().take(50)
             .filter_map(|(vol, idx)| {
                 let vol_name = &self.vol_names[*vol as usize];
@@ -274,10 +275,10 @@ impl VolumeManager {
             matched,
             total,
             created_at: Instant::now(),
-            sorted_by_name: None,
-            sorted_by_path: None,
-            sorted_by_size: None,
-            sorted_by_modified: None,
+            sorted_by_name: if options.sort_by == SortBy::Name || options.sort_by == SortBy::Score { Some(default_perm.clone()) } else { None },
+            sorted_by_path: if options.sort_by == SortBy::Path { Some(default_perm.clone()) } else { None },
+            sorted_by_size: if options.sort_by == SortBy::Size { Some(default_perm.clone()) } else { None },
+            sorted_by_modified: if options.sort_by == SortBy::ModifiedTime { Some(default_perm) } else { None },
         });
         log::info!("search_with_options total: {:?}", t0.elapsed());
 
