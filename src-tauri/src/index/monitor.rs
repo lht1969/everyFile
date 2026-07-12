@@ -334,6 +334,7 @@ impl VolumeManager {
         };
 
         let mut new_matched: Vec<(u8, usize)> = Vec::with_capacity(cache.matched.len());
+        let mut removed_count = 0usize;
 
         for (vol, idx) in cache.matched.drain(..) {
             if vol != vol_idx {
@@ -341,11 +342,16 @@ impl VolumeManager {
             } else if idx < result.index_map.len() {
                 if let Some(new_idx) = result.index_map[idx] {
                     new_matched.push((vol, new_idx));
+                } else {
+                    removed_count += 1;
                 }
+            } else {
+                removed_count += 1;
             }
         }
 
         // Add new files that match the current search query
+        let added_count_before = new_matched.len();
         if !result.new_file_indices.is_empty() {
             if let Some(files) = volume_files {
                 let query = if cache.query.trim().is_empty() {
@@ -368,12 +374,18 @@ impl VolumeManager {
                 }
             }
         }
+        let added_count = new_matched.len() - added_count_before;
 
         cache.matched = new_matched;
         cache.total = cache.matched.len();
 
-        // 排列在增量更新后仍然有效（existing 条目位置不变，新条目追加在末尾）
-        // 只有当排序键数据变化时才需要重建（当前不会发生）
+        // 只有新增或删除时才需要重建排列（修改不影响排序顺序）
+        if removed_count > 0 || added_count > 0 {
+            cache.sorted_by_name = None;
+            cache.sorted_by_path = None;
+            cache.sorted_by_size = None;
+            cache.sorted_by_modified = None;
+        }
 
         cache.total
     }
