@@ -351,28 +351,42 @@ fn main() {
                             .map(|c| c.index_settings.include_system_files)
                             .unwrap_or(false);
 
-                        let mut volume_manager = vm_clone.lock().await;
+                        // 先获取卷列表（短暂持锁）
+                        let volumes_list = {
+                            let vm = vm_clone.lock().await;
+                            vm.volumes()
+                        };
 
-                        for drive_letter in volume_manager.volumes() {
-                            let mut monitor = volume_manager.take_monitor(&drive_letter);
-                            let mut inc_result = None;
-                            if let Some(ref mut m) = monitor {
-                                m.update_settings(include_hidden, include_system);
-                                if let Ok(result) = m.scan_incremental(&handle_clone) {
-                                    if result.added > 0 || result.updated > 0 || result.removed > 0 {
-                                        log::info!(
-                                            "Incremental {}: +{} ~{} -{} (total: {})",
-                                            drive_letter, result.added, result.updated, result.removed, result.total
-                                        );
-                                        inc_result = Some(result);
+                        for drive_letter in volumes_list {
+                            // 扫描阶段：短暂持锁
+                            let inc_result = {
+                                let mut vm = vm_clone.lock().await;
+                                let mut monitor = vm.take_monitor(&drive_letter);
+                                let mut result = None;
+                                if let Some(ref mut m) = monitor {
+                                    m.update_settings(include_hidden, include_system);
+                                    if let Ok(r) = m.scan_incremental(&handle_clone) {
+                                        if r.added > 0 || r.updated > 0 || r.removed > 0 {
+                                            log::info!(
+                                                "Incremental {}: +{} ~{} -{} (total: {})",
+                                                drive_letter, r.added, r.updated, r.removed, r.total
+                                            );
+                                            result = Some(r);
+                                        }
                                     }
                                 }
-                            }
-                            if let Some(m) = monitor {
-                                volume_manager.return_monitor(&drive_letter, m);
-                            }
+                                if let Some(m) = monitor {
+                                    vm.return_monitor(&drive_letter, m);
+                                }
+                                result
+                            };
+
+                            // 更新缓存阶段：短暂持锁
                             if let Some(result) = inc_result {
-                                let cache_total = volume_manager.apply_incremental(&drive_letter, &result);
+                                let cache_total = {
+                                    let mut vm = vm_clone.lock().await;
+                                    vm.apply_incremental(&drive_letter, &result)
+                                };
                                 let _ = handle_clone.emit(
                                     "index-updated",
                                     serde_json::json!({
@@ -385,6 +399,7 @@ fn main() {
                                     }),
                                 );
                             }
+                            // 锁已释放，前端请求可以继续
                         }
 
                         let now_str = chrono::Local::now().format("%H:%M:%S").to_string();
