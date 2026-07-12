@@ -16,6 +16,7 @@ interface ResultListProps {
   onVisibleRangeChange?: (startIndex: number, endIndex: number) => void;
   onSortChange?: (field: SortField, direction: SortDirection) => void;
   scrollToTop?: number;
+  searching?: boolean;
 }
 
 const ROW_HEIGHT = 28;
@@ -34,7 +35,7 @@ function FileIcon({ path, isDirectory }: { path: string; isDirectory: boolean })
   return <img className="file-icon-img" src={iconUrl} alt="" draggable={false} />;
 }
 
-function ResultList({ results, totalCount, resultsOffset, sortField, sortDirection, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop }: ResultListProps) {
+function ResultList({ results, totalCount, resultsOffset, sortField, sortDirection, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop, searching }: ResultListProps) {
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string; isDirectory: boolean } | null>(null);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
@@ -168,6 +169,24 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
           </div>
         </div>
         <div className="result-body" ref={resultBodyRef}>
+          {results.length === 0 && totalCount === 0 && !searching && (
+            <div className="empty-state">
+              <div className="empty-icon">🔍</div>
+              <div className="empty-text">输入关键词开始搜索</div>
+            </div>
+          )}
+          {results.length === 0 && totalCount === 0 && searching && (
+            <div className="empty-state">
+              <div className="empty-spinner">⟳</div>
+              <div className="empty-text">搜索中...</div>
+            </div>
+          )}
+          {results.length === 0 && totalCount > 0 && (
+            <div className="empty-state">
+              <div className="empty-icon">📭</div>
+              <div className="empty-text">未找到匹配结果</div>
+            </div>
+          )}
           <div className="virtual-spacer" style={{ height: spacerHeight }} />
           <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)` }}>
             {(() => {

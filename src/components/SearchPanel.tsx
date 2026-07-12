@@ -5,9 +5,10 @@ interface SearchPanelProps {
   onSearch: (query: string, filesOnly?: boolean, directoriesOnly?: boolean) => void;
   onOpenSettings: () => void;
   onExport?: (format: 'csv' | 'txt' | 'json') => void;
+  searching?: boolean;
 }
 
-function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
+function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPanelProps) {
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [filterType, setFilterType] = useState<'files' | 'directories'>('files');
@@ -118,7 +119,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport }: SearchPanelProps) {
               onClick={() => setQuery('')}
               title="清空搜索框"
             >
-              ×
+              {searching ? <span className="search-spinner">⟳</span> : '×'}
             </button>
           )}
         </div>

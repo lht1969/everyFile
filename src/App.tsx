@@ -19,6 +19,8 @@ function App() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [searchState, setSearchState] = useState({ query: '', filesOnly: true, directoriesOnly: false });
   const [sortState, setSortState] = useState<{ field: SortField; direction: SortDirection }>({ field: 'name', direction: 'asc' });
+  const [searching, setSearching] = useState(false);
+  const [searchTime, setSearchTime] = useState<number | null>(null);
   const [scrollTrigger, setScrollTrigger] = useState(0);
   const [rebuilding, setRebuilding] = useState(false);
 
@@ -147,7 +149,9 @@ function App() {
     rangeCacheRef.current.clear();
     setSearchState({ query: searchQuery, filesOnly: filesOnly ?? true, directoriesOnly: directoriesOnly ?? false });
     setScrollTrigger(prev => prev + 1);
-    setStatusMessage('搜索中...');
+    setSearching(true);
+    setSearchTime(null);
+    const startTime = performance.now();
 
     try {
       const response = await invoke<SearchResponse>('search_files', {
@@ -179,6 +183,9 @@ function App() {
       if (myId !== searchCounterRef.current) return;
       console.error('Search failed:', e);
       message(`搜索失败: ${e}`, { title: '错误', kind: 'error' });
+    } finally {
+      setSearchTime(performance.now() - startTime);
+      setSearching(false);
     }
   }, [sortState]);
 
@@ -324,6 +331,7 @@ function App() {
           onSearch={handleSearch}
           onOpenSettings={() => setShowSettings(true)}
           onExport={handleExport}
+          searching={searching}
         />
         <ResultList
           results={results}
@@ -337,12 +345,14 @@ function App() {
           onVisibleRangeChange={handleVisibleRangeChange}
           onSortChange={handleSortChange}
           scrollToTop={scrollTrigger}
+          searching={searching}
         />
       </div>
       <StatusBar
         message={statusMessage}
         indexStatus={indexStatus}
         isAdmin={isAdmin}
+        searchTime={searchTime}
       />
 
       {showSettings && (

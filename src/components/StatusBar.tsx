@@ -4,15 +4,21 @@ interface StatusBarProps {
   message: string;
   indexStatus: IndexStatus;
   isAdmin: boolean;
+  searchTime?: number | null;
 }
 
-function StatusBar({ message, indexStatus, isAdmin }: StatusBarProps) {
+function StatusBar({ message, indexStatus, isAdmin, searchTime }: StatusBarProps) {
   return (
     <div className="status-bar">
       <div className="status-left">
         <span className="status-message">{message}</span>
       </div>
       <div className="status-right">
+        {searchTime !== null && searchTime !== undefined && (
+          <span className="search-time">
+            {searchTime < 1000 ? `${Math.round(searchTime)}ms` : `${(searchTime / 1000).toFixed(1)}s`}
+          </span>
+        )}
         {indexStatus.volumes.length > 0 && (
           <span className="volume-info">
             卷: {indexStatus.volumes.join(', ')}
