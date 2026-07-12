@@ -45,7 +45,7 @@ pub struct SearchCache {
     directories_only: bool,
     pub total: usize,
     pub created_at: Instant,
-    pub matched: Vec<(String, usize)>,
+    pub matched: Vec<(u8, usize)>,
     // Lazily-computed ascending permutation vectors into `matched`
     sorted_by_name: Option<Vec<usize>>,
     sorted_by_path: Option<Vec<usize>>,
@@ -65,6 +65,7 @@ impl SearchCache {
     pub fn get_sorted_slice(
         &mut self,
         volumes: &HashMap<String, VolumeMonitor>,
+        vol_names: &[String],
         sort_by: SortBy,
         sort_direction: SortDirection,
         start: usize,
@@ -80,7 +81,7 @@ impl SearchCache {
         };
         if slot.is_none() {
             let t0 = Instant::now();
-            *slot = Some(build_sort_permutation(matched, volumes, sort_by));
+            *slot = Some(build_sort_permutation(matched, volumes, vol_names, sort_by));
             log::info!("build_sort_permutation({:?}): {:?}", sort_by, t0.elapsed());
         }
         let indices = slot.as_ref().unwrap();
@@ -109,12 +110,13 @@ impl SearchCache {
 
         iter.filter_map(|idx| {
             let (vol, file_idx) = &matched[*idx];
-            volumes.get(vol).and_then(|m| m.files.get(*file_idx)).cloned()
+            let vol_name = &vol_names[*vol as usize];
+            volumes.get(vol_name).and_then(|m| m.files.get(*file_idx)).cloned()
         }).collect()
     }
 }
 
-fn build_sort_permutation(matched: &[(String, usize)], volumes: &HashMap<String, VolumeMonitor>, sort_by: SortBy) -> Vec<usize> {
+fn build_sort_permutation(matched: &[(u8, usize)], volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String], sort_by: SortBy) -> Vec<usize> {
     let n = matched.len();
     if n == 0 {
         return Vec::new();
@@ -122,25 +124,25 @@ fn build_sort_permutation(matched: &[(String, usize)], volumes: &HashMap<String,
     // Pre-fetch sort keys once to avoid HashMap lookups inside the comparator
     match sort_by {
         SortBy::Name | SortBy::Score => {
-            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[vol].files[*idx].name).collect();
+            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].name).collect();
             let mut v: Vec<usize> = (0..n).collect();
             v.sort_by(|&a, &b| keys[a].cmp(keys[b]));
             v
         }
         SortBy::Path => {
-            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[vol].files[*idx].path).collect();
+            let keys: Vec<&str> = matched.iter().map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].path).collect();
             let mut v: Vec<usize> = (0..n).collect();
             v.sort_by(|&a, &b| keys[a].cmp(keys[b]));
             v
         }
         SortBy::Size => {
-            let keys: Vec<u64> = matched.iter().map(|(vol, idx)| volumes[vol].files[*idx].size).collect();
+            let keys: Vec<u64> = matched.iter().map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx].size).collect();
             let mut v: Vec<usize> = (0..n).collect();
             v.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
             v
         }
         SortBy::ModifiedTime => {
-            let keys: Vec<i64> = matched.iter().map(|(vol, idx)| volumes[vol].files[*idx].modified_time).collect();
+            let keys: Vec<i64> = matched.iter().map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx].modified_time).collect();
             let mut v: Vec<usize> = (0..n).collect();
             v.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
             v
@@ -150,6 +152,8 @@ fn build_sort_permutation(matched: &[(String, usize)], volumes: &HashMap<String,
 
 pub struct VolumeManager {
     volumes: HashMap<String, VolumeMonitor>,
+    volume_index: HashMap<String, u8>,
+    vol_names: Vec<String>,
     pub search_cache: Option<SearchCache>,
 }
 
@@ -164,11 +168,16 @@ impl VolumeManager {
     pub fn new() -> Self {
         Self {
             volumes: HashMap::new(),
+            volume_index: HashMap::new(),
+            vol_names: Vec::new(),
             search_cache: None,
         }
     }
 
     pub fn add_volume(&mut self, drive_letter: &str, _is_admin: bool, include_hidden_files: bool, include_system_files: bool) -> Result<()> {
+        let idx = self.vol_names.len() as u8;
+        self.volume_index.insert(drive_letter.to_string(), idx);
+        self.vol_names.push(drive_letter.to_string());
         let monitor = VolumeMonitor::new(drive_letter.to_string(), include_hidden_files, include_system_files);
         self.volumes.insert(drive_letter.to_string(), monitor);
         Ok(())
@@ -176,6 +185,10 @@ impl VolumeManager {
 
     pub fn remove_volume(&mut self, drive_letter: &str) {
         self.volumes.remove(drive_letter);
+        if let Some(idx) = self.volume_index.remove(drive_letter) {
+            self.vol_names[idx as usize].clear();
+        }
+        self.search_cache = None;
     }
 
     pub fn volumes(&self) -> Vec<String> {
@@ -214,7 +227,7 @@ impl VolumeManager {
     pub fn search_with_options(&mut self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
         let t0 = Instant::now();
 
-        let mut matched: Vec<(String, usize)> = Vec::new();
+        let mut matched: Vec<(u8, usize)> = Vec::new();
         let is_empty_query = query.trim().is_empty();
         let parsed_query = if is_empty_query {
             None
@@ -224,11 +237,12 @@ impl VolumeManager {
         let query_controls_dir = parsed_query.as_ref().map_or(false, |q| q.path_filter_dir_only);
 
         for (vol_key, monitor) in &self.volumes {
+            let vol_idx = self.volume_index[vol_key];
             if is_empty_query {
                 for (idx, file) in monitor.files.iter().enumerate() {
                     if options.files_only && file.is_directory { continue; }
                     if options.directories_only && !file.is_directory { continue; }
-                    matched.push((vol_key.clone(), idx));
+                    matched.push((vol_idx, idx));
                 }
             } else {
                 let pq = parsed_query.as_ref().unwrap();
@@ -236,7 +250,7 @@ impl VolumeManager {
                     if !crate::search::query::SearchQuery::matches(pq, file) { continue; }
                     if !query_controls_dir && options.files_only && file.is_directory { continue; }
                     if options.directories_only && !file.is_directory { continue; }
-                    matched.push((vol_key.clone(), idx));
+                    matched.push((vol_idx, idx));
                 }
             }
         }
@@ -247,7 +261,10 @@ impl VolumeManager {
         // Don't sort matched here — all sorting is lazy via permutation vectors.
         // First batch is taken in insertion order for instant response.
         let first_batch: Vec<SearchResult> = matched.iter().take(50)
-            .filter_map(|(vol, idx)| self.volumes.get(vol).and_then(|m| m.files.get(*idx)).cloned())
+            .filter_map(|(vol, idx)| {
+                let vol_name = &self.vol_names[*vol as usize];
+                self.volumes.get(vol_name).and_then(|m| m.files.get(*idx)).cloned()
+            })
             .collect();
 
         self.search_cache = Some(SearchCache {
@@ -296,23 +313,29 @@ impl VolumeManager {
         if total == 0 {
             return Some((Vec::new(), 0));
         }
-        let results = cache.get_sorted_slice(&self.volumes, sort_by, sort_direction, start, end);
+        let results = cache.get_sorted_slice(&self.volumes, &self.vol_names, sort_by, sort_direction, start, end);
         Some((results, total))
     }
 
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
-        // 分离借用：先获取 volume files 引用，避免与 search_cache 的可变借用冲突
+        // 分离借用：先获取 volume files 引用和索引，避免与 search_cache 的可变借用冲突
         let volume_files: Option<&[SearchResult]> = self.volumes.get(drive_letter).map(|v| v.files());
+        let vol_idx = self.volume_index.get(drive_letter).copied();
 
         let cache = match self.search_cache.as_mut() {
             Some(c) => c,
             None => return 0,
         };
 
-        let mut new_matched: Vec<(String, usize)> = Vec::with_capacity(cache.matched.len());
+        let vol_idx = match vol_idx {
+            Some(i) => i,
+            None => return 0,
+        };
+
+        let mut new_matched: Vec<(u8, usize)> = Vec::with_capacity(cache.matched.len());
 
         for (vol, idx) in cache.matched.drain(..) {
-            if vol != drive_letter {
+            if vol != vol_idx {
                 new_matched.push((vol, idx));
             } else if idx < result.index_map.len() {
                 if let Some(new_idx) = result.index_map[idx] {
@@ -340,7 +363,7 @@ impl VolumeManager {
                     if cache.files_only && file.is_directory { continue; }
                     if cache.directories_only && !file.is_directory { continue; }
 
-                    new_matched.push((drive_letter.to_string(), new_idx));
+                    new_matched.push((vol_idx, new_idx));
                 }
             }
         }
