@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
+const SCROLL_SPACE = 30_000_000; // 浏览器安全 scrollHeight 上限内
+
 interface UseVirtualScrollOptions {
   totalItems: number;
   itemHeight: number;
@@ -18,7 +20,6 @@ interface UseVirtualScrollReturn {
   resetScroll: () => void;
 }
 
-
 export function useVirtualScroll({
   totalItems,
   itemHeight,
@@ -34,12 +35,18 @@ export function useVirtualScroll({
   onRangeChangeRef.current = onRangeChange;
 
   const scrollTop = scrollTopRef.current;
-  const startIndex = Math.floor(scrollTop / itemHeight);
   const viewportHeight = containerRef.current?.clientHeight ?? 0;
-  const visibleCount = Math.ceil(viewportHeight / itemHeight) + overscan;
+
+  const needsScaling = totalItems * itemHeight > SCROLL_SPACE;
+  const effectiveItemHeight = needsScaling
+    ? SCROLL_SPACE / totalItems
+    : itemHeight;
+
+  const spacerHeight = needsScaling ? SCROLL_SPACE : totalItems * itemHeight;
+  const startIndex = Math.floor(scrollTop / effectiveItemHeight);
+  const visibleCount = Math.ceil(viewportHeight / effectiveItemHeight) + overscan;
   const endIndex = Math.min(startIndex + visibleCount, totalItems);
-  const offsetY = startIndex * itemHeight;
-  const spacerHeight = totalItems * itemHeight;
+  const offsetY = startIndex * effectiveItemHeight;
 
   const handleScroll = useCallback(() => {
     if (rafId.current !== null) {
@@ -68,6 +75,7 @@ export function useVirtualScroll({
   }, [containerRef, handleScroll]);
 
   useEffect(() => {
+    if (totalItems === 0) return;
     const key = `${startIndex}-${endIndex}`;
     if (key !== lastFiredRef.current) {
       lastFiredRef.current = key;
@@ -77,11 +85,14 @@ export function useVirtualScroll({
 
   const scrollToIndex = useCallback((index: number) => {
     if (containerRef.current) {
-      containerRef.current.scrollTop = index * itemHeight;
+      const eih = totalItems * itemHeight > SCROLL_SPACE
+        ? SCROLL_SPACE / totalItems
+        : itemHeight;
+      containerRef.current.scrollTop = index * eih;
       scrollTopRef.current = containerRef.current.scrollTop;
       setTick(t => t + 1);
     }
-  }, [containerRef, itemHeight]);
+  }, [containerRef, totalItems, itemHeight]);
 
   const resetScroll = useCallback(() => {
     if (containerRef.current) {

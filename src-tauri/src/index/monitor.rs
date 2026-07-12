@@ -1,4 +1,4 @@
-﻿use crate::error::Result;
+use crate::error::Result;
 use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -376,7 +376,6 @@ impl VolumeMonitor {
         };
 
         walkdir::WalkDir::new(&path)
-            .max_depth(10)
             .follow_links(false)
     }
 
