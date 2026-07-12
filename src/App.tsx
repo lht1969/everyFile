@@ -205,7 +205,7 @@ function App() {
     rangeCacheRef.current.clear();
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
-    setStatusMessage('排序中...');
+    // setStatusMessage('排序中...');
     try {
       const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
         sortBy: field,
