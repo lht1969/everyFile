@@ -65,9 +65,16 @@ export function useVirtualScroll({
     const container = containerRef.current;
     if (!container) return;
 
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      container.scrollTop += e.deltaY * 0.25;
+    };
+
     container.addEventListener('scroll', handleScroll, { passive: true });
+    container.addEventListener('wheel', handleWheel, { passive: false });
     return () => {
       container.removeEventListener('scroll', handleScroll);
+      container.removeEventListener('wheel', handleWheel);
       if (rafId.current !== null) {
         cancelAnimationFrame(rafId.current);
       }

@@ -6,6 +6,7 @@ import { formatSize, formatTime } from '../utils/format';
 
 interface ResultListProps {
   results: SearchResult[];
+  resultsOffset: number;
   totalCount: number;
   sortField: SortField;
   sortDirection: SortDirection;
@@ -33,7 +34,7 @@ function FileIcon({ path, isDirectory }: { path: string; isDirectory: boolean })
   return <img className="file-icon-img" src={iconUrl} alt="" draggable={false} />;
 }
 
-function ResultList({ results, totalCount, sortField, sortDirection, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop }: ResultListProps) {
+function ResultList({ results, totalCount, resultsOffset, sortField, sortDirection, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop }: ResultListProps) {
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string; isDirectory: boolean } | null>(null);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
@@ -43,7 +44,7 @@ function ResultList({ results, totalCount, sortField, sortDirection, onOpenFile,
   const hoverTimeoutRef = useRef<number | null>(null);
   const resizingRef = useRef<{ colIndex: number; startX: number; startWidth: number } | null>(null);
 
-  const { startIndex, offsetY, spacerHeight, scrollToIndex, resetScroll } = useVirtualScroll({
+  const { startIndex, endIndex, offsetY, spacerHeight, scrollToIndex, resetScroll } = useVirtualScroll({
     totalItems: totalCount,
     itemHeight: ROW_HEIGHT,
     overscan: 5,
@@ -169,29 +170,44 @@ function ResultList({ results, totalCount, sortField, sortDirection, onOpenFile,
         <div className="result-body" ref={resultBodyRef}>
           <div className="virtual-spacer" style={{ height: spacerHeight }} />
           <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)` }}>
-            {results.map((result, i) => {
-              const globalIndex = startIndex + i;
-              return (
-                <div
-                  key={result.path}
-                  className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
-                  style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
-                  onClick={() => handleRowClick(globalIndex)}
-                  onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
-                  onContextMenu={(e) => handleContextMenu(e, result.path, result.is_directory)}
-                  onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
-                  onMouseLeave={handleMouseLeave}
-                >
-                  <div className="col-name">
-                    <FileIcon path={result.path} isDirectory={result.is_directory} />
-                    <span className="col-name-text" title={result.name}>{result.name}</span>
+            {(() => {
+              const dataEnd = resultsOffset + results.length;
+              const renderEnd = Math.min(endIndex, dataEnd);
+              const renderLen = Math.max(0, renderEnd - startIndex);
+              return Array.from({ length: renderLen }, (_, i) => {
+                const globalIndex = startIndex + i;
+                const result = results[globalIndex - resultsOffset];
+                if (!result) {
+                  return (
+                    <div
+                      key={`placeholder-${globalIndex}`}
+                      className="result-row"
+                      style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
+                    />
+                  );
+                }
+                return (
+                  <div
+                    key={result.path}
+                    className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
+                    style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
+                    onClick={() => handleRowClick(globalIndex)}
+                    onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
+                    onContextMenu={(e) => handleContextMenu(e, result.path, result.is_directory)}
+                    onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
+                    onMouseLeave={handleMouseLeave}
+                  >
+                    <div className="col-name">
+                      <FileIcon path={result.path} isDirectory={result.is_directory} />
+                      <span className="col-name-text" title={result.name}>{result.name}</span>
+                    </div>
+                    <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
+                    <div className="col-size">{formatSize(result.size)}</div>
+                    <div className="col-modified">{formatTime(result.modified_time)}</div>
                   </div>
-                  <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
-                  <div className="col-size">{formatSize(result.size)}</div>
-                  <div className="col-modified">{formatTime(result.modified_time)}</div>
-                </div>
-              );
-            })}
+                );
+              });
+            })()}
           </div>
         </div>
       </div>
