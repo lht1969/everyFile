@@ -44,11 +44,12 @@ export function useVirtualScroll({
 
   const spacerHeight = needsScaling ? SCROLL_SPACE : totalItems * itemHeight;
   const rawStartIndex = Math.floor(scrollTop / effectiveItemHeight);
-  // 接近底部时强制钳制，防止浮动精度导致振荡
-  const atBottom = totalItems > 0 && scrollTop >= spacerHeight - viewportHeight - effectiveItemHeight * 2;
-  const startIndex = totalItems > 0 ? (atBottom ? totalItems - 1 : Math.min(rawStartIndex, totalItems - 1)) : 0;
   const visibleCount = Math.ceil(viewportHeight / effectiveItemHeight) + overscan;
-  const endIndex = totalItems > 0 ? Math.max(Math.min(startIndex + visibleCount, totalItems), startIndex + 1) : 0;
+  // 接近底部时钳制到最后一屏，防止浮动精度振荡
+  const atBottom = totalItems > 0 && scrollTop >= spacerHeight - viewportHeight - effectiveItemHeight * 2;
+  const maxStart = Math.max(totalItems - visibleCount, 0);
+  const startIndex = totalItems > 0 ? (atBottom ? maxStart : Math.min(rawStartIndex, maxStart)) : 0;
+  const endIndex = Math.min(startIndex + visibleCount, totalItems);
   const offsetY = startIndex * effectiveItemHeight;
 
   const handleScroll = useCallback(() => {
