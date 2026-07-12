@@ -506,8 +506,8 @@ impl VolumeMonitor {
         let include_hidden = self.include_hidden_files;
         let include_system = self.include_system_files;
 
-        // Build path→index map from existing files
-        let mut path_map: HashMap<String, usize> = HashMap::with_capacity(self.files.len());
+        // Build path→index map from existing files (不预分配，让 HashMap 自然增长)
+        let mut path_map: HashMap<String, usize> = HashMap::new();
         for (i, f) in self.files.iter().enumerate() {
             path_map.insert(f.path.to_string(), i);
         }
@@ -593,11 +593,12 @@ impl VolumeMonitor {
         // Remove files that were not visited (deleted files)
         let old_len = self.files.len();
         let mut index_map = vec![None; old_len];
-        let mut new_files = Vec::with_capacity(self.files.len());
-        for (i, file) in self.files.iter().enumerate() {
+        let mut new_files = Vec::with_capacity(old_len);
+        // 用移动替代克隆，避免为字符串分配新内存
+        for (i, file) in self.files.drain(..).enumerate() {
             if i < visited.len() && visited[i] {
                 index_map[i] = Some(new_files.len());
-                new_files.push(file.clone());
+                new_files.push(file);
             }
         }
         let removed = old_len - new_files.len();
