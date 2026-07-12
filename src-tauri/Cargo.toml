@@ -59,6 +59,7 @@ tokio = { version = "1.35", features = ["sync", "time", "rt-multi-thread"] }
 
 # 并发工具
 parking_lot = "0.12"
+rayon = "1.10"
 
 # Base64 encoding for icon data URLs
 base64 = "0.22"

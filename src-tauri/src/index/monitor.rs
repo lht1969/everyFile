@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -127,31 +128,19 @@ fn build_sort_permutation(matched: &[(u8, usize)], volumes: &HashMap<String, Vol
             let keys: Vec<&str> = matched.iter()
                 .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].name)
                 .collect();
-            v.sort_unstable_by(|&a, &b| {
-                let (ba, bb) = (keys[a].as_bytes(), keys[b].as_bytes());
-                match ba.cmp(bb) {
-                    std::cmp::Ordering::Equal => keys[a].cmp(keys[b]),
-                    ord => ord,
-                }
-            });
+            v.par_sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         }
         SortBy::Path => {
             let keys: Vec<&str> = matched.iter()
                 .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].path)
                 .collect();
-            v.sort_unstable_by(|&a, &b| {
-                let (ba, bb) = (keys[a].as_bytes(), keys[b].as_bytes());
-                match ba.cmp(bb) {
-                    std::cmp::Ordering::Equal => keys[a].cmp(keys[b]),
-                    ord => ord,
-                }
-            });
+            v.par_sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         }
         SortBy::Size => {
-            v.sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].size);
+            v.par_sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].size);
         }
         SortBy::ModifiedTime => {
-            v.sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].modified_time);
+            v.par_sort_unstable_by_key(|&i| volumes[&vol_names[matched[i].0 as usize]].files[matched[i].1].modified_time);
         }
     }
     v
