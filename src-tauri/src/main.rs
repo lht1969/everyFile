@@ -358,6 +358,12 @@ fn main() {
                         };
 
                         for drive_letter in volumes_list {
+                            // 如果有搜索请求，跳过剩余卷的扫描
+                            if is_searching_clone.load(Ordering::SeqCst) {
+                                log::info!("Incremental scan skipped: search in progress");
+                                break;
+                            }
+
                             // 扫描阶段：短暂持锁
                             let inc_result = {
                                 let mut vm = vm_clone.lock().await;
