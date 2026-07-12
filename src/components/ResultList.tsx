@@ -188,12 +188,13 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
             </div>
           )}
           <div className="virtual-spacer" style={{ height: spacerHeight }} />
-          <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)` }}>
-            {(() => {
-              const dataEnd = resultsOffset + results.length;
-              const renderEnd = Math.min(endIndex, dataEnd);
-              const renderLen = Math.max(0, renderEnd - startIndex);
-              return Array.from({ length: renderLen }, (_, i) => {
+          {(() => {
+            const dataEnd = resultsOffset + results.length;
+            const renderEnd = Math.min(endIndex, dataEnd);
+            const renderLen = Math.max(0, renderEnd - startIndex);
+            return (
+              <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)`, height: renderLen * ROW_HEIGHT }}>
+                {Array.from({ length: renderLen }, (_, i) => {
                 const globalIndex = startIndex + i;
                 const result = results[globalIndex - resultsOffset];
                 if (!result) {
@@ -225,9 +226,10 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                     <div className="col-modified">{formatTime(result.modified_time)}</div>
                   </div>
                 );
-              });
-            })()}
-          </div>
+              })}
+              </div>
+            );
+          })()}
         </div>
       </div>
       {contextMenu && (
