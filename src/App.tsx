@@ -23,8 +23,11 @@ function App() {
   const [searchTime, setSearchTime] = useState<number | null>(null);
   const [scrollTrigger, setScrollTrigger] = useState(0);
   const [rebuilding, setRebuilding] = useState(false);
+  const initialLoadDone = useRef(false);
 
   useEffect(() => {
+    if (initialLoadDone.current) return;
+    initialLoadDone.current = true;
     loadIndexStatus();
     checkAdmin();
     loadAllFiles();
