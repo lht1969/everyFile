@@ -388,7 +388,6 @@ body {
   grid-template-columns: 1fr 2fr 100px 150px;
   gap: 0;
   padding: 4px 16px;
-  border-top: 1px solid var(--border-color);
   align-items: center;
 }
 
@@ -437,7 +436,6 @@ body {
   background: #f9fafb;
   position: sticky;
   top: 0;
-  border-top: none;
 }
 
 .result-row.header .col-size,
