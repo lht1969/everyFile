@@ -7,7 +7,7 @@ use usn_journal_rs::mft::MftEntry;
 use usn_journal_rs::volume::Volume;
 
 struct FileIndex {
-    files: Vec<crate::search::SearchResult>,
+    files: Vec<SearchResult>,
     fid_to_index: HashMap<u64, usize>,
 }
 
@@ -66,7 +66,7 @@ fn handle_full_scan(
     journal_id_map: &mut HashMap<char, u64>,
     resp_tx: &Sender<UsnResponse>,
 ) {
-    log::info!("[USN] Full scan starting for drive {}: ", drive_letter);
+    log::info!("[USN] Full scan starting for drive {}", drive_letter);
 
     // Open volume
     let volume = match Volume::from_drive_letter(drive_letter) {
@@ -84,8 +84,11 @@ fn handle_full_scan(
 
     // Enumerate MFT entries
     let mft = volume.mft();
-    let mut files: Vec<SearchResult> = Vec::new();
+    let mut files: Vec<SearchResult> = Vec::with_capacity(1_000_000);
     let mut fid_to_index: HashMap<u64, usize> = HashMap::new();
+
+    const RECYCLE_BIN: &str = "$recycle.bin";
+    const SYSTEM_VOL_INFO: &str = "system volume information";
 
     for result in mft.iter() {
         let entry: MftEntry = match result {
@@ -99,11 +102,14 @@ fn handle_full_scan(
             None => continue,
         };
 
-        let path_str = path.to_string_lossy().to_string();
-
         // Filter: skip $Recycle.Bin, System Volume Information
-        let path_lower = path_str.to_lowercase();
-        if path_lower.contains("$recycle.bin") || path_lower.contains("system volume information") {
+        // Check path components to avoid allocation per entry
+        let skip = path.components().any(|comp| {
+            let s = comp.as_os_str().to_string_lossy();
+            let sl = s.to_lowercase();
+            sl == RECYCLE_BIN || sl == SYSTEM_VOL_INFO
+        });
+        if skip {
             continue;
         }
 
@@ -112,7 +118,6 @@ fn handle_full_scan(
             continue;
         }
 
-        let name = entry.file_name.to_string_lossy().to_string();
         let is_directory = entry.is_dir();
         let file_id = entry.fid;
 
@@ -131,11 +136,16 @@ fn handle_full_scan(
             Err(_) => (0, 0),
         };
 
+        // Single allocation for name: Box::from directly
+        let name: Box<str> = Box::from(entry.file_name.to_string_lossy().as_ref());
+        // Single allocation for path: into() on the String
+        let path_str: Box<str> = path.to_string_lossy().to_string().into();
+
         let index = files.len();
         files.push(SearchResult {
             file_id,
-            name: name.into(),
-            path: path_str.into(),
+            name,
+            path: path_str,
             size,
             modified_time,
             is_directory,
@@ -151,14 +161,16 @@ fn handle_full_scan(
 
     // Create or verify USN journal
     let journal = volume.journal();
-    let journal_max_size = 32 * 1024 * 1024; // 32 MB
-    let allocation_delta = 8 * 1024 * 1024; // 8 MB
+    let journal_max_size = usn_journal_rs::DEFAULT_JOURNAL_MAX_SIZE;
+    let allocation_delta = usn_journal_rs::DEFAULT_JOURNAL_ALLOCATION_DELTA;
 
     let (journal_id, last_usn) = match journal.query(true) {
         Ok(data) => {
             // Ensure journal is large enough
             if data.maximum_size < journal_max_size {
-                let _ = journal.create_or_update(journal_max_size, allocation_delta);
+                if let Err(e) = journal.create_or_update(journal_max_size, allocation_delta) {
+                    log::warn!("[USN] Failed to resize journal for {}: {}", drive_letter, e);
+                }
                 if let Ok(new_data) = journal.query(false) {
                     (new_data.journal_id, new_data.next_usn)
                 } else {
@@ -208,22 +220,25 @@ fn handle_full_scan(
     // Store volume handle
     volumes.insert(drive_letter, volume);
 
-    // Store file index
+    // Store file index (move data in, clone only for response)
     file_indices.insert(
         drive_letter,
         FileIndex {
-            files: files.clone(),
+            files,
             fid_to_index: fid_to_index.clone(),
         },
     );
 
-    let _ = resp_tx.send(UsnResponse::FullScanResult {
-        drive_letter,
-        files,
-        file_index: fid_to_index,
-        last_usn,
-        journal_id,
-    });
+    // Send response using clone from the stored FileIndex
+    if let Some(fi) = file_indices.get(&drive_letter) {
+        let _ = resp_tx.send(UsnResponse::FullScanResult {
+            drive_letter,
+            files: fi.files.clone(),
+            file_index: fi.fid_to_index.clone(),
+            last_usn,
+            journal_id,
+        });
+    }
 }
 
 fn handle_poll_changes(
