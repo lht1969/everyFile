@@ -164,6 +164,8 @@ pub struct VolumeMonitor {
     files: Vec<SearchResult>,
     include_hidden_files: bool,
     include_system_files: bool,
+    pub fid_index: Option<HashMap<u64, usize>>,
+    pub use_usn: bool,
 }
 
 impl VolumeManager {
@@ -320,6 +322,71 @@ impl VolumeManager {
         Some((results, total))
     }
 
+    /// Apply a full USN scan result: replace the volume's file list and set fid_index.
+    pub fn apply_full_scan(
+        &mut self,
+        drive_letter: &str,
+        files: Vec<SearchResult>,
+        file_index: HashMap<u64, usize>,
+    ) {
+        if let Some(monitor) = self.volumes.get_mut(drive_letter) {
+            monitor.files = files;
+            monitor.fid_index = Some(file_index);
+            monitor.use_usn = true;
+        }
+        self.search_cache = None;
+    }
+
+    /// Apply incremental USN changes to a volume.
+    pub fn apply_incremental_usn(
+        &mut self,
+        drive_letter: &str,
+        added: Vec<(SearchResult, u64)>,
+        removed: Vec<u64>,
+        updated: Vec<(usize, SearchResult)>,
+    ) {
+        let monitor = match self.volumes.get_mut(drive_letter) {
+            Some(m) => m,
+            None => return,
+        };
+
+        if monitor.fid_index.is_none() {
+            log::warn!("[USN] No fid_index for {}, skipping incremental update", drive_letter);
+            return;
+        }
+
+        // Process updates first (in-place, before removals shift indices)
+        for (idx, new_result) in updated {
+            if idx < monitor.files.len() {
+                monitor.files[idx] = new_result;
+            }
+        }
+
+        // Process removals: map fids → indices, mark paths empty
+        {
+            let fid_index = monitor.fid_index.as_ref().unwrap();
+            let indices_to_remove: Vec<usize> = removed
+                .iter()
+                .filter_map(|fid| fid_index.get(fid).copied())
+                .collect();
+            for idx in indices_to_remove {
+                if idx < monitor.files.len() {
+                    monitor.files[idx].path = "".into();
+                }
+            }
+        }
+
+        // Process additions
+        for (search_result, _fid) in added {
+            monitor.files.push(search_result);
+        }
+
+        // Compact: remove empty paths, rebuild fid_index
+        monitor.compact_files();
+
+        self.search_cache = None;
+    }
+
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
         let volume_files: Option<&[SearchResult]> = self.volumes.get(drive_letter).map(|v| v.files());
         let vol_idx = match self.volume_index.get(drive_letter).copied() {
@@ -407,7 +474,19 @@ impl VolumeMonitor {
             files: Vec::new(),
             include_hidden_files,
             include_system_files,
+            fid_index: None,
+            use_usn: false,
         }
+    }
+
+    /// Remove entries with empty paths and rebuild fid_index.
+    pub fn compact_files(&mut self) {
+        self.files.retain(|f| !f.path.is_empty());
+        let mut new_fid_index = HashMap::new();
+        for (i, f) in self.files.iter().enumerate() {
+            new_fid_index.insert(f.file_id, i);
+        }
+        self.fid_index = Some(new_fid_index);
     }
 
     /// Update settings without recreating the monitor or clearing its file list.
@@ -522,6 +601,17 @@ impl VolumeMonitor {
     }
 
     pub fn scan_incremental(&mut self, handle: &tauri::AppHandle) -> Result<IncrementalResult> {
+        if self.use_usn {
+            return Ok(IncrementalResult {
+                added: 0,
+                updated: 0,
+                removed: 0,
+                total: self.files.len(),
+                index_map: Vec::new(),
+                new_file_indices: Vec::new(),
+            });
+        }
+
         let include_hidden = self.include_hidden_files;
         let include_system = self.include_system_files;
 
