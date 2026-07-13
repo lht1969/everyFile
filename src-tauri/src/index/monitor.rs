@@ -343,7 +343,7 @@ impl VolumeManager {
         drive_letter: &str,
         added: Vec<(SearchResult, u64)>,
         removed: Vec<u64>,
-        updated: Vec<(usize, SearchResult)>,
+        updated: Vec<(u64, SearchResult)>,
     ) {
         let monitor = match self.volumes.get_mut(drive_letter) {
             Some(m) => m,
@@ -355,10 +355,12 @@ impl VolumeManager {
             return;
         }
 
-        // Process updates first (in-place, before removals shift indices)
-        for (idx, new_result) in updated {
-            if idx < monitor.files.len() {
-                monitor.files[idx] = new_result;
+        // Process updates: use fid to look up current index (avoids index drift after compaction)
+        for (fid, new_result) in updated {
+            if let Some(idx) = monitor.fid_index.as_ref().and_then(|fi| fi.get(&fid).copied()) {
+                if idx < monitor.files.len() {
+                    monitor.files[idx] = new_result;
+                }
             }
         }
 

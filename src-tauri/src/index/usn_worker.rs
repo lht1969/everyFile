@@ -283,7 +283,7 @@ fn handle_poll_changes(
     let mut resolver = volume.path_resolver_with_cache();
     let mut added: Vec<(SearchResult, u64)> = Vec::new();
     let mut removed: Vec<u64> = Vec::new();
-    let mut updated: Vec<(usize, SearchResult)> = Vec::new();
+    let mut updated: Vec<(u64, SearchResult)> = Vec::new();
     let mut new_last_usn = last_usn;
 
     const USN_REASON_FILE_CREATE: u32 = 0x100;
@@ -404,7 +404,7 @@ fn handle_poll_changes(
                     if idx < fi.files.len() {
                         fi.files[idx] = updated_result.clone();
                     }
-                    updated.push((idx, updated_result));
+                    updated.push((fid, updated_result));
                 }
             }
         }

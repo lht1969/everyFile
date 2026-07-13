@@ -31,8 +31,8 @@ pub enum UsnResponse {
         added: Vec<(crate::search::SearchResult, u64)>,
         /// fids of deleted files
         removed: Vec<u64>,
-        /// (index into files vec, new SearchResult) for updated files
-        updated: Vec<(usize, crate::search::SearchResult)>,
+        /// (file_id, new SearchResult) for updated files - fid-based to avoid index drift
+        updated: Vec<(u64, crate::search::SearchResult)>,
         last_usn: i64,
     },
     /// Error
