@@ -64,6 +64,10 @@ rayon = "1.10"
 # Base64 encoding for icon data URLs
 base64 = "0.22"
 
+# USN Journal support
+usn-journal-rs = "0.4"
+crossbeam-channel = "0.5"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

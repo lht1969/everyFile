@@ -1,5 +1,7 @@
 pub mod database;
 pub mod monitor;
+pub mod usn_types;
+pub mod usn_worker;
 
 use crate::error::Result;
 use std::sync::Arc;
