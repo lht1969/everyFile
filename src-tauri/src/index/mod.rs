@@ -28,3 +28,41 @@ impl IndexManager {
         self.database.lock().await.search(query, limit, offset).await
     }
 }
+
+use crossbeam_channel::{Receiver, Sender};
+use crate::index::usn_types::{UsnCommand, UsnResponse};
+
+pub struct UsnIndexManager {
+    cmd_tx: Sender<UsnCommand>,
+    resp_rx: Receiver<UsnResponse>,
+}
+
+impl UsnIndexManager {
+    pub fn new() -> Self {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
+        crate::index::usn_worker::spawn_usn_worker(cmd_rx, resp_tx);
+        Self { cmd_tx, resp_rx }
+    }
+
+    pub fn full_scan(&self, drive_letter: char) {
+        let _ = self.cmd_tx.send(UsnCommand::FullScan { drive_letter });
+    }
+
+    pub fn poll_changes(&self, drive_letter: char) {
+        let _ = self.cmd_tx.send(UsnCommand::PollChanges { drive_letter });
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.cmd_tx.send(UsnCommand::Shutdown);
+    }
+
+    pub fn resp_rx_clone(&self) -> Receiver<UsnResponse> {
+        self.resp_rx.clone()
+    }
+
+    /// Non-blocking check for responses
+    pub fn try_recv(&self) -> Option<UsnResponse> {
+        self.resp_rx.try_recv().ok()
+    }
+}
