@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Command sent to the USN worker thread
+#[derive(Debug)]
 pub enum UsnCommand {
     /// Full MFT scan for a volume
     FullScan { drive_letter: char },
@@ -12,6 +13,7 @@ pub enum UsnCommand {
 }
 
 /// Response from the USN worker thread
+#[derive(Debug)]
 pub enum UsnResponse {
     /// Full index built from MFT
     FullScanResult {
@@ -52,19 +54,36 @@ pub struct VolumeState {
 impl UsnState {
     pub fn load() -> Self {
         let path = Self::state_path();
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+                log::warn!("[USN] Failed to parse {}: {}", path.display(), e);
+                Self::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => {
+                log::warn!("[USN] Failed to read {}: {}", path.display(), e);
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self) {
         let path = Self::state_path();
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("[USN] Failed to create dir {}: {}", parent.display(), e);
+                return;
+            }
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, json);
+        match serde_json::to_string_pretty(self) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    log::warn!("[USN] Failed to write {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => {
+                log::warn!("[USN] Failed to serialize USN state: {}", e);
+            }
         }
     }
 
