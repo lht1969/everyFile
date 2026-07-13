@@ -88,9 +88,90 @@ impl UsnState {
     }
 
     fn state_path() -> std::path::PathBuf {
-        let appdata = dirs::data_dir()
-            .or_else(|| dirs::home_dir())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        appdata.join("Everything").join("usn_state.json")
+        Self::state_path_inner().unwrap_or_else(|| std::path::PathBuf::from("usn_state.json"))
+    }
+
+    fn state_path_inner() -> Option<std::path::PathBuf> {
+        let appdata = dirs::data_dir().or_else(|| dirs::home_dir())?;
+        Some(appdata.join("Everything").join("usn_state.json"))
+    }
+
+    #[cfg(test)]
+    fn test_state_path(suffix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("everything_test_usn_{}.json", suffix))
+    }
+
+    #[cfg(test)]
+    pub fn load_test(suffix: &str) -> Self {
+        let path = Self::test_state_path(suffix);
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn save_test(&self, suffix: &str) {
+        let path = Self::test_state_path(suffix);
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_usn_state_default() {
+        let state = UsnState::default();
+        assert!(state.volumes.is_empty());
+    }
+
+    #[test]
+    fn test_usn_state_save_load() {
+        let suffix = "save_load";
+        let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
+        let mut state = UsnState::default();
+        state.volumes.insert(
+            "C".to_string(),
+            VolumeState {
+                journal_id: 12345,
+                last_usn: 67890,
+            },
+        );
+        state.save_test(suffix);
+        let loaded = UsnState::load_test(suffix);
+        assert_eq!(loaded.volumes["C"].journal_id, 12345);
+        assert_eq!(loaded.volumes["C"].last_usn, 67890);
+        let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
+    }
+
+    #[test]
+    fn test_usn_state_multiple_volumes() {
+        let suffix = "multi_vol";
+        let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
+        let mut state = UsnState::default();
+        state.volumes.insert(
+            "C".to_string(),
+            VolumeState {
+                journal_id: 100,
+                last_usn: 200,
+            },
+        );
+        state.volumes.insert(
+            "D".to_string(),
+            VolumeState {
+                journal_id: 300,
+                last_usn: 400,
+            },
+        );
+        state.save_test(suffix);
+        let loaded = UsnState::load_test(suffix);
+        assert_eq!(loaded.volumes.len(), 2);
+        assert_eq!(loaded.volumes["C"].journal_id, 100);
+        assert_eq!(loaded.volumes["D"].last_usn, 400);
+        let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
     }
 }
