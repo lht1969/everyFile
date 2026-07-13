@@ -14,6 +14,8 @@ mod tray;
 
 use commands::search::AppState;
 use index::monitor::VolumeManager;
+use index::UsnIndexManager;
+use index::usn_types::UsnResponse;
 use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -120,6 +122,16 @@ fn main() {
     let is_searching = Arc::new(AtomicBool::new(false));
     let last_index_update = Arc::new(Mutex::new(String::new()));
 
+    // 检查管理员权限，决定是否使用 USN Journal
+    let is_admin = fs::is_elevated();
+    let usn_manager: Option<Arc<UsnIndexManager>> = if is_admin {
+        info!("Admin mode detected, creating USN Index Manager");
+        Some(Arc::new(UsnIndexManager::new()))
+    } else {
+        info!("Non-admin mode, using walkdir for indexing");
+        None
+    };
+
     // 数据库路径：使用 AppData 目录，避免在 dev 模式下触发文件监听器重建
     let db_path = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -162,6 +174,7 @@ fn main() {
             volume_manager: volume_manager.clone(),
             is_searching: is_searching.clone(),
             last_index_update: last_index_update.clone(),
+            usn_manager: usn_manager.clone(),
         })
         // 设置窗口事件处理
         .on_window_event(|window, event| {
@@ -191,8 +204,6 @@ fn main() {
 
             // 启动异步任务
             tauri::async_runtime::spawn(async move {
-                // 检查是否以管理员身份运行
-                let is_admin = fs::is_elevated();
                 // 获取卷管理器的锁
                 let mut volume_manager = vm.lock().await;
 
@@ -275,11 +286,25 @@ fn main() {
                     }
                 }
 
-                // 扫描所有卷
+                // If admin, mark all monitors for USN and skip walkdir full scan
+                if is_admin {
+                    for drive_letter in volume_manager.volumes() {
+                        if let Some(monitor) = volume_manager.get_monitor_mut(&drive_letter) {
+                            monitor.use_usn = true;
+                        }
+                    }
+                }
+
+                // 扫描所有卷 (walkdir for non-USN volumes only)
                 for drive_letter in volume_manager.volumes() {
                     // 获取卷监控器
                     let monitor = volume_manager.take_monitor(&drive_letter);
                     if let Some(mut m) = monitor {
+                        if m.use_usn {
+                            // USN volumes are scanned via the USN worker
+                            volume_manager.return_monitor(&drive_letter, m);
+                            continue;
+                        }
                         // 克隆应用句柄
                         let handle_clone = handle.clone();
                         // 扫描卷并显示进度
@@ -300,8 +325,147 @@ fn main() {
                     }
                 }
 
+                // If admin, issue full-scan commands to the USN worker
+                if let Some(ref usn) = usn_manager {
+                    for drive_letter in volume_manager.volumes() {
+                        let dl_char = drive_letter.chars().next().unwrap_or('C');
+                        log::info!("[USN] Issuing full scan for drive {}", dl_char);
+                        usn.full_scan(dl_char);
+                    }
+                }
+
                 // 释放卷管理器锁
                 drop(volume_manager);
+
+                // Spawn USN response handler thread (admin only)
+                if let Some(ref usn) = usn_manager {
+                    let resp_rx = usn.resp_rx_clone();
+                    let vm_for_handler = vm.clone();
+                    let handle_for_handler = handle.clone();
+                    let rt_handle = tokio::runtime::Handle::current();
+
+                    std::thread::Builder::new()
+                        .name("usn-response-handler".into())
+                        .spawn(move || {
+                            log::info!("[USN] Response handler thread started");
+                            loop {
+                                match resp_rx.recv() {
+                                    Ok(UsnResponse::FullScanResult {
+                                        drive_letter,
+                                        files,
+                                        file_index,
+                                        ..
+                                    }) => {
+                                        let drive_string = format!("{}:", drive_letter);
+                                        log::info!(
+                                            "[USN] Full scan result for {}: {} files",
+                                            drive_string,
+                                            files.len()
+                                        );
+                                        let mut vm = rt_handle.block_on(vm_for_handler.lock());
+                                        vm.apply_full_scan(&drive_string, files, file_index);
+                                        let count = vm.get_file_count(&drive_string);
+                                        drop(vm);
+                                        let _ = handle_for_handler.emit(
+                                            "scan-complete",
+                                            serde_json::json!({
+                                                "volume": drive_string,
+                                                "count": count
+                                            }),
+                                        );
+                                    }
+                                    Ok(UsnResponse::IncrementalResult {
+                                        drive_letter,
+                                        added,
+                                        removed,
+                                        updated,
+                                        ..
+                                    }) => {
+                                        if added.is_empty()
+                                            && removed.is_empty()
+                                            && updated.is_empty()
+                                        {
+                                            continue;
+                                        }
+                                        let drive_string = format!("{}:", drive_letter);
+                                        log::info!(
+                                            "[USN] Incremental {}: +{} ~{} -{}",
+                                            drive_string,
+                                            added.len(),
+                                            updated.len(),
+                                            removed.len()
+                                        );
+                                        let mut vm = rt_handle.block_on(vm_for_handler.lock());
+                                        let total = vm.get_file_count(&drive_string);
+                                        vm.apply_incremental_usn(
+                                            &drive_string, added, removed, updated,
+                                        );
+                                        let new_total = vm.get_file_count(&drive_string);
+                                        drop(vm);
+                                        let _ = handle_for_handler.emit(
+                                            "index-updated",
+                                            serde_json::json!({
+                                                "volume": drive_string,
+                                                "added": new_total.saturating_sub(total),
+                                                "updated": 0,
+                                                "removed": total.saturating_sub(new_total),
+                                                "total": new_total,
+                                                "cache_total": new_total
+                                            }),
+                                        );
+                                    }
+                                    Ok(UsnResponse::Error { message }) => {
+                                        log::error!("[USN] Worker error: {}", message);
+                                    }
+                                    Err(_) => {
+                                        log::info!(
+                                            "[USN] Response channel closed, handler exiting"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                        .expect("failed to spawn USN response handler thread");
+                }
+
+                // Spawn USN polling task (admin only)
+                if let Some(ref usn) = usn_manager {
+                    let usn_clone = usn.clone();
+                    let vm_clone_for_usn = vm.clone();
+
+                    tauri::async_runtime::spawn(async move {
+                        // Initial delay before starting USN polling
+                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+                        loop {
+                            let config = crate::config::Config::load().ok();
+                            let interval = config
+                                .as_ref()
+                                .map(|c| c.index_settings.update_interval as u64)
+                                .unwrap_or(300);
+
+                            if interval == 0 {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                                continue;
+                            }
+
+                            let volumes_list = {
+                                let vm = vm_clone_for_usn.lock().await;
+                                vm.volumes()
+                            };
+
+                            for drive_letter in &volumes_list {
+                                let dl_char =
+                                    drive_letter.chars().next().unwrap_or('C');
+                                usn_clone.poll_changes(dl_char);
+                            }
+
+                            tokio::time::sleep(tokio::time::Duration::from_secs(interval))
+                                .await;
+                        }
+                    });
+                }
 
                 // 启动增量更新任务（所有用户）
                 let vm_clone = vm.clone();
@@ -370,6 +534,13 @@ fn main() {
                                 let mut monitor = vm.take_monitor(&drive_letter);
                                 let mut result = None;
                                 if let Some(ref mut m) = monitor {
+                                    if m.use_usn {
+                                        // USN volumes are handled by the USN polling task
+                                        if let Some(m) = monitor {
+                                            vm.return_monitor(&drive_letter, m);
+                                        }
+                                        continue;
+                                    }
                                     m.update_settings(include_hidden, include_system);
                                     if let Ok(r) = m.scan_incremental(&handle_clone) {
                                         if r.added > 0 || r.updated > 0 || r.removed > 0 {

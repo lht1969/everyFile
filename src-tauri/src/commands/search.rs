@@ -1,4 +1,5 @@
 use crate::index::IndexManager;
+use crate::index::UsnIndexManager;
 use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +46,7 @@ pub struct AppState {
     pub volume_manager: Arc<Mutex<crate::index::monitor::VolumeManager>>,
     pub is_searching: Arc<AtomicBool>,
     pub last_index_update: Arc<Mutex<String>>,
+    pub usn_manager: Option<Arc<UsnIndexManager>>,
 }
 
 #[tauri::command]
