@@ -242,12 +242,197 @@ fn handle_full_scan(
 }
 
 fn handle_poll_changes(
-    _drive_letter: char,
-    _volumes: &HashMap<char, Volume>,
-    _file_indices: &mut HashMap<char, FileIndex>,
-    _last_usn_map: &mut HashMap<char, i64>,
+    drive_letter: char,
+    volumes: &HashMap<char, Volume>,
+    file_indices: &mut HashMap<char, FileIndex>,
+    last_usn_map: &mut HashMap<char, i64>,
     _journal_id_map: &HashMap<char, u64>,
-    _resp_tx: &Sender<UsnResponse>,
+    resp_tx: &Sender<UsnResponse>,
 ) {
-    // TODO: Task 4
+    let volume = match volumes.get(&drive_letter) {
+        Some(v) => v,
+        None => {
+            let _ = resp_tx.send(UsnResponse::Error {
+                message: format!("No volume handle for drive {}", drive_letter),
+            });
+            return;
+        }
+    };
+
+    let last_usn = match last_usn_map.get(&drive_letter) {
+        Some(&usn) => usn,
+        None => {
+            let _ = resp_tx.send(UsnResponse::Error {
+                message: format!("No last USN recorded for drive {}", drive_letter),
+            });
+            return;
+        }
+    };
+
+    let journal = volume.journal();
+    let iter = match journal.iter() {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = resp_tx.send(UsnResponse::Error {
+                message: format!("Failed to read journal for {}: {}", drive_letter, e),
+            });
+            return;
+        }
+    };
+
+    let mut resolver = volume.path_resolver_with_cache();
+    let mut added: Vec<(SearchResult, u64)> = Vec::new();
+    let mut removed: Vec<u64> = Vec::new();
+    let mut updated: Vec<(usize, SearchResult)> = Vec::new();
+    let mut new_last_usn = last_usn;
+
+    const USN_REASON_FILE_CREATE: u32 = 0x100;
+    const USN_REASON_FILE_DELETE: u32 = 0x200;
+    const USN_REASON_RENAME_OLD_NAME: u32 = 0x80000;
+    const USN_REASON_RENAME_NEW_NAME: u32 = 0x100000;
+    const USN_REASON_DATA_OVERWRITE: u32 = 0x01;
+    const USN_REASON_BASIC_INFO_CHANGE: u32 = 0x04;
+
+    const RECYCLE_BIN: &str = "$recycle.bin";
+    const SYSTEM_VOL_INFO: &str = "system volume information";
+
+    for result in iter {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if entry.usn <= last_usn {
+            continue;
+        }
+
+        new_last_usn = entry.usn.max(new_last_usn);
+
+        let reason = entry.reason;
+        let fid = entry.fid;
+        let name: Box<str> = Box::from(entry.file_name.to_string_lossy().as_ref());
+
+        if reason & USN_REASON_FILE_DELETE != 0 || reason & USN_REASON_RENAME_OLD_NAME != 0 {
+            if let Some(fi) = file_indices.get_mut(&drive_letter) {
+                if let Some(&idx) = fi.fid_to_index.get(&fid) {
+                    removed.push(fid);
+                    fi.fid_to_index.remove(&fid);
+                    if idx < fi.files.len() {
+                        fi.files[idx].path = "".into();
+                    }
+                }
+            }
+        } else if reason & USN_REASON_FILE_CREATE != 0 || reason & USN_REASON_RENAME_NEW_NAME != 0 {
+            let path = match resolver.resolve_path(&entry) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let skip = path.components().any(|comp| {
+                let s = comp.as_os_str().to_string_lossy();
+                let sl = s.to_lowercase();
+                sl == RECYCLE_BIN || sl == SYSTEM_VOL_INFO
+            });
+            if skip {
+                continue;
+            }
+
+            let is_directory = entry.is_dir();
+            let (size, modified_time) = match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let size = meta.len();
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (size, mtime)
+                }
+                Err(_) => (0, 0),
+            };
+
+            let path_str: Box<str> = path.to_string_lossy().to_string().into();
+            let search_result = SearchResult {
+                file_id: fid,
+                name,
+                path: path_str,
+                size,
+                modified_time,
+                is_directory,
+            };
+
+            if let Some(fi) = file_indices.get_mut(&drive_letter) {
+                let idx = fi.files.len();
+                fi.fid_to_index.insert(fid, idx);
+                added.push((search_result.clone(), fid));
+                fi.files.push(search_result);
+            }
+        } else if reason & USN_REASON_DATA_OVERWRITE != 0
+            || reason & USN_REASON_BASIC_INFO_CHANGE != 0
+        {
+            if let Some(fi) = file_indices.get_mut(&drive_letter) {
+                if let Some(&idx) = fi.fid_to_index.get(&fid) {
+                    let path = match resolver.resolve_path(&entry) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    let (size, modified_time) = match std::fs::metadata(&path) {
+                        Ok(meta) => {
+                            let size = meta.len();
+                            let mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            (size, mtime)
+                        }
+                        Err(_) => (0, 0),
+                    };
+
+                    let path_str: Box<str> = path.to_string_lossy().to_string().into();
+                    let updated_result = SearchResult {
+                        file_id: fid,
+                        name,
+                        path: path_str,
+                        size,
+                        modified_time,
+                        is_directory: fi.files[idx].is_directory,
+                    };
+                    if idx < fi.files.len() {
+                        fi.files[idx] = updated_result.clone();
+                    }
+                    updated.push((idx, updated_result));
+                }
+            }
+        }
+    }
+
+    log::debug!(
+        "[USN] Poll {}: added={}, removed={}, updated={}",
+        drive_letter,
+        added.len(),
+        removed.len(),
+        updated.len()
+    );
+
+    if new_last_usn > last_usn {
+        last_usn_map.insert(drive_letter, new_last_usn);
+
+        let mut state = UsnState::load();
+        if let Some(vs) = state.volumes.get_mut(&drive_letter.to_string()) {
+            vs.last_usn = new_last_usn;
+        }
+        state.save();
+    }
+
+    let _ = resp_tx.send(UsnResponse::IncrementalResult {
+        drive_letter,
+        added,
+        removed,
+        updated,
+        last_usn: new_last_usn,
+    });
 }
