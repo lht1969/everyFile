@@ -321,76 +321,83 @@ impl VolumeManager {
     }
 
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
-        // 分离借用：先获取 volume files 引用和索引，避免与 search_cache 的可变借用冲突
         let volume_files: Option<&[SearchResult]> = self.volumes.get(drive_letter).map(|v| v.files());
-        let vol_idx = self.volume_index.get(drive_letter).copied();
+        let vol_idx = match self.volume_index.get(drive_letter).copied() {
+            Some(i) => i,
+            None => return 0,
+        };
 
         let cache = match self.search_cache.as_mut() {
             Some(c) => c,
             None => return 0,
         };
 
-        let vol_idx = match vol_idx {
-            Some(i) => i,
-            None => return 0,
-        };
+        apply_incremental_to_cache(cache, &self.volumes, &self.vol_names, volume_files, vol_idx, result)
+    }
+}
 
-        let mut new_matched: Vec<(u8, usize)> = Vec::with_capacity(cache.matched.len());
-        let mut removed_count = 0usize;
+/// 增量更新缓存（自由函数，避免借用冲突）
+fn apply_incremental_to_cache(
+    cache: &mut SearchCache,
+    _volumes: &HashMap<String, VolumeMonitor>,
+    _vol_names: &[String],
+    volume_files: Option<&[SearchResult]>,
+    vol_idx: u8,
+    result: &IncrementalResult,
+) -> usize {
+    let mut new_matched: Vec<(u8, usize)> = Vec::with_capacity(cache.matched.len());
+    let mut removed_count = 0usize;
 
-        for (vol, idx) in cache.matched.drain(..) {
-            if vol != vol_idx {
-                new_matched.push((vol, idx));
-            } else if idx < result.index_map.len() {
-                if let Some(new_idx) = result.index_map[idx] {
-                    new_matched.push((vol, new_idx));
-                } else {
-                    removed_count += 1;
-                }
+    for (vol, idx) in cache.matched.drain(..) {
+        if vol != vol_idx {
+            new_matched.push((vol, idx));
+        } else if idx < result.index_map.len() {
+            if let Some(new_idx) = result.index_map[idx] {
+                new_matched.push((vol, new_idx));
             } else {
                 removed_count += 1;
             }
+        } else {
+            removed_count += 1;
         }
+    }
 
-        // Add new files that match the current search query
-        let added_count_before = new_matched.len();
-        if !result.new_file_indices.is_empty() {
-            if let Some(files) = volume_files {
-                let query = if cache.query.trim().is_empty() {
-                    None
-                } else {
-                    Some(crate::search::query::SearchQuery::parse(&cache.query))
-                };
+    let added_count_before = new_matched.len();
+    if !result.new_file_indices.is_empty() {
+        if let Some(files) = volume_files {
+            let query = if cache.query.trim().is_empty() {
+                None
+            } else {
+                Some(crate::search::query::SearchQuery::parse(&cache.query))
+            };
 
-                for &new_idx in &result.new_file_indices {
-                    if new_idx >= files.len() { continue; }
-                    let file = &files[new_idx];
+            for &new_idx in &result.new_file_indices {
+                if new_idx >= files.len() { continue; }
+                let file = &files[new_idx];
 
-                    if let Some(ref q) = query {
-                        if !crate::search::query::SearchQuery::matches(q, file) { continue; }
-                    }
-                    if cache.files_only && file.is_directory { continue; }
-                    if cache.directories_only && !file.is_directory { continue; }
-
-                    new_matched.push((vol_idx, new_idx));
+                if let Some(ref q) = query {
+                    if !crate::search::query::SearchQuery::matches(q, file) { continue; }
                 }
+                if cache.files_only && file.is_directory { continue; }
+                if cache.directories_only && !file.is_directory { continue; }
+
+                new_matched.push((vol_idx, new_idx));
             }
         }
-        let added_count = new_matched.len() - added_count_before;
-
-        cache.matched = new_matched;
-        cache.total = cache.matched.len();
-
-        // 只有新增或删除时才需要重建排列（修改不影响排序顺序）
-        if removed_count > 0 || added_count > 0 {
-            cache.sorted_by_name = None;
-            cache.sorted_by_path = None;
-            cache.sorted_by_size = None;
-            cache.sorted_by_modified = None;
-        }
-
-        cache.total
     }
+    let added_count = new_matched.len() - added_count_before;
+
+    cache.matched = new_matched;
+    cache.total = cache.matched.len();
+
+    if removed_count > 0 || added_count > 0 {
+        cache.sorted_by_name = None;
+        cache.sorted_by_path = None;
+        cache.sorted_by_size = None;
+        cache.sorted_by_modified = None;
+    }
+
+    cache.total
 }
 
 impl VolumeMonitor {
