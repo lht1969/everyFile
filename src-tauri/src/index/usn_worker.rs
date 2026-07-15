@@ -341,8 +341,18 @@ fn handle_full_scan(
                 return None;
             }
 
+            // Skip unnamed / placeholder records (<Record#N>, <no name>)
+            if r.name.starts_with('<') {
+                return None;
+            }
+
             // Skip $-prefixed NTFS metadata files
             if r.name.starts_with('$') {
+                return None;
+            }
+
+            // Skip NTFS virtual entries (. and ..)
+            if r.name == "." || r.name == ".." {
                 return None;
             }
 
@@ -376,6 +386,11 @@ fn handle_full_scan(
                 }
             }
             parts.reverse();
+
+            // Skip paths containing $-prefixed components (NTFS special directories)
+            if parts.iter().any(|p| p.starts_with('$')) {
+                return None;
+            }
 
             // Build path string: "C:\folder\subfolder\file.txt"
             let estimated_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
