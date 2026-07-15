@@ -46,7 +46,7 @@ pub struct SearchCache {
     directories_only: bool,
     pub total: usize,
     pub created_at: Instant,
-    pub matched: Vec<(u8, usize)>,
+    pub matched: Vec<(u8, u32)>,
     // Lazily-computed ascending permutation vectors into `matched`
     sorted_by_name: Option<Vec<usize>>,
     sorted_by_path: Option<Vec<usize>>,
@@ -112,12 +112,12 @@ impl SearchCache {
         iter.filter_map(|idx| {
             let (vol, file_idx) = &matched[*idx];
             let vol_name = &vol_names[*vol as usize];
-            volumes.get(vol_name).and_then(|m| m.files.get(*file_idx)).cloned()
+            volumes.get(vol_name).and_then(|m| m.files.get(*file_idx as usize)).cloned()
         }).collect()
     }
 }
 
-fn build_sort_permutation(matched: &[(u8, usize)], volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String], sort_by: SortBy) -> Vec<usize> {
+fn build_sort_permutation(matched: &[(u8, u32)], volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String], sort_by: SortBy) -> Vec<usize> {
     let n = matched.len();
     if n == 0 {
         return Vec::new();
@@ -126,25 +126,25 @@ fn build_sort_permutation(matched: &[(u8, usize)], volumes: &HashMap<String, Vol
     match sort_by {
         SortBy::Name | SortBy::Score => {
             let keys: Vec<&str> = matched.iter()
-                .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].name)
+                .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx as usize].name)
                 .collect();
             v.par_sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         }
         SortBy::Path => {
             let keys: Vec<&str> = matched.iter()
-                .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx].path)
+                .map(|(vol, idx)| &*volumes[&vol_names[*vol as usize]].files[*idx as usize].path)
                 .collect();
             v.par_sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
         }
         SortBy::Size => {
             let keys: Vec<u64> = matched.iter()
-                .map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx].size)
+                .map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx as usize].size)
                 .collect();
             v.par_sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]));
         }
         SortBy::ModifiedTime => {
             let keys: Vec<i64> = matched.iter()
-                .map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx].modified_time)
+                .map(|(vol, idx)| volumes[&vol_names[*vol as usize]].files[*idx as usize].modified_time)
                 .collect();
             v.par_sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]));
         }
@@ -164,7 +164,7 @@ pub struct VolumeMonitor {
     files: Vec<SearchResult>,
     include_hidden_files: bool,
     include_system_files: bool,
-    pub fid_index: Option<HashMap<u64, usize>>,
+    pub fid_index: Option<Vec<(u64, usize)>>,
     pub use_usn: bool,
 }
 
@@ -231,7 +231,7 @@ impl VolumeManager {
     pub fn search_with_options(&mut self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
         let t0 = Instant::now();
 
-        let mut matched: Vec<(u8, usize)> = Vec::new();
+        let mut matched: Vec<(u8, u32)> = Vec::new();
         let is_empty_query = query.trim().is_empty();
         let parsed_query = if is_empty_query {
             None
@@ -246,7 +246,7 @@ impl VolumeManager {
                 for (idx, file) in monitor.files.iter().enumerate() {
                     if options.files_only && file.is_directory { continue; }
                     if options.directories_only && !file.is_directory { continue; }
-                    matched.push((vol_idx, idx));
+                    matched.push((vol_idx, idx as u32));
                 }
             } else {
                 let pq = parsed_query.as_ref().unwrap();
@@ -254,7 +254,7 @@ impl VolumeManager {
                     if !crate::search::query::SearchQuery::matches(pq, file) { continue; }
                     if !query_controls_dir && options.files_only && file.is_directory { continue; }
                     if options.directories_only && !file.is_directory { continue; }
-                    matched.push((vol_idx, idx));
+                    matched.push((vol_idx, idx as u32));
                 }
             }
         }
@@ -268,7 +268,7 @@ impl VolumeManager {
         let first_batch: Vec<SearchResult> = matched.iter().take(50)
             .filter_map(|(vol, idx)| {
                 let vol_name = &self.vol_names[*vol as usize];
-                self.volumes.get(vol_name).and_then(|m| m.files.get(*idx)).cloned()
+                self.volumes.get(vol_name).and_then(|m| m.files.get(*idx as usize)).cloned()
             })
             .collect();
 
@@ -336,10 +336,11 @@ impl VolumeManager {
         files: Vec<SearchResult>,
     ) {
         if let Some(monitor) = self.volumes.get_mut(drive_letter) {
-            let mut fid_index = HashMap::with_capacity(files.len());
+            let mut fid_index: Vec<(u64, usize)> = Vec::with_capacity(files.len());
             for (i, f) in files.iter().enumerate() {
-                fid_index.insert(f.file_id, i);
+                fid_index.push((f.file_id, i));
             }
+            fid_index.sort_unstable_by_key(|(id, _)| *id);
             monitor.files = files;
             monitor.fid_index = Some(fid_index);
             monitor.use_usn = true;
@@ -367,7 +368,7 @@ impl VolumeManager {
 
         // Process updates: use fid to look up current index (avoids index drift after compaction)
         for (fid, new_result) in updated {
-            if let Some(idx) = monitor.fid_index.as_ref().and_then(|fi| fi.get(&fid).copied()) {
+            if let Some(idx) = monitor.fid_index.as_ref().and_then(|fi| fi.iter().find(|(id, _)| *id == fid).map(|(_, idx)| *idx)) {
                 if idx < monitor.files.len() {
                     monitor.files[idx] = new_result;
                 }
@@ -379,7 +380,7 @@ impl VolumeManager {
             let fid_index = monitor.fid_index.as_ref().unwrap();
             let indices_to_remove: Vec<usize> = removed
                 .iter()
-                .filter_map(|fid| fid_index.get(fid).copied())
+                .filter_map(|fid| fid_index.iter().find(|(id, _)| *id == *fid).map(|(_, idx)| *idx))
                 .collect();
             for idx in indices_to_remove {
                 if idx < monitor.files.len() {
@@ -424,15 +425,15 @@ fn apply_incremental_to_cache(
     vol_idx: u8,
     result: &IncrementalResult,
 ) -> usize {
-    let mut new_matched: Vec<(u8, usize)> = Vec::with_capacity(cache.matched.len());
+    let mut new_matched: Vec<(u8, u32)> = Vec::with_capacity(cache.matched.len());
     let mut removed_count = 0usize;
 
     for (vol, idx) in cache.matched.drain(..) {
         if vol != vol_idx {
             new_matched.push((vol, idx));
-        } else if idx < result.index_map.len() {
-            if let Some(new_idx) = result.index_map[idx] {
-                new_matched.push((vol, new_idx));
+        } else if (idx as usize) < result.index_map.len() {
+            if let Some(new_idx) = result.index_map[idx as usize] {
+                new_matched.push((vol, new_idx as u32));
             } else {
                 removed_count += 1;
             }
@@ -460,7 +461,7 @@ fn apply_incremental_to_cache(
                 if cache.files_only && file.is_directory { continue; }
                 if cache.directories_only && !file.is_directory { continue; }
 
-                new_matched.push((vol_idx, new_idx));
+                new_matched.push((vol_idx, new_idx as u32));
             }
         }
     }
@@ -494,10 +495,11 @@ impl VolumeMonitor {
     /// Remove entries with empty paths and rebuild fid_index.
     pub fn compact_files(&mut self) {
         self.files.retain(|f| !f.path.is_empty());
-        let mut new_fid_index = HashMap::new();
+        let mut new_fid_index: Vec<(u64, usize)> = Vec::with_capacity(self.files.len());
         for (i, f) in self.files.iter().enumerate() {
-            new_fid_index.insert(f.file_id, i);
+            new_fid_index.push((f.file_id, i));
         }
+        new_fid_index.sort_unstable_by_key(|(id, _)| *id);
         self.fid_index = Some(new_fid_index);
     }
 

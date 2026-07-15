@@ -356,21 +356,18 @@ fn handle_full_scan(
     let t1 = Instant::now();
 
     // Build record_number → (parent_record, name, is_dir, size, mtime, attributes) map
-    // Use a Vec indexed by record_number for O(1) lookup
-    let mut records_by_number: Vec<Option<(u64, &str, bool, u64, Option<u64>, u32)>> =
-        vec![None; scan_output.total_records as usize + 1];
+    // Use a HashMap for memory-efficient sparse storage (MFT record numbers can be sparse)
+    let mut records_by_number: std::collections::HashMap<u64, (u64, &str, bool, u64, Option<u64>, u32)> =
+        std::collections::HashMap::with_capacity(scan_output.all_records.len());
     for r in &scan_output.all_records {
-        let idx = r.record_number as usize;
-        if idx < records_by_number.len() {
-            records_by_number[idx] = Some((
-                r.parent_record,
-                &r.name,
-                r.is_directory,
-                r.size,
-                r.mtime,
-                r.attributes,
-            ));
-        }
+        records_by_number.insert(r.record_number, (
+            r.parent_record,
+            &r.name,
+            r.is_directory,
+            r.size,
+            r.mtime,
+            r.attributes,
+        ));
     }
 
     // Resolve paths in parallel using rayon
@@ -413,18 +410,17 @@ fn handle_full_scan(
                 return None;
             }
 
-            // Resolve path via parent chain — O(depth) with O(1) Vec lookups
+            // Resolve path via parent chain — O(depth) with HashMap lookups
             let mut parts: Vec<&str> = Vec::with_capacity(16);
             parts.push(&r.name);
             let mut cur = record_number;
             for _ in 0..50 {
-                let parent = records_by_number.get(cur as usize)
-                    .and_then(|opt| opt.as_ref())
+                let parent = records_by_number.get(&cur)
                     .map(|(p, _, _, _, _, _)| *p);
                 match parent {
                     Some(p) if p != cur && p != 0 => {
                         cur = p;
-                        if let Some(Some((_, name, _, _, _, _))) = records_by_number.get(cur as usize) {
+                        if let Some((_, name, _, _, _, _)) = records_by_number.get(&cur) {
                             // Skip NTFS virtual entries (. and ..) to avoid paths like C:\.\windows
                             if *name == "." || *name == ".." {
                                 continue;
