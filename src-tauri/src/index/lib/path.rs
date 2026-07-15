@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::scanner::ScanOutput;
+use super::scanner::ScanOutput;
 
 const ROOT_RECORD_NUMBER: u64 = 5;
 
