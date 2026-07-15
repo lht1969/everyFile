@@ -1,3 +1,4 @@
+use crate::index::lib as mft_lib;
 use crate::index::ntfs_mft;
 use crate::index::usn_types::{UsnCommand, UsnResponse, UsnState, VolumeState};
 use crate::search::SearchResult;
@@ -15,6 +16,17 @@ use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
     FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0,
 };
+
+/// Convert NTFS timestamp (100ns intervals since 1601-01-01) to Unix timestamp (seconds since 1970)
+const NTFS_EPOCH_DIFF: i64 = 11_644_473_600; // seconds between 1601 and 1970
+
+#[inline]
+fn ntfs_time_to_unix(ntfs_time: Option<u64>) -> i64 {
+    match ntfs_time {
+        Some(t) if t > 0 => (t as i64 / 10_000_000) - NTFS_EPOCH_DIFF,
+        _ => 0,
+    }
+}
 
 /// USN_REASON_MASK_ALL：监控所有变更原因
 const USN_REASON_MASK_ALL: u32 = 0xFFFFFFFF;
@@ -267,6 +279,258 @@ fn handle_full_scan(
     resp_tx: &Sender<UsnResponse>,
 ) {
     log::info!("[USN] Full scan starting for drive {}", drive_letter);
+    let scan_start = Instant::now();
+
+    // Phase 1a: Use MftScanner to read raw MFT records directly from disk
+    // This bypasses FSCTL_ENUM_USN_DATA and reads data runs directly — much faster
+    let t0 = Instant::now();
+    let volume_path = format!("\\\\.\\{}:", drive_letter);
+
+    let scan_output = match mft_lib::scan_volume(&volume_path, u64::MAX) {
+        Ok((output, _info)) => output,
+        Err(e) => {
+            log::warn!("[USN] MftScanner failed for {}: {}, falling back to FSCTL_ENUM_USN_DATA", drive_letter, e);
+            handle_full_scan_legacy(
+                drive_letter, include_hidden_files, include_system_files,
+                volumes, last_usn_map, journal_id_map, resp_tx,
+            );
+            return;
+        }
+    };
+
+    log::info!(
+        "[USN] Phase 1a: MftScanner read {} records ({} files, {} dirs) for {} in {:?}",
+        scan_output.total_records, scan_output.files, scan_output.dirs,
+        drive_letter, t0.elapsed()
+    );
+
+    // Phase 1b: Resolve full paths from parent_record chain
+    let t1 = Instant::now();
+
+    // Build record_number → (parent_record, name, is_dir, size, mtime, attributes) map
+    // Use a Vec indexed by record_number for O(1) lookup
+    let mut records_by_number: Vec<Option<(u64, &str, bool, u64, Option<u64>, u32)>> =
+        vec![None; scan_output.total_records as usize + 1];
+    for r in &scan_output.all_records {
+        let idx = r.record_number as usize;
+        if idx < records_by_number.len() {
+            records_by_number[idx] = Some((
+                r.parent_record,
+                &r.name,
+                r.is_directory,
+                r.size,
+                r.mtime,
+                r.attributes,
+            ));
+        }
+    }
+
+    // Resolve paths in parallel using rayon
+
+    const RECYCLE_BIN: &str = "$recycle.bin";
+    const SYSTEM_VOL_INFO: &str = "system volume information";
+
+    let entries: Vec<(u64, Box<str>, Box<str>, bool, i64, u64)> = scan_output
+        .all_records
+        .par_iter()
+        .filter_map(|r| {
+            let record_number = r.record_number;
+
+            // Skip root and metadata records
+            if record_number < 5 {
+                return None;
+            }
+
+            // Skip $-prefixed NTFS metadata files
+            if r.name.starts_with('$') {
+                return None;
+            }
+
+            // Hidden check
+            if !include_hidden_files && (r.attributes & 0x02) != 0 {
+                return None;
+            }
+            // System check
+            if !include_system_files && (r.attributes & 0x04) != 0 {
+                return None;
+            }
+
+            // Resolve path via parent chain — O(depth) with O(1) Vec lookups
+            let mut parts: Vec<&str> = Vec::with_capacity(16);
+            parts.push(&r.name);
+            let mut cur = record_number;
+            for _ in 0..50 {
+                let parent = records_by_number.get(cur as usize)
+                    .and_then(|opt| opt.as_ref())
+                    .map(|(p, _, _, _, _, _)| *p);
+                match parent {
+                    Some(p) if p != cur && p != 0 => {
+                        cur = p;
+                        if let Some(Some((_, name, _, _, _, _))) = records_by_number.get(cur as usize) {
+                            parts.push(name);
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            parts.reverse();
+
+            // Build path string: "C:\folder\subfolder\file.txt"
+            let estimated_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
+                + parts.len()  // separators
+                + 4;            // "X:\" prefix
+            let path_str: Box<str> = {
+                let mut path = String::with_capacity(estimated_len);
+                path.push(drive_letter);
+                path.push(':');
+                path.push('\\');
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        path.push('\\');
+                    }
+                    path.push_str(part);
+                }
+                path.into()
+            };
+
+            // Path component checks
+            let skip = path_str.split('\\').any(|comp| {
+                let sl = comp.to_lowercase();
+                sl == RECYCLE_BIN || (!include_system_files && sl == SYSTEM_VOL_INFO)
+            });
+            if skip {
+                return None;
+            }
+
+            let name_str: Box<str> = Box::from(r.name.as_str());
+            let is_dir = r.is_directory;
+            let size = r.size;
+            let modified_time = ntfs_time_to_unix(r.mtime);
+            let file_id = r.record_number;
+
+            Some((file_id, name_str, path_str, is_dir, modified_time, size))
+        })
+        .collect();
+
+    log::info!(
+        "[USN] Phase 1b: Resolved {} file paths for {} in {:?}",
+        entries.len(), drive_letter, t1.elapsed()
+    );
+
+    // Free records_by_number and scan_output — no longer needed
+    // Drop records_by_number first since it borrows &str from scan_output
+    drop(records_by_number);
+    drop(scan_output);
+
+    // Phase 2: Build SearchResult entries (size already from MFT, no need for batch_metadata)
+    let t2 = Instant::now();
+    let files: Vec<SearchResult> = entries
+        .into_iter()
+        .map(|(fid, name_str, path_str, is_dir, modified_time, size)| {
+            SearchResult {
+                file_id: fid,
+                name: name_str,
+                path: path_str,
+                size,
+                modified_time,
+                is_directory: is_dir,
+            }
+        })
+        .collect();
+
+    log::info!(
+        "[USN] Phase 2: Built {} SearchResult entries in {:?}",
+        files.len(), t2.elapsed()
+    );
+    log::info!(
+        "[USN] Full scan complete for drive {}: {} files, total {:?}",
+        drive_letter, files.len(), scan_start.elapsed()
+    );
+
+    // Create or verify USN journal (required for incremental updates)
+    let volume = match Volume::from_drive_letter(drive_letter) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = resp_tx.send(UsnResponse::Error {
+                message: format!("Failed to open volume {} for journal: {}", drive_letter, e),
+            });
+            return;
+        }
+    };
+
+    let journal = volume.journal();
+    let journal_max_size = usn_journal_rs::DEFAULT_JOURNAL_MAX_SIZE;
+    let allocation_delta = usn_journal_rs::DEFAULT_JOURNAL_ALLOCATION_DELTA;
+
+    let (journal_id, last_usn) = match journal.query(true) {
+        Ok(data) => {
+            if data.maximum_size < journal_max_size {
+                if let Err(e) = journal.create_or_update(journal_max_size, allocation_delta) {
+                    log::warn!("[USN] Failed to resize journal for {}: {}", drive_letter, e);
+                }
+                if let Ok(new_data) = journal.query(false) {
+                    (new_data.journal_id, new_data.next_usn)
+                } else {
+                    (data.journal_id, data.next_usn)
+                }
+            } else {
+                (data.journal_id, data.next_usn)
+            }
+        }
+        Err(e) => {
+            log::warn!("[USN] Failed to query journal for {}: {}", drive_letter, e);
+            match journal.create_or_update(journal_max_size, allocation_delta) {
+                Ok(()) => match journal.query(false) {
+                    Ok(data) => (data.journal_id, data.next_usn),
+                    Err(e2) => {
+                        let _ = resp_tx.send(UsnResponse::Error {
+                            message: format!("Journal create+query failed for {}: {}", drive_letter, e2),
+                        });
+                        return;
+                    }
+                },
+                Err(e2) => {
+                    let _ = resp_tx.send(UsnResponse::Error {
+                        message: format!("Journal create failed for {}: {}", drive_letter, e2),
+                    });
+                    return;
+                }
+            }
+        }
+    };
+
+    last_usn_map.insert(drive_letter, last_usn);
+    journal_id_map.insert(drive_letter, journal_id);
+
+    let mut state = UsnState::load();
+    state.volumes.insert(
+        drive_letter.to_string(),
+        VolumeState { journal_id, last_usn },
+    );
+    state.save();
+
+    volumes.insert(drive_letter, volume);
+
+    let _ = resp_tx.send(UsnResponse::FullScanResult {
+        drive_letter,
+        files,
+        last_usn,
+        journal_id,
+    });
+}
+
+fn handle_full_scan_legacy(
+    drive_letter: char,
+    include_hidden_files: bool,
+    include_system_files: bool,
+    volumes: &mut HashMap<char, Volume>,
+    last_usn_map: &mut HashMap<char, i64>,
+    journal_id_map: &mut HashMap<char, u64>,
+    resp_tx: &Sender<UsnResponse>,
+) {
+    log::info!("[USN] Full scan (legacy) starting for drive {}", drive_letter);
     let scan_start = Instant::now();
 
     let volume = match Volume::from_drive_letter(drive_letter) {

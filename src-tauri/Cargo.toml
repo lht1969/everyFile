@@ -67,6 +67,7 @@ base64 = "0.22"
 
 # USN Journal support
 usn-journal-rs = "0.4"
+ntfs = "0.3"
 crossbeam-channel = "0.5"
 
 [features]
