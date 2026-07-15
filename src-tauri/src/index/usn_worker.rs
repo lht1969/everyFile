@@ -2,6 +2,7 @@ use crate::index::lib as mft_lib;
 use crate::index::ntfs_mft;
 use crate::index::usn_types::{UsnCommand, UsnResponse, UsnState, VolumeState};
 use crate::search::SearchResult;
+use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -375,7 +376,7 @@ fn handle_full_scan(
     const RECYCLE_BIN: &str = "$recycle.bin";
     const SYSTEM_VOL_INFO: &str = "system volume information";
 
-    let entries: Vec<(u64, Box<str>, Box<str>, bool, i64, u64)> = scan_output
+    let entries: Vec<(u64, CompactString, CompactString, bool, i64, u64)> = scan_output
         .all_records
         .par_iter()
         .filter_map(|r| {
@@ -444,7 +445,7 @@ fn handle_full_scan(
             let estimated_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
                 + parts.len()  // separators
                 + 4;            // "X:\" prefix
-            let path_str: Box<str> = {
+            let path_str: CompactString = {
                 let mut path = String::with_capacity(estimated_len);
                 path.push(drive_letter);
                 path.push(':');
@@ -455,7 +456,7 @@ fn handle_full_scan(
                     }
                     path.push_str(part);
                 }
-                path.into()
+                CompactString::from(path)
             };
 
             // Path component checks
@@ -467,7 +468,7 @@ fn handle_full_scan(
                 return None;
             }
 
-            let name_str: Box<str> = Box::from(r.name.as_str());
+            let name_str: CompactString = CompactString::from(r.name.as_str());
             let is_dir = r.is_directory;
             let size = r.size;
             let modified_time = ntfs_time_to_unix(r.mtime);
@@ -703,7 +704,7 @@ fn handle_full_scan_legacy(
     // Phase 1b: 并行路径解析，透传 MFT 阶段获取的 timestamp
     // entries 元组结构：(fid, name, path, is_dir, timestamp)
     let t1 = Instant::now();
-    let entries: Vec<(u64, Box<str>, Box<str>, bool, i64)> = raw_entries
+    let entries: Vec<(u64, CompactString, CompactString, bool, i64)> = raw_entries
         .par_iter()
         .enumerate()
         .filter_map(|(_idx, re)| {
@@ -750,7 +751,7 @@ fn handle_full_scan_legacy(
             let estimated_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
                 + parts.len()  // separators
                 + 4;            // "X:\" prefix
-            let path_str: Box<str> = {
+            let path_str: CompactString = {
                 let mut path = String::with_capacity(estimated_len);
                 path.push(drive_letter);
                 path.push(':');
@@ -761,7 +762,7 @@ fn handle_full_scan_legacy(
                     }
                     path.push_str(&part.to_string_lossy());
                 }
-                path.into()
+                CompactString::from(path)
             };
 
             // Path component checks
@@ -773,8 +774,8 @@ fn handle_full_scan_legacy(
                 return None;
             }
 
-            // Pre-convert name to Box<str> here so Phase 2 doesn't need name lookup
-            let name_str: Box<str> = re.file_name.to_string_lossy().into();
+            // Pre-convert name to CompactString here so Phase 2 doesn't need name lookup
+            let name_str: CompactString = CompactString::from(re.file_name.to_string_lossy().as_ref());
             let is_dir = (re.file_attributes & 0x10) != 0;
             Some((re.fid, name_str, path_str, is_dir, re.timestamp))
         })
@@ -796,7 +797,7 @@ fn handle_full_scan_legacy(
     let t2 = Instant::now();
     let path_isdir: Vec<(Box<str>, bool)> = entries
         .iter()
-        .map(|(_, _, path, is_dir, _)| (path.clone(), *is_dir))
+        .map(|(_, _, path, is_dir, _)| (Box::from(path.as_str()), *is_dir))
         .collect();
     let sizes = ntfs_mft::batch_metadata(&path_isdir);
     drop(path_isdir); // 释放临时内存
@@ -1129,8 +1130,8 @@ fn handle_poll_changes(
             if !include_hidden_files && entry.is_hidden() { continue; }
             if entry.file_name.to_string_lossy().starts_with('$') { continue; }
 
-            let name: Box<str> = Box::from(entry.file_name.to_string_lossy().as_ref());
-            let path_str: Box<str> = path.to_string_lossy().to_string().into();
+            let name: CompactString = CompactString::from(entry.file_name.to_string_lossy().as_ref());
+            let path_str: CompactString = CompactString::from(path.to_string_lossy().as_ref());
             let meta = mft_reader
                 .as_mut()
                 .map(|r| r.get_file_metadata(fid, &path))
@@ -1172,8 +1173,8 @@ fn handle_poll_changes(
                 }
             };
 
-            let name: Box<str> = Box::from(entry.file_name.to_string_lossy().as_ref());
-            let path_str: Box<str> = path.to_string_lossy().to_string().into();
+            let name: CompactString = CompactString::from(entry.file_name.to_string_lossy().as_ref());
+            let path_str: CompactString = CompactString::from(path.to_string_lossy().as_ref());
             let meta = mft_reader
                 .as_mut()
                 .map(|r| r.get_file_metadata(fid, &path))

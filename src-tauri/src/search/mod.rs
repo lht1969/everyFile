@@ -1,13 +1,14 @@
 pub mod query;
 
 use chrono::{DateTime, TimeZone, Utc};
+use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub file_id: u64,
-    pub name: Box<str>,
-    pub path: Box<str>,
+    pub name: CompactString,
+    pub path: CompactString,
     pub size: u64,
     pub modified_time: i64,
     pub is_directory: bool,

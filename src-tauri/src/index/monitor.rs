@@ -735,7 +735,7 @@ impl VolumeMonitor {
         // Find indices of newly added files for cache update
         let new_file_indices: Vec<usize> = self.files.iter()
             .enumerate()
-            .filter(|(_, f)| added_paths.contains(f.path.as_ref()))
+            .filter(|(_, f)| added_paths.contains(f.path.as_str()))
             .map(|(i, _)| i)
             .collect();
 
@@ -748,6 +748,6 @@ impl VolumeMonitor {
     }
 
     pub fn remove_file(&mut self, file_path: &str) {
-        self.files.retain(|f| f.path.as_ref() != file_path);
+        self.files.retain(|f| f.path.as_str() != file_path);
     }
 }

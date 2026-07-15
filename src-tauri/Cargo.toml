@@ -2,7 +2,7 @@
 name = "everything-tauri"
 version = "0.1.0"
 description = "极速本地文件搜索引擎 - 基于 Rust + Tauri"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["lht1969"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -64,6 +64,9 @@ rayon = "1.10"
 
 # Base64 encoding for icon data URLs
 base64 = "0.22"
+
+# Compact string representation for memory optimization
+compact_str = { version = "0.8", features = ["serde"] }
 
 # USN Journal support
 usn-journal-rs = "0.4"

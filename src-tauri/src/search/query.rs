@@ -128,7 +128,7 @@ impl SearchQuery {
             }
         }
         if !self.glob_patterns.is_empty() {
-            if !self.glob_patterns.iter().all(|p| p.matches_path(std::path::Path::new(file.name.as_ref()))) {
+            if !self.glob_patterns.iter().all(|p| p.matches_path(std::path::Path::new(file.name.as_str()))) {
                 return false;
             }
         }
