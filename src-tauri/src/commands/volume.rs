@@ -142,16 +142,45 @@ pub async fn rebuild_index(
         include_system_files
     );
 
-    let mut vm = state.volume_manager.lock().await;
+    let is_admin = crate::fs::is_elevated();
 
     // 在重建索引前，将当前配置的隐藏/系统文件设置同步到已加载的卷监视器
-    for letter in vm.volumes() {
-        if let Some(monitor) = vm.get_monitor_mut(&letter) {
-            monitor.update_settings(include_hidden_files, include_system_files);
+    {
+        let mut vm = state.volume_manager.lock().await;
+        for letter in vm.volumes() {
+            if let Some(monitor) = vm.get_monitor_mut(&letter) {
+                monitor.update_settings(include_hidden_files, include_system_files);
+            }
         }
     }
 
-    vm.scan_all_with_progress(&app_handle).map_err(|e| e.to_string())?;
+    if is_admin {
+        // 管理员模式：通过 USN worker 进行全量扫描（与启动流程一致）
+        if let Some(ref usn) = state.usn_manager {
+            let volumes = {
+                let vm = state.volume_manager.lock().await;
+                vm.volumes()
+            };
+            for drive_letter in volumes {
+                let dl_char = drive_letter.chars().next().unwrap_or('C');
+                log::info!(
+                    "[USN] Rebuild: issuing full scan for drive {} (hidden={}, system={})",
+                    dl_char, include_hidden_files, include_system_files
+                );
+                usn.full_scan(dl_char, include_hidden_files, include_system_files);
+            }
+        } else {
+            log::warn!("Admin mode but no USN manager, falling back to walkdir");
+            let mut vm = state.volume_manager.lock().await;
+            vm.scan_all_with_progress(&app_handle)
+                .map_err(|e| e.to_string())?;
+        }
+    } else {
+        // 非管理员模式：使用 walkdir 扫描
+        let mut vm = state.volume_manager.lock().await;
+        vm.scan_all_with_progress(&app_handle)
+            .map_err(|e| e.to_string())?;
+    }
 
     let _ = app_handle.emit("rebuild-complete", ());
 
