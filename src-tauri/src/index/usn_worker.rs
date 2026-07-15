@@ -360,14 +360,19 @@ fn handle_full_scan(
             parts.push(&r.name);
             let mut cur = record_number;
             for _ in 0..50 {
-                if let Some(Some((parent, name, _, _, _, _))) = records_by_number.get(cur as usize) {
-                    if *parent == cur || *parent == 0 {
-                        break;
+                let parent = records_by_number.get(cur as usize)
+                    .and_then(|opt| opt.as_ref())
+                    .map(|(p, _, _, _, _, _)| *p);
+                match parent {
+                    Some(p) if p != cur && p != 0 => {
+                        cur = p;
+                        if let Some(Some((_, name, _, _, _, _))) = records_by_number.get(cur as usize) {
+                            parts.push(name);
+                        } else {
+                            break;
+                        }
                     }
-                    cur = *parent;
-                    parts.push(name);
-                } else {
-                    break;
+                    _ => break,
                 }
             }
             parts.reverse();
@@ -414,9 +419,10 @@ fn handle_full_scan(
         entries.len(), drive_letter, t1.elapsed()
     );
 
-    // Free scan_output and records_by_number — no longer needed
-    drop(scan_output);
+    // Free records_by_number and scan_output — no longer needed
+    // Drop records_by_number first since it borrows &str from scan_output
     drop(records_by_number);
+    drop(scan_output);
 
     // Phase 2: Build SearchResult entries (size already from MFT, no need for batch_metadata)
     let t2 = Instant::now();
