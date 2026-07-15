@@ -5,7 +5,6 @@ pub enum MftError {
     Io(std::io::Error),
     NtfsParse(String),
     NtfsPanic(String),
-    NoDataRuns,
     PermissionDenied { path: String },
 }
 
@@ -15,7 +14,6 @@ impl fmt::Display for MftError {
             MftError::Io(e) => write!(f, "I/O error: {}", e),
             MftError::NtfsParse(msg) => write!(f, "NTFS parse error: {}", msg),
             MftError::NtfsPanic(msg) => write!(f, "NTFS parser panicked: {}", msg),
-            MftError::NoDataRuns => write!(f, "No non-resident $DATA attribute in MFT record 0"),
             MftError::PermissionDenied { path } => {
                 write!(
                     f,

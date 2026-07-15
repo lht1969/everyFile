@@ -63,6 +63,7 @@ impl UsnIndexManager {
         });
     }
 
+    #[allow(dead_code)]
     pub fn shutdown(&self) {
         let _ = self.cmd_tx.send(UsnCommand::Shutdown);
     }
@@ -72,6 +73,7 @@ impl UsnIndexManager {
     }
 
     /// Non-blocking check for responses
+    #[allow(dead_code)]
     pub fn try_recv(&self) -> Option<UsnResponse> {
         self.resp_rx.try_recv().ok()
     }

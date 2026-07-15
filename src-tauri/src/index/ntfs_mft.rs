@@ -93,6 +93,7 @@ impl UsnMetadataReader {
 
     /// Get file metadata directly from a path string, avoiding PathBuf allocation.
     /// 保留用于增量更新场景的单文件元数据查询。
+    #[allow(dead_code)]
     #[inline]
     pub fn get_file_metadata_by_str(&mut self, path_str: &str) -> FileMetadata {
         match std::fs::metadata(path_str) {

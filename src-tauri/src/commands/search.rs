@@ -46,6 +46,7 @@ pub struct AppState {
     pub volume_manager: Arc<Mutex<crate::index::monitor::VolumeManager>>,
     pub is_searching: Arc<AtomicBool>,
     pub last_index_update: Arc<Mutex<String>>,
+    #[allow(dead_code)]
     pub usn_manager: Option<Arc<UsnIndexManager>>,
 }
 

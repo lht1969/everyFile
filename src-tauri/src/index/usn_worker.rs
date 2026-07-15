@@ -33,6 +33,7 @@ const USN_REASON_MASK_ALL: u32 = 0xFFFFFFFF;
 
 /// 从 FSCTL_READ_USN_JOURNAL 直接解析的原始 USN 记录
 struct RawUsnRecord {
+    #[allow(dead_code)]
     usn: i64,
     fid: u64,
     parent_fid: u64,

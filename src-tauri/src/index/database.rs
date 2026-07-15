@@ -116,6 +116,7 @@ impl IndexDatabase {
     /// - 首次扫描时（数据库无记录）返回 (0, 0)
     /// - journal_id 用于检测 journal 是否被重置（如 fsutil usn deletejournal），
     ///   重置时调用方应忽略持久化的 last_usn，重新从 0 开始读
+    #[allow(dead_code)]
     pub async fn load_usn_state(&self, drive_letter: &str) -> Result<(i64, u64)> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
@@ -135,6 +136,7 @@ impl IndexDatabase {
     /// 持久化 USN 增量状态：扫描成功后调用，写入 last_usn 与 journal_id
     /// - UPSERT 语义：已存在则更新，不存在则插入
     /// - updated_at 写入当前 UTC 时间（YYYY-MM-DD HH:MM:SS 格式）
+    #[allow(dead_code)]
     pub async fn save_usn_state(&self, drive_letter: &str, last_usn: i64, journal_id: u64) -> Result<()> {
         let conn = self.conn.lock().await;
         // 写入 UTC 时间戳（与 files 表的 modified_time 格式保持一致）

@@ -8,9 +8,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub use aligned_reader::AlignedReader;
 pub use error::MftError;
-pub use path::{format_ntfs_time, resolve_paths};
-pub use scanner::{format_attributes, MftScanner, ScanOutput, ScanResult};
+pub use scanner::{MftScanner, ScanOutput};
 
+#[allow(dead_code)]
 pub struct NtfsInfo {
     pub cluster_size: u32,
     pub sector_size: u16,

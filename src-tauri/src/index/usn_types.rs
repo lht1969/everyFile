@@ -17,6 +17,7 @@ pub enum UsnCommand {
         include_system_files: bool,
     },
     /// Shutdown the worker
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -27,7 +28,9 @@ pub enum UsnResponse {
     FullScanResult {
         drive_letter: char,
         files: Vec<crate::search::SearchResult>,
+        #[allow(dead_code)]
         last_usn: i64,
+        #[allow(dead_code)]
         journal_id: u64,
     },
     /// Incremental changes from USN journal
@@ -39,6 +42,7 @@ pub enum UsnResponse {
         removed: Vec<u64>,
         /// (file_id, new SearchResult) for updated files - fid-based to avoid index drift
         updated: Vec<(u64, crate::search::SearchResult)>,
+        #[allow(dead_code)]
         last_usn: i64,
     },
     /// Error

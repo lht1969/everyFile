@@ -1,9 +1,12 @@
+#![allow(dead_code)]
+
 use std::io::{self, Read, Seek, SeekFrom};
 
 const NTFS_BLOCK_SIZE: u64 = 512;
 const ATTR_DATA: u32 = 0x80;
 const ATTR_STANDARD_INFO: u32 = 0x10;
 const ATTR_FILE_NAME: u32 = 0x30;
+const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
 const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
@@ -17,10 +20,10 @@ const FILE_ATTRIBUTE_REPARSE: u32 = 0x400;
 const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
 const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x4000;
 
-struct DataRun {
-    lcn: u64,
-    length: u64,
-    is_sparse: bool,
+pub struct DataRun {
+    pub lcn: u64,
+    pub length: u64,
+    pub is_sparse: bool,
 }
 
 pub struct ScanResult {
@@ -45,12 +48,13 @@ pub struct ScanOutput {
     pub skip_inactive: u64,
     pub total_ads: u64,
     pub total_hard_links: u64,
+    pub no_timestamp: u64,
 }
 
 pub struct MftScanner {
-    data_runs: Vec<DataRun>,
-    cluster_size: u64,
-    file_record_size: u64,
+    pub data_runs: Vec<DataRun>,
+    pub cluster_size: u64,
+    pub file_record_size: u64,
 }
 
 impl MftScanner {
@@ -116,6 +120,8 @@ impl MftScanner {
         let mut skip_no_signature: u64 = 0;
         let mut skip_fixup_fail: u64 = 0;
         let mut skip_inactive: u64 = 0;
+        let mut no_timestamp: u64 = 0;
+        let mut pending_ext: Vec<(usize, Vec<u64>)> = Vec::new();
 
         for run in &self.data_runs {
             if total_records >= max_records {
@@ -190,10 +196,20 @@ impl MftScanner {
                     }
                 }
                 let parent_record = extract_parent_record(&record_buf, self.file_record_size as usize);
-                let size = extract_data_size(&record_buf, self.file_record_size as usize);
+                let size = extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
+                if size == 0 && !is_dir {
+                    let ext = extract_data_extension_records(&record_buf, self.file_record_size as usize);
+                    if !ext.is_empty() {
+                        let result_idx = all_records.len();
+                        pending_ext.push((result_idx, ext));
+                    }
+                }
                 let mtime = extract_mtime(&record_buf, self.file_record_size as usize);
                 let ctime = extract_ctime(&record_buf, self.file_record_size as usize);
                 let atime = extract_atime(&record_buf, self.file_record_size as usize);
+                if mtime.is_none() && ctime.is_none() && atime.is_none() {
+                    no_timestamp += 1;
+                }
                 let attributes = extract_attributes(&record_buf, self.file_record_size as usize);
                 let ads = count_ads(&record_buf, self.file_record_size as usize);
                 total_ads += ads;
@@ -216,6 +232,17 @@ impl MftScanner {
             }
         }
 
+        if !pending_ext.is_empty() {
+            resolve_pending_sizes(
+                reader,
+                &self.data_runs,
+                self.file_record_size,
+                self.cluster_size,
+                &pending_ext,
+                &mut all_records,
+            );
+        }
+
         ScanOutput {
             all_records,
             total_records,
@@ -226,6 +253,7 @@ impl MftScanner {
             skip_inactive,
             total_ads,
             total_hard_links,
+            no_timestamp,
         }
     }
 }
@@ -364,6 +392,92 @@ fn parse_data_runs(data: &[u8]) -> Vec<DataRun> {
     runs
 }
 
+/// Read an arbitrary MFT record by number from the data runs (with fixup applied)
+pub fn read_record(
+    reader: &mut (impl Read + Seek),
+    data_runs: &[DataRun],
+    file_record_size: u64,
+    cluster_size: u64,
+    target_record: u64,
+) -> io::Result<Vec<u8>> {
+    let mut record_number: u64 = 0;
+
+    for run in data_runs {
+        let records_in_run = (run.length * cluster_size) / file_record_size;
+
+        if run.is_sparse {
+            record_number += records_in_run;
+            continue;
+        }
+
+        if target_record < record_number + records_in_run {
+            let offset_in_run = target_record - record_number;
+            let file_offset = run.lcn * cluster_size + offset_in_run * file_record_size;
+
+            let mut record = vec![0u8; file_record_size as usize];
+            reader.seek(SeekFrom::Start(file_offset))?;
+            reader.read_exact(&mut record)?;
+            apply_fixup(&mut record, target_record, file_record_size)?;
+            return Ok(record);
+        }
+
+        record_number += records_in_run;
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Record {} not found in data runs", target_record),
+    ))
+}
+
+/// Parse $ATTRIBUTE_LIST entries, returning (attr_type, mft_record_number) for each entry
+fn extract_attribute_list(record: &[u8], record_size: usize) -> Vec<(u32, u64)> {
+    let first_attr_offset = read_u16(record, 20) as usize;
+    let mut offset = first_attr_offset;
+    let mut entries = Vec::new();
+
+    while offset + 8 <= record.len().min(record_size) {
+        let attr_type = read_u32(record, offset);
+        let attr_len = read_u32(record, offset + 4) as usize;
+
+        if attr_type == ATTR_END || attr_len == 0 || offset + attr_len > record.len() {
+            break;
+        }
+
+        if attr_type == ATTR_ATTRIBUTE_LIST && record[offset + 8] == 0 {
+            let value_offset = read_u16(record, offset + 20) as usize;
+            let value_len = read_u32(record, offset + 16) as usize;
+            let value_start = offset + value_offset;
+            let value_end = value_start + value_len;
+
+            if value_end > record.len() {
+                break;
+            }
+
+            let mut pos = value_start;
+            while pos + 24 <= value_end {
+                let entry_type = read_u32(record, pos);
+                if entry_type == ATTR_END {
+                    break;
+                }
+                let entry_len = read_u16(record, pos + 4) as usize;
+                if entry_len < 24 || pos + entry_len > value_end {
+                    break;
+                }
+                let mft_ref = read_u64(record, pos + 16);
+                let record_num = mft_ref & 0x0000_FFFF_FFFF_FFFF;
+                entries.push((entry_type, record_num));
+                pos += entry_len;
+            }
+            break;
+        }
+
+        offset += attr_len;
+    }
+
+    entries
+}
+
 fn extract_parent_record(record: &[u8], record_size: usize) -> u64 {
     let first_attr_offset = read_u16(record, 20) as usize;
     let mut offset = first_attr_offset;
@@ -461,7 +575,14 @@ fn extract_name(record: &[u8], record_size: usize) -> String {
     }
 }
 
-fn extract_data_size(record: &[u8], record_size: usize) -> u64 {
+pub fn extract_data_size(
+    record: &[u8],
+    record_size: usize,
+    reader: Option<&mut (impl Read + Seek)>,
+    data_runs: Option<&[DataRun]>,
+    file_record_size: u64,
+    cluster_size: u64,
+) -> u64 {
     let first_attr_offset = read_u16(record, 20) as usize;
     let mut offset = first_attr_offset;
 
@@ -486,19 +607,148 @@ fn extract_data_size(record: &[u8], record_size: usize) -> u64 {
         offset += attr_len;
     }
 
+    // $DATA not found directly — try $ATTRIBUTE_LIST fallback
+    if let (Some(reader), Some(data_runs)) = (reader, data_runs) {
+        let entries = extract_attribute_list(record, record_size);
+        let mut seen = std::collections::HashSet::new();
+        for (entry_type, record_num) in entries {
+            if entry_type != ATTR_DATA {
+                continue;
+            }
+            if !seen.insert(record_num) {
+                continue;
+            }
+            if let Ok(ext_record) = read_record(reader, data_runs, file_record_size, cluster_size, record_num) {
+                let size = extract_data_size_from_bytes(&ext_record, ext_record.len());
+                if size > 0 {
+                    return size;
+                }
+            }
+        }
+    }
+
+    0
+}
+
+/// Extract $DATA extension record numbers from $ATTRIBUTE_LIST (no I/O)
+fn extract_data_extension_records(record: &[u8], record_size: usize) -> Vec<u64> {
+    let entries = extract_attribute_list(record, record_size);
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for (entry_type, record_num) in entries {
+        if entry_type == ATTR_DATA && seen.insert(record_num) {
+            result.push(record_num);
+        }
+    }
+    result
+}
+
+/// Compute disk byte offset for a given MFT record number
+fn record_disk_offset(data_runs: &[DataRun], file_record_size: u64, cluster_size: u64, target_record: u64) -> Option<u64> {
+    let mut record_number: u64 = 0;
+    for run in data_runs {
+        let records_in_run = (run.length * cluster_size) / file_record_size;
+        if run.is_sparse {
+            record_number += records_in_run;
+            continue;
+        }
+        if target_record < record_number + records_in_run {
+            let offset_in_run = target_record - record_number;
+            return Some(run.lcn * cluster_size + offset_in_run * file_record_size);
+        }
+        record_number += records_in_run;
+    }
+    None
+}
+
+/// Batch-resolve sizes for records that have $ATTRIBUTE_LIST.
+/// Reads all extension records sorted by disk offset for sequential I/O.
+fn resolve_pending_sizes(
+    reader: &mut (impl Read + Seek),
+    data_runs: &[DataRun],
+    file_record_size: u64,
+    cluster_size: u64,
+    pending: &[(usize, Vec<u64>)],
+    results: &mut [ScanResult],
+) {
+    let mut offsets: Vec<(u64, u64)> = Vec::new();
+    for (_, record_nums) in pending {
+        for &rn in record_nums {
+            if let Some(offset) = record_disk_offset(data_runs, file_record_size, cluster_size, rn) {
+                offsets.push((offset, rn));
+            }
+        }
+    }
+    offsets.sort_unstable_by_key(|&(offset, _)| offset);
+
+    let mut sizes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut record_buf = vec![0u8; file_record_size as usize];
+    for &(offset, record_number) in &offsets {
+        if reader.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        if reader.read_exact(&mut record_buf).is_err() {
+            continue;
+        }
+        if apply_fixup(&mut record_buf, record_number, file_record_size).is_err() {
+            continue;
+        }
+        let size = extract_data_size_from_bytes(&record_buf, record_buf.len());
+        if size > 0 {
+            sizes.insert(record_number, size);
+        }
+    }
+
+    for (result_idx, record_nums) in pending {
+        for &rn in record_nums {
+            if let Some(&size) = sizes.get(&rn){
+                if size > 0 {   
+                    results[*result_idx].size = size;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Pure version of extract_data_size for already-loaded record bytes
+fn extract_data_size_from_bytes(record: &[u8], record_size: usize) -> u64 {
+    let first_attr_offset = read_u16(record, 20) as usize;
+    let mut offset = first_attr_offset;
+
+    while offset + 8 <= record.len().min(record_size) {
+        let attr_type = read_u32(record, offset);
+        let attr_len = read_u32(record, offset + 4) as usize;
+
+        if attr_type == ATTR_END || attr_len == 0 || offset + attr_len > record.len() {
+            break;
+        }
+
+        if attr_type == ATTR_DATA {
+            let non_resident = record[offset + 8];
+            if non_resident == 0 {
+                return read_u32(record, offset + 16) as u64;
+            } else {
+                return read_u64(record, offset + 48);
+            }
+        }
+
+        offset += attr_len;
+    }
+
     0
 }
 
 fn extract_mtime(record: &[u8], record_size: usize) -> Option<u64> {
-    extract_si_time(record, record_size, 8)
+    extract_si_time(record, record_size, 8).or_else(|| extract_fn_time(record, record_size, 16))
 }
 
 fn extract_ctime(record: &[u8], record_size: usize) -> Option<u64> {
-    extract_si_time(record, record_size, 0)
+    extract_si_time(record, record_size, 0).or_else(|| extract_fn_time(record, record_size, 8))
 }
 
 fn extract_atime(record: &[u8], record_size: usize) -> Option<u64> {
-    extract_si_time(record, record_size, 24)
+    extract_si_time(record, record_size, 24).or_else(|| extract_fn_time(record, record_size, 32))
 }
 
 fn extract_si_time(record: &[u8], record_size: usize, time_offset: usize) -> Option<u64> {
@@ -514,6 +764,33 @@ fn extract_si_time(record: &[u8], record_size: usize, time_offset: usize) -> Opt
         }
 
         if attr_type == ATTR_STANDARD_INFO && record[offset + 8] == 0 {
+            let value_offset = read_u16(record, offset + 20) as usize;
+            let value_start = offset + value_offset;
+
+            if value_start + time_offset + 8 <= record.len() {
+                return Some(read_u64(record, value_start + time_offset));
+            }
+        }
+
+        offset += attr_len;
+    }
+
+    None
+}
+
+fn extract_fn_time(record: &[u8], record_size: usize, time_offset: usize) -> Option<u64> {
+    let first_attr_offset = read_u16(record, 20) as usize;
+    let mut offset = first_attr_offset;
+
+    while offset + 8 <= record.len().min(record_size) {
+        let attr_type = read_u32(record, offset);
+        let attr_len = read_u32(record, offset + 4) as usize;
+
+        if attr_type == ATTR_END || attr_len == 0 || offset + attr_len > record.len() {
+            break;
+        }
+
+        if attr_type == ATTR_FILE_NAME && record[offset + 8] == 0 {
             let value_offset = read_u16(record, offset + 20) as usize;
             let value_start = offset + value_offset;
 
@@ -600,6 +877,107 @@ fn count_ads(record: &[u8], record_size: usize) -> u64 {
     count
 }
 
+/// Dump raw bytes of a specific MFT record for debugging
+pub fn dump_record(
+    reader: &mut (impl Read + Seek),
+    data_runs: &[DataRun],
+    file_record_size: u64,
+    cluster_size: u64,
+    target_record: u64,
+) -> io::Result<Vec<u8>> {
+    let mut record_number: u64 = 0;
+
+    for run in data_runs {
+        if run.is_sparse {
+            let records_in_run = (run.length * cluster_size) / file_record_size;
+            record_number += records_in_run;
+            continue;
+        }
+
+        let run_start = run.lcn * cluster_size;
+        let records_in_run = (run.length * cluster_size) / file_record_size;
+
+        if target_record < record_number + records_in_run {
+            let offset_in_run = target_record - record_number;
+            let file_offset = run_start + offset_in_run * file_record_size;
+
+            reader.seek(SeekFrom::Start(file_offset))?;
+            let mut record = vec![0u8; file_record_size as usize];
+            reader.read_exact(&mut record)?;
+            let _ = apply_fixup(&mut record, target_record, file_record_size);
+            return Ok(record);
+        }
+
+        record_number += records_in_run;
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Record {} not found", target_record),
+    ))
+}
+
+pub struct TimestampComparison {
+    pub si_ctime: Option<u64>,
+    pub si_mtime: Option<u64>,
+    pub si_atime: Option<u64>,
+    pub fn_ctime: Option<u64>,
+    pub fn_mtime: Option<u64>,
+    pub fn_atime: Option<u64>,
+}
+
+/// Compare timestamps from $STANDARD_INFORMATION vs $FILE_NAME attributes
+pub fn compare_timestamps(record: &[u8]) -> TimestampComparison {
+    let first_attr_offset = read_u16(record, 20) as usize;
+    let mut offset = first_attr_offset;
+    let mut si_ctime = None;
+    let mut si_mtime = None;
+    let mut si_atime = None;
+    let mut fn_mtime = None;
+    let mut fn_ctime = None;
+    let mut fn_atime = None;
+
+    while offset + 8 <= record.len() {
+        let attr_type = read_u32(record, offset);
+        let attr_len = read_u32(record, offset + 4) as usize;
+
+        if attr_type == ATTR_END || attr_len == 0 || offset + attr_len > record.len() {
+            break;
+        }
+
+        if attr_type == ATTR_STANDARD_INFO && record[offset + 8] == 0 {
+            let value_offset = read_u16(record, offset + 20) as usize;
+            let value_start = offset + value_offset;
+            if value_start + 40 <= record.len() {
+                si_ctime = Some(read_u64(record, value_start));
+                si_mtime = Some(read_u64(record, value_start + 8));
+                si_atime = Some(read_u64(record, value_start + 24));
+            }
+        }
+
+        if attr_type == ATTR_FILE_NAME && record[offset + 8] == 0 {
+            let value_offset = read_u16(record, offset + 20) as usize;
+            let value_start = offset + value_offset;
+            if value_start + 40 <= record.len() && fn_mtime.is_none() {
+                fn_ctime = Some(read_u64(record, value_start + 8));
+                fn_mtime = Some(read_u64(record, value_start + 16));
+                fn_atime = Some(read_u64(record, value_start + 32));
+            }
+        }
+
+        offset += attr_len;
+    }
+
+    TimestampComparison {
+        si_ctime,
+        si_mtime,
+        si_atime,
+        fn_ctime,
+        fn_mtime,
+        fn_atime,
+    }
+}
+
 fn count_hard_links(record: &[u8], record_size: usize) -> u64 {
     let first_attr_offset = read_u16(record, 20) as usize;
     let mut offset = first_attr_offset;
@@ -681,5 +1059,195 @@ mod tests {
     fn signed_le_negative() {
         assert_eq!(read_signed_le(&[0xFF]), -1);
         assert_eq!(read_signed_le(&[0xFE, 0xFF]), -2);
+    }
+
+    /// Build a minimal fake MFT record (1024 bytes) with $STANDARD_INFORMATION
+    /// and $FILE_NAME attributes, placing known timestamps at the expected offsets.
+    fn build_fake_record(
+        si_ctime: u64,
+        si_mtime: u64,
+        si_atime: u64,
+        si_attrs: u32,
+        fn_mtime: u64,
+    ) -> Vec<u8> {
+        let record_size = 1024usize;
+        let mut record = vec![0u8; record_size];
+
+        // MFT record header
+        record[0..4].copy_from_slice(b"FILE");
+        // Update sequence offset (usually 0x30 or 0x38)
+        let usn_offset: u16 = 0x30;
+        record[4..6].copy_from_slice(&usn_offset.to_le_bytes());
+        // Update sequence count: 3 (2 sectors + 1 USN word)
+        record[6..8].copy_from_slice(&3u16.to_le_bytes());
+        // First attribute offset: 0x40
+        let first_attr_offset: u16 = 0x40;
+        record[20..22].copy_from_slice(&first_attr_offset.to_le_bytes());
+        // Flags: 0x01 (in use) + 0x02 (directory) = 0x03
+        record[22..24].copy_from_slice(&0x03u16.to_le_bytes());
+
+        // USN at offset 0x30: value 0x0001 (must match last 2 bytes of each sector)
+        // Sector 0 ends at byte 510, sector 1 ends at byte 1022.
+        record[0x30] = 0x01;
+        record[0x31] = 0x00;
+        // Fixup array entries at 0x32 and 0x34
+        record[0x32] = 0x01; // sector 0 replacement low byte
+        record[0x33] = 0x00; // sector 0 replacement high byte
+        record[0x34] = 0x02; // sector 1 replacement low byte
+        record[0x35] = 0x00; // sector 1 replacement high byte
+
+        // Place sentinel USN values at sector ends so fixup succeeds
+        record[510] = 0x01;
+        record[511] = 0x00;
+        record[1022] = 0x01;
+        record[1023] = 0x00;
+
+        // --- $STANDARD_INFORMATION at first_attr_offset (0x40) ---
+        let si_off = first_attr_offset as usize;
+        record[si_off..si_off + 4].copy_from_slice(&ATTR_STANDARD_INFO.to_le_bytes()); // type
+        let si_len: u32 = 96; // enough room
+        record[si_off + 4..si_off + 8].copy_from_slice(&si_len.to_le_bytes()); // length
+        record[si_off + 8] = 0; // non-resident = 0
+        // value_offset at attr+20 = 0x18 (24)
+        record[si_off + 20..si_off + 22].copy_from_slice(&0x18u16.to_le_bytes());
+        // value_length at attr+16 = 48 (standard SI value size)
+        record[si_off + 16..si_off + 20].copy_from_slice(&48u32.to_le_bytes());
+
+        let val = si_off + 0x18;
+        record[val..val + 8].copy_from_slice(&si_ctime.to_le_bytes());     // creation
+        record[val + 8..val + 16].copy_from_slice(&si_mtime.to_le_bytes()); // modification
+        record[val + 16..val + 24].copy_from_slice(&0u64.to_le_bytes());    // mft change
+        record[val + 24..val + 32].copy_from_slice(&si_atime.to_le_bytes()); // access
+        record[val + 32..val + 36].copy_from_slice(&si_attrs.to_le_bytes()); // attributes
+
+        // --- $FILE_NAME after $STANDARD_INFORMATION ---
+        let fn_off = si_off + si_len as usize;
+        record[fn_off..fn_off + 4].copy_from_slice(&ATTR_FILE_NAME.to_le_bytes()); // type
+        let fn_len: u32 = 128;
+        record[fn_off + 4..fn_off + 8].copy_from_slice(&fn_len.to_le_bytes());
+        record[fn_off + 8] = 0; // non-resident
+        record[fn_off + 20..fn_off + 22].copy_from_slice(&0x18u16.to_le_bytes());
+        record[fn_off + 16..fn_off + 20].copy_from_slice(&80u32.to_le_bytes());
+
+        let fval = fn_off + 0x18;
+        // Parent directory reference (record 5 = root)
+        record[fval..fval + 8].copy_from_slice(&5u64.to_le_bytes());
+        // File name modification time at +16
+        record[fval + 16..fval + 24].copy_from_slice(&fn_mtime.to_le_bytes());
+        // Name length at +64, namespace at +65
+        record[fval + 64] = 4; // 4 UTF-16 chars
+        record[fval + 65] = 0; // POSIX namespace
+        // Name "test" in UTF-16LE at +66
+        let name_bytes = "test".encode_utf16().collect::<Vec<u16>>();
+        for (i, ch) in name_bytes.iter().enumerate() {
+            record[fval + 66 + i * 2..fval + 68 + i * 2].copy_from_slice(&ch.to_le_bytes());
+        }
+
+        // --- End attribute ---
+        let end_off = fn_off + fn_len as usize;
+        record[end_off..end_off + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+
+        record
+    }
+
+    #[test]
+    fn extract_si_timestamps_from_fake_record() {
+        let ctime: u64 = 131_000_000_000_000_000; // ~2016
+        let mtime: u64 = 132_000_000_000_000_000; // ~2019
+        let atime: u64 = 133_000_000_000_000_000; // ~2022
+        let attrs: u32 = 0x20; // ARCHIVE
+
+        let record = build_fake_record(ctime, mtime, atime, attrs, 0);
+
+        assert_eq!(extract_ctime(&record, 1024), Some(ctime));
+        assert_eq!(extract_mtime(&record, 1024), Some(mtime));
+        assert_eq!(extract_atime(&record, 1024), Some(atime));
+        assert_eq!(extract_attributes(&record, 1024), attrs);
+    }
+
+    #[test]
+    fn extract_fn_mtime_from_fake_record() {
+        let fn_mtime: u64 = 134_000_000_000_000_000;
+        let record = build_fake_record(0, 0, 0, 0, fn_mtime);
+
+        let ts = compare_timestamps(&record);
+        assert_eq!(ts.si_mtime, Some(0));
+        assert_eq!(ts.fn_mtime, Some(fn_mtime));
+    }
+
+    #[test]
+    fn compare_timestamps_returns_both_sources() {
+        let c1: u64 = 100;
+        let m1: u64 = 200;
+        let a1: u64 = 300;
+        let m2: u64 = 400;
+        let record = build_fake_record(c1, m1, a1, 0, m2);
+
+        let ts = compare_timestamps(&record);
+        assert_eq!(ts.si_ctime, Some(c1));
+        assert_eq!(ts.si_mtime, Some(m1));
+        assert_eq!(ts.si_atime, Some(a1));
+        assert_eq!(ts.fn_ctime, Some(0));
+        assert_eq!(ts.fn_mtime, Some(m2));
+        assert_eq!(ts.fn_atime, Some(0));
+    }
+
+    #[test]
+    fn extract_attribute_list_parses_entries() {
+        let record_size = 1024usize;
+        let mut record = vec![0u8; record_size];
+        record[0..4].copy_from_slice(b"FILE");
+        let first_attr_offset: u16 = 0x40;
+        record[20..22].copy_from_slice(&first_attr_offset.to_le_bytes());
+        let usn_offset: u16 = 0x30;
+        record[4..6].copy_from_slice(&usn_offset.to_le_bytes());
+        record[6..8].copy_from_slice(&3u16.to_le_bytes());
+        record[0x30] = 0x01; record[0x31] = 0x00;
+        record[0x32] = 0x01; record[0x33] = 0x00;
+        record[0x34] = 0x02; record[0x35] = 0x00;
+        record[510] = 0x01; record[511] = 0x00;
+        record[1022] = 0x01; record[1023] = 0x00;
+
+        let attr_off = first_attr_offset as usize;
+        record[attr_off..attr_off + 4].copy_from_slice(&ATTR_ATTRIBUTE_LIST.to_le_bytes());
+        let attr_len: u32 = 128;
+        record[attr_off + 4..attr_off + 8].copy_from_slice(&attr_len.to_le_bytes());
+        record[attr_off + 8] = 0; // resident
+        record[attr_off + 16..attr_off + 20].copy_from_slice(&96u32.to_le_bytes()); // value_length
+        record[attr_off + 20..attr_off + 22].copy_from_slice(&0x18u16.to_le_bytes()); // value_offset
+
+        let val = attr_off + 0x18;
+
+        // Entry 1: $STANDARD_INFO in record 100
+        let e = val;
+        record[e..e + 4].copy_from_slice(&ATTR_STANDARD_INFO.to_le_bytes());
+        record[e + 4..e + 6].copy_from_slice(&32u16.to_le_bytes()); // entry_len (padded to 32)
+        // mft_reference at e+16: record 100
+        record[e + 16..e + 24].copy_from_slice(&100u64.to_le_bytes());
+
+        // Entry 2: $DATA in record 200
+        let e = val + 32;
+        record[e..e + 4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+        record[e + 4..e + 6].copy_from_slice(&32u16.to_le_bytes());
+        record[e + 16..e + 24].copy_from_slice(&200u64.to_le_bytes());
+
+        // Entry 3: $DATA again in record 300 (duplicate type, different record)
+        let e = val + 64;
+        record[e..e + 4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+        record[e + 4..e + 6].copy_from_slice(&32u16.to_le_bytes());
+        record[e + 16..e + 24].copy_from_slice(&300u64.to_le_bytes());
+
+        let entries = extract_attribute_list(&record, record_size);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], (ATTR_STANDARD_INFO, 100));
+        assert_eq!(entries[1], (ATTR_DATA, 200));
+        assert_eq!(entries[2], (ATTR_DATA, 300));
+    }
+
+    #[test]
+    fn extract_data_size_returns_zero_without_data() {
+        let record = build_fake_record(100, 200, 300, 0x20, 400);
+        let size = extract_data_size(&record, 1024, None::<&mut std::fs::File>, None, 0, 0);
+        assert_eq!(size, 0);
     }
 }
