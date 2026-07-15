@@ -16,6 +16,17 @@ use windows::Win32::System::Ioctl::{
     FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0,
 };
 
+/// Convert NTFS timestamp (100ns intervals since 1601-01-01) to Unix timestamp (seconds since 1970)
+const NTFS_EPOCH_DIFF: i64 = 11_644_473_600; // seconds between 1601 and 1970
+
+#[inline]
+fn ntfs_time_to_unix(ntfs_time: Option<u64>) -> i64 {
+    match ntfs_time {
+        Some(t) if t > 0 => (t as i64 / 10_000_000) - NTFS_EPOCH_DIFF,
+        _ => 0,
+    }
+}
+
 /// USN_REASON_MASK_ALL：监控所有变更原因
 const USN_REASON_MASK_ALL: u32 = 0xFFFFFFFF;
 
