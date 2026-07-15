@@ -221,6 +221,53 @@ fn read_usn_records_direct(
     Ok((records, current_start_usn))
 }
 
+/// Fallback path resolution using batch parent map.
+/// When usn-journal-rs's resolver can't find a parent (e.g. newly created files
+/// whose parent wasn't in the resolver's MFT cache), we walk the parent chain
+/// using the USN records from the current batch.
+fn resolve_path_from_batch(
+    fid: u64,
+    parent_map: &std::collections::HashMap<u64, u64>,
+    name_map: &std::collections::HashMap<u64, &std::ffi::OsString>,
+    drive_letter: char,
+) -> Option<std::path::PathBuf> {
+    let mut components: Vec<&std::ffi::OsString> = Vec::with_capacity(8);
+    let mut cur = fid;
+
+    // Walk up the parent chain (max 50 levels to prevent infinite loops)
+    for _ in 0..50 {
+        if let Some(name) = name_map.get(&cur) {
+            let name_str = name.to_string_lossy();
+            // Skip NTFS virtual entries
+            if name_str != "." && name_str != ".." && !name_str.starts_with('$') {
+                components.push(name);
+            }
+        }
+
+        match parent_map.get(&cur) {
+            Some(&pfid) if pfid != cur && pfid != 0 => {
+                cur = pfid;
+            }
+            _ => break,
+        }
+    }
+
+    if components.is_empty() {
+        return None;
+    }
+
+    components.reverse();
+
+    let mut path = std::path::PathBuf::new();
+    path.push(format!("{}:", drive_letter));
+    path.push("\\");
+    for comp in &components {
+        path.push(comp);
+    }
+
+    Some(path)
+}
+
 pub fn spawn_usn_worker(
     cmd_rx: Receiver<UsnCommand>,
     resp_tx: Sender<UsnResponse>,
@@ -377,6 +424,10 @@ fn handle_full_scan(
                     Some(p) if p != cur && p != 0 => {
                         cur = p;
                         if let Some(Some((_, name, _, _, _, _))) = records_by_number.get(cur as usize) {
+                            // Skip NTFS virtual entries (. and ..) to avoid paths like C:\.\windows
+                            if *name == "." || *name == ".." {
+                                continue;
+                            }
                             parts.push(name);
                         } else {
                             break;
@@ -683,7 +734,12 @@ fn handle_full_scan_legacy(
                         cur_fid = pfid;
                         match fid_to_idx.get(&pfid) {
                             Some(&parent_idx) => {
-                                parts.push(&raw_entries[parent_idx].file_name);
+                                let parent_name = &raw_entries[parent_idx].file_name;
+                                // Skip NTFS virtual entries (. and ..) to avoid paths like C:\.\windows
+                                if parent_name.to_string_lossy() == "." || parent_name.to_string_lossy() == ".." {
+                                    continue;
+                                }
+                                parts.push(parent_name);
                             }
                             None => break,
                         }
@@ -999,6 +1055,16 @@ fn handle_poll_changes(
     const RECYCLE_BIN: &str = "$recycle.bin";
     const SYSTEM_VOL_INFO: &str = "system volume information";
 
+    // Build a parent map from this batch of USN records for fallback path resolution.
+    // When usn-journal-rs's resolver can't find a parent (e.g. newly created files),
+    // we can walk the parent chain using this map.
+    let mut batch_parent_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut batch_name_map: std::collections::HashMap<u64, &std::ffi::OsString> = std::collections::HashMap::new();
+    for rec in &records {
+        batch_parent_map.insert(rec.fid, rec.parent_fid);
+        batch_name_map.insert(rec.fid, &rec.file_name);
+    }
+
     // 复用 volume handle 用于元数据查询
     let mut mft_reader = ntfs_mft::open_volume_handle(drive_letter)
         .map(|handle| ntfs_mft::UsnMetadataReader::new(handle));
@@ -1037,14 +1103,20 @@ fn handle_poll_changes(
             let path = match resolver.resolve_path(entry) {
                 Some(p) => p,
                 None => {
-                    log::warn!(
-                        "[USN] resolve_path FAILED for fid={}, name={}, reason=0x{:x}, is_dir={}",
-                        fid,
-                        entry.file_name.to_string_lossy(),
-                        reason,
-                        entry.is_dir()
-                    );
-                    continue;
+                    // Fallback: build path from batch parent map
+                    match resolve_path_from_batch(fid, &batch_parent_map, &batch_name_map, drive_letter) {
+                        Some(p) => p,
+                        None => {
+                            log::warn!(
+                                "[USN] resolve_path FAILED for fid={}, name={}, reason=0x{:x}, is_dir={}",
+                                fid,
+                                entry.file_name.to_string_lossy(),
+                                reason,
+                                entry.is_dir()
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -1087,13 +1159,19 @@ fn handle_poll_changes(
             let path = match resolver.resolve_path(entry) {
                 Some(p) => p,
                 None => {
-                    log::warn!(
-                        "[USN] resolve_path FAILED (update) for fid={}, name={}, reason=0x{:x}",
-                        fid,
-                        entry.file_name.to_string_lossy(),
-                        reason
-                    );
-                    continue;
+                    // Fallback: build path from batch parent map
+                    match resolve_path_from_batch(fid, &batch_parent_map, &batch_name_map, drive_letter) {
+                        Some(p) => p,
+                        None => {
+                            log::warn!(
+                                "[USN] resolve_path FAILED (update) for fid={}, name={}, reason=0x{:x}",
+                                fid,
+                                entry.file_name.to_string_lossy(),
+                                reason
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
 
