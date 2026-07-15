@@ -5,9 +5,17 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub enum UsnCommand {
     /// Full MFT scan for a volume
-    FullScan { drive_letter: char },
+    FullScan {
+        drive_letter: char,
+        include_hidden_files: bool,
+        include_system_files: bool,
+    },
     /// Incremental USN journal poll for a volume
-    PollChanges { drive_letter: char },
+    PollChanges {
+        drive_letter: char,
+        include_hidden_files: bool,
+        include_system_files: bool,
+    },
     /// Shutdown the worker
     Shutdown,
 }
@@ -19,16 +27,14 @@ pub enum UsnResponse {
     FullScanResult {
         drive_letter: char,
         files: Vec<crate::search::SearchResult>,
-        /// fid → index into files vec
-        file_index: HashMap<u64, usize>,
         last_usn: i64,
         journal_id: u64,
     },
     /// Incremental changes from USN journal
     IncrementalResult {
         drive_letter: char,
-        /// (SearchResult, fid) for new files
-        added: Vec<(crate::search::SearchResult, u64)>,
+        /// SearchResults for new files
+        added: Vec<crate::search::SearchResult>,
         /// fids of deleted files
         removed: Vec<u64>,
         /// (file_id, new SearchResult) for updated files - fid-based to avoid index drift

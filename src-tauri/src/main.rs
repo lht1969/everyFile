@@ -329,8 +329,8 @@ fn main() {
                 if let Some(ref usn) = usn_manager {
                     for drive_letter in volume_manager.volumes() {
                         let dl_char = drive_letter.chars().next().unwrap_or('C');
-                        log::info!("[USN] Issuing full scan for drive {}", dl_char);
-                        usn.full_scan(dl_char);
+                        log::info!("[USN] Issuing full scan for drive {} (hidden={}, system={})", dl_char, include_hidden_files, include_system_files);
+                        usn.full_scan(dl_char, include_hidden_files, include_system_files);
                     }
                 }
 
@@ -353,7 +353,6 @@ fn main() {
                                     Ok(UsnResponse::FullScanResult {
                                         drive_letter,
                                         files,
-                                        file_index,
                                         ..
                                     }) => {
                                         let drive_string = format!("{}:", drive_letter);
@@ -363,7 +362,7 @@ fn main() {
                                             files.len()
                                         );
                                         let mut vm = rt_handle.block_on(vm_for_handler.lock());
-                                        vm.apply_full_scan(&drive_string, files, file_index);
+                                        vm.apply_full_scan(&drive_string, files);
                                         let count = vm.get_file_count(&drive_string);
                                         drop(vm);
                                         let _ = handle_for_handler.emit(
@@ -435,17 +434,27 @@ fn main() {
                     let vm_clone_for_usn = vm.clone();
 
                     tauri::async_runtime::spawn(async move {
-                        // Initial delay before starting USN polling
-                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                        // 初始延迟：等待全量扫描完成后开始轮询
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        log::info!("[USN] Polling task started");
 
                         loop {
                             let config = crate::config::Config::load().ok();
                             let interval = config
                                 .as_ref()
                                 .map(|c| c.index_settings.update_interval as u64)
-                                .unwrap_or(300);
+                                .unwrap_or(30);
+                            let include_hidden = config
+                                .as_ref()
+                                .map(|c| c.index_settings.include_hidden_files)
+                                .unwrap_or(false);
+                            let include_system = config
+                                .as_ref()
+                                .map(|c| c.index_settings.include_system_files)
+                                .unwrap_or(false);
 
                             if interval == 0 {
+                                log::info!("[USN] Poll interval is 0, skipping");
                                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                                 continue;
                             }
@@ -455,10 +464,17 @@ fn main() {
                                 vm.volumes()
                             };
 
+                            log::info!(
+                                "[USN] Polling {} volumes: {:?}, interval={}s",
+                                volumes_list.len(),
+                                volumes_list,
+                                interval
+                            );
                             for drive_letter in &volumes_list {
                                 let dl_char =
                                     drive_letter.chars().next().unwrap_or('C');
-                                usn_clone.poll_changes(dl_char);
+                                log::info!("[USN] Sending PollChanges for drive {}", dl_char);
+                                usn_clone.poll_changes(dl_char, include_hidden, include_system);
                             }
 
                             tokio::time::sleep(tokio::time::Duration::from_secs(interval))

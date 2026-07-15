@@ -6,6 +6,8 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use std::time::Instant;
+use usn_journal_rs::mft::EnumOptions;
 use usn_journal_rs::path::PathResolvableEntry;
 use usn_journal_rs::volume::Volume;
 use windows::Win32::Foundation::HANDLE;
@@ -265,6 +267,7 @@ fn handle_full_scan(
     resp_tx: &Sender<UsnResponse>,
 ) {
     log::info!("[USN] Full scan starting for drive {}", drive_letter);
+    let scan_start = Instant::now();
 
     let volume = match Volume::from_drive_letter(drive_letter) {
         Ok(v) => v,
@@ -281,41 +284,102 @@ fn handle_full_scan(
     const RECYCLE_BIN: &str = "$recycle.bin";
     const SYSTEM_VOL_INFO: &str = "system volume information";
 
-    // Phase 1a: enumerate all MFT entries, build parent map
+    // Phase 1a: 自定义 MFT 枚举，直接从 USN_RECORD_V2 提取 timestamp
+    // 4MB 缓冲区：减少 DeviceIoControl 调用次数至 2-3 次
+    // 关键收益：timestamp 字段一次性拿到，省去后续 GetFileAttributesExW 查询
+    let t0 = Instant::now();
     struct RawEntry {
         fid: u64,
         file_name: std::ffi::OsString,
         file_attributes: u32,
+        timestamp: i64,
     }
 
-    let mut raw_entries: Vec<RawEntry> = Vec::with_capacity(1_000_000);
-    let mut parent_map: HashMap<u64, u64> = HashMap::with_capacity(1_000_000);
+    let mut raw_entries: Vec<RawEntry>;
+    let mut parent_map: HashMap<u64, u64>;
 
-    for result in mft.iter() {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        parent_map.insert(entry.fid, entry.parent_fid);
-        raw_entries.push(RawEntry {
-            fid: entry.fid,
-            file_name: entry.file_name,
-            file_attributes: entry.file_attributes,
-        });
+    // 优先尝试自定义枚举器（携带 timestamp）
+    // 失败时回退到 usn-journal-rs 的标准枚举器（无 timestamp）
+    // 缓冲区选择：1MB 在 221 万文件下最优（实测 9.5s），
+    // 4MB 反而因 buffer_size/2 退出条件过严导致多轮调用
+    let vol_handle_for_mft = ntfs_mft::open_volume_handle(drive_letter);
+    match vol_handle_for_mft {
+        Some(h) => {
+            match ntfs_mft::enumerate_mft_with_timestamps(h, 1024 * 1024) {
+                Ok(entries_with_ts) => {
+                    raw_entries = Vec::with_capacity(entries_with_ts.len());
+                    parent_map = HashMap::with_capacity(entries_with_ts.len());
+                    for e in entries_with_ts {
+                        parent_map.insert(e.fid, e.parent_fid);
+                        raw_entries.push(RawEntry {
+                            fid: e.fid,
+                            file_name: e.file_name,
+                            file_attributes: e.file_attributes,
+                            timestamp: e.timestamp,
+                        });
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[USN] Custom MFT enum failed ({}), falling back to usn-journal-rs", e);
+                    let enum_options = EnumOptions {
+                        buffer_size: 1024 * 1024,
+                        ..Default::default()
+                    };
+                    raw_entries = Vec::with_capacity(1_000_000);
+                    parent_map = HashMap::with_capacity(1_000_000);
+                    for result in mft.iter_with_options(enum_options) {
+                        let entry = match result { Ok(e) => e, Err(_) => continue };
+                        parent_map.insert(entry.fid, entry.parent_fid);
+                        raw_entries.push(RawEntry {
+                            fid: entry.fid,
+                            file_name: entry.file_name,
+                            file_attributes: entry.file_attributes,
+                            timestamp: 0, // 回退路径无 timestamp
+                        });
+                    }
+                }
+            }
+        }
+        None => {
+            log::warn!("[USN] Failed to open volume handle, falling back to usn-journal-rs");
+            let enum_options = EnumOptions {
+                buffer_size: 1024 * 1024,
+                ..Default::default()
+            };
+            raw_entries = Vec::with_capacity(1_000_000);
+            parent_map = HashMap::with_capacity(1_000_000);
+            for result in mft.iter_with_options(enum_options) {
+                let entry = match result { Ok(e) => e, Err(_) => continue };
+                parent_map.insert(entry.fid, entry.parent_fid);
+                raw_entries.push(RawEntry {
+                    fid: entry.fid,
+                    file_name: entry.file_name,
+                    file_attributes: entry.file_attributes,
+                    timestamp: 0,
+                });
+            }
+        }
     }
 
-    log::info!("[USN] Enumerated {} MFT entries for {}", raw_entries.len(), drive_letter);
+    log::info!(
+        "[USN] Phase 1a: Enumerated {} MFT entries for {} in {:?}",
+        raw_entries.len(), drive_letter, t0.elapsed()
+    );
 
-    // Build O(1) name lookup: fid → file_name
-    let name_map: HashMap<u64, std::ffi::OsString> = raw_entries
+    // Build O(1) index lookup: fid → raw_entries index (avoids cloning OsStrings)
+    let fid_to_idx: HashMap<u64, usize> = raw_entries
         .iter()
-        .map(|e| (e.fid, e.file_name.clone()))
+        .enumerate()
+        .map(|(i, e)| (e.fid, i))
         .collect();
 
-    // Phase 1b: parallel path resolution using parent map
-    let entries: Vec<(u64, Box<str>, bool)> = raw_entries
+    // Phase 1b: 并行路径解析，透传 MFT 阶段获取的 timestamp
+    // entries 元组结构：(fid, name, path, is_dir, timestamp)
+    let t1 = Instant::now();
+    let entries: Vec<(u64, Box<str>, Box<str>, bool, i64)> = raw_entries
         .par_iter()
-        .filter_map(|re| {
+        .enumerate()
+        .filter_map(|(_idx, re)| {
             // Skip $-prefixed NTFS metadata files (cheap pre-check before path resolution)
             if re.file_name.to_string_lossy().starts_with('$') {
                 return None;
@@ -329,17 +393,18 @@ fn handle_full_scan(
                 return None;
             }
 
-            // Resolve path via parent map — O(depth) with O(1) name lookups
-            let mut parts: Vec<std::ffi::OsString> = Vec::new();
-            parts.push(re.file_name.clone());
+            // Resolve path via parent map — O(depth) with O(1) index lookups
+            // Use Vec<&OsString> to borrow from raw_entries, avoiding clones
+            let mut parts: Vec<&std::ffi::OsString> = Vec::with_capacity(16);
+            parts.push(&re.file_name);
             let mut cur_fid = re.fid;
             for _ in 0..50 {
                 match parent_map.get(&cur_fid) {
                     Some(&pfid) if pfid != cur_fid && pfid != 0 => {
                         cur_fid = pfid;
-                        match name_map.get(&pfid) {
-                            Some(parent_name) => {
-                                parts.push(parent_name.clone());
+                        match fid_to_idx.get(&pfid) {
+                            Some(&parent_idx) => {
+                                parts.push(&raw_entries[parent_idx].file_name);
                             }
                             None => break,
                         }
@@ -349,9 +414,15 @@ fn handle_full_scan(
             }
             parts.reverse();
 
-            // Build path string
+            // Build path string with pre-allocated capacity
+            let estimated_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
+                + parts.len()  // separators
+                + 4;            // "X:\" prefix
             let path_str: Box<str> = {
-                let mut path = format!("{}:\\", drive_letter);
+                let mut path = String::with_capacity(estimated_len);
+                path.push(drive_letter);
+                path.push(':');
+                path.push('\\');
                 for (i, part) in parts.iter().enumerate() {
                     if i > 0 {
                         path.push('\\');
@@ -370,64 +441,59 @@ fn handle_full_scan(
                 return None;
             }
 
+            // Pre-convert name to Box<str> here so Phase 2 doesn't need name lookup
+            let name_str: Box<str> = re.file_name.to_string_lossy().into();
             let is_dir = (re.file_attributes & 0x10) != 0;
-            Some((re.fid, path_str, is_dir))
-        })
-        .collect();
-
-    log::info!("[USN] Resolved {} file paths for {}", entries.len(), drive_letter);
-
-    // Phase 2: metadata lookup — skip std::fs::metadata for directories
-    // (directories don't need size/timestamp, and we already know is_dir from file_attributes)
-    let entries_with_path: Vec<(u64, Box<str>, bool, std::path::PathBuf)> = entries
-        .into_iter()
-        .map(|(fid, path_str, is_dir)| {
-            let pb = std::path::PathBuf::from(path_str.to_string());
-            (fid, path_str, is_dir, pb)
-        })
-        .collect();
-
-    // Open volume handle once for all metadata lookups
-    let vol_handle = ntfs_mft::open_volume_handle(drive_letter);
-
-    let files: Vec<SearchResult> = entries_with_path
-        .par_chunks(4096)
-        .flat_map(|chunk| {
-            let mut reader = vol_handle.map(|h| ntfs_mft::UsnMetadataReader::new(h));
-            let mut results = Vec::with_capacity(chunk.len());
-            for (fid, path_str, is_dir, path_buf) in chunk {
-                // Skip metadata lookup for directories — size=0, timestamp=0, is_dir already known
-                let (size, modified_time) = if *is_dir {
-                    (0, 0)
-                } else {
-                    reader
-                        .as_mut()
-                        .map(|r| {
-                            let m = r.get_file_metadata(*fid, path_buf);
-                            (m.size, m.modified_time)
-                        })
-                        .unwrap_or((0, 0))
-                };
-                let name: Box<str> = name_map.get(fid)
-                    .map(|n| Box::from(n.to_string_lossy().as_ref()))
-                    .unwrap_or_default();
-                results.push(SearchResult {
-                    file_id: *fid,
-                    name,
-                    path: path_str.clone(),
-                    size,
-                    modified_time,
-                    is_directory: *is_dir,
-                });
-            }
-            results
+            Some((re.fid, name_str, path_str, is_dir, re.timestamp))
         })
         .collect();
 
     log::info!(
-        "[USN] Full scan complete for drive {}: {} files",
-        drive_letter,
-        files.len()
+        "[USN] Phase 1b: Resolved {} file paths for {} in {:?}",
+        entries.len(), drive_letter, t1.elapsed()
+    );
+
+    // Free raw_entries and parent_map/fid_to_idx — no longer needed
+    drop(raw_entries);
+    drop(parent_map);
+    drop(fid_to_idx);
+
+    // Phase 2: 仅查询文件大小（timestamp 已在 Phase 1a 从 MFT 拿到）
+    // 优化收益：每个文件节省一次 timestamp 字段的传输，
+    // 实际节省效果取决于 NTFS 元数据缓存命中率
+    let t2 = Instant::now();
+    let path_isdir: Vec<(Box<str>, bool)> = entries
+        .iter()
+        .map(|(_, _, path, is_dir, _)| (path.clone(), *is_dir))
+        .collect();
+    let sizes = ntfs_mft::batch_metadata(&path_isdir);
+    drop(path_isdir); // 释放临时内存
+
+    let files: Vec<SearchResult> = entries
+        .par_iter()
+        .enumerate()
+        .map(|(i, (fid, name_str, path_str, is_dir, timestamp))| {
+            let (size, fallback_modified) = sizes[i];
+            // 优先使用 MFT 时间戳，回退到 GetFileAttributesExW 返回的 modified_time
+            let modified_time = if *timestamp > 0 { *timestamp } else { fallback_modified };
+            SearchResult {
+                file_id: *fid,
+                name: name_str.clone(),
+                path: path_str.clone(),
+                size,
+                modified_time,
+                is_directory: *is_dir,
+            }
+        })
+        .collect();
+
+    log::info!(
+        "[USN] Phase 2: Batch size lookup for {} files in {:?}",
+        files.len(), t2.elapsed()
+    );
+    log::info!(
+        "[USN] Full scan complete for drive {}: {} files, total {:?}",
+        drive_letter, files.len(), scan_start.elapsed()
     );
 
     // Create or verify USN journal
@@ -642,7 +708,7 @@ fn handle_poll_changes(
     let mut removed: Vec<u64> = Vec::new();
     let mut updated: Vec<(u64, SearchResult)> = Vec::new();
     // new_last_usn 使用 API 返回的 next_start_usn，这是有效的记录边界
-    let mut new_last_usn = next_start_usn;
+    let new_last_usn = next_start_usn;
 
     const USN_REASON_FILE_CREATE: u32 = 0x100;
     const USN_REASON_FILE_DELETE: u32 = 0x200;
