@@ -1,4 +1,5 @@
 pub mod database;
+pub mod lib;
 pub mod monitor;
 pub mod ntfs_mft;
 pub mod usn_types;
