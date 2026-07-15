@@ -1,5 +1,6 @@
 pub mod database;
 pub mod monitor;
+pub mod ntfs_mft;
 pub mod usn_types;
 pub mod usn_worker;
 
@@ -45,12 +46,20 @@ impl UsnIndexManager {
         Self { cmd_tx, resp_rx }
     }
 
-    pub fn full_scan(&self, drive_letter: char) {
-        let _ = self.cmd_tx.send(UsnCommand::FullScan { drive_letter });
+    pub fn full_scan(&self, drive_letter: char, include_hidden_files: bool, include_system_files: bool) {
+        let _ = self.cmd_tx.send(UsnCommand::FullScan {
+            drive_letter,
+            include_hidden_files,
+            include_system_files,
+        });
     }
 
-    pub fn poll_changes(&self, drive_letter: char) {
-        let _ = self.cmd_tx.send(UsnCommand::PollChanges { drive_letter });
+    pub fn poll_changes(&self, drive_letter: char, include_hidden_files: bool, include_system_files: bool) {
+        let _ = self.cmd_tx.send(UsnCommand::PollChanges {
+            drive_letter,
+            include_hidden_files,
+            include_system_files,
+        });
     }
 
     pub fn shutdown(&self) {

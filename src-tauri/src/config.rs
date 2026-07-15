@@ -44,7 +44,7 @@ impl Default for IndexSettings {
             enable_usn_journal: true,
             include_hidden_files: false,
             include_system_files: false,
-            update_interval: 300,
+            update_interval: 30,
         }
     }
 }

@@ -308,6 +308,13 @@ impl VolumeManager {
         self.search_cache = None;
     }
 
+    /// Update settings on all live monitors.
+    pub fn update_all_settings(&mut self, include_hidden_files: bool, include_system_files: bool) {
+        for monitor in self.volumes.values_mut() {
+            monitor.update_settings(include_hidden_files, include_system_files);
+        }
+    }
+
     pub fn get_cached_slice(&mut self, sort_by: SortBy, sort_direction: SortDirection, start: usize, end: usize) -> Option<(Vec<SearchResult>, usize)> {
         let cache = self.search_cache.as_mut()?;
         if !cache.is_valid() {
@@ -327,11 +334,14 @@ impl VolumeManager {
         &mut self,
         drive_letter: &str,
         files: Vec<SearchResult>,
-        file_index: HashMap<u64, usize>,
     ) {
         if let Some(monitor) = self.volumes.get_mut(drive_letter) {
+            let mut fid_index = HashMap::with_capacity(files.len());
+            for (i, f) in files.iter().enumerate() {
+                fid_index.insert(f.file_id, i);
+            }
             monitor.files = files;
-            monitor.fid_index = Some(file_index);
+            monitor.fid_index = Some(fid_index);
             monitor.use_usn = true;
         }
         self.search_cache = None;
@@ -341,7 +351,7 @@ impl VolumeManager {
     pub fn apply_incremental_usn(
         &mut self,
         drive_letter: &str,
-        added: Vec<(SearchResult, u64)>,
+        added: Vec<SearchResult>,
         removed: Vec<u64>,
         updated: Vec<(u64, SearchResult)>,
     ) {
@@ -379,7 +389,7 @@ impl VolumeManager {
         }
 
         // Process additions
-        for (search_result, _fid) in added {
+        for search_result in added {
             monitor.files.push(search_result);
         }
 

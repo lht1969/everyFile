@@ -41,6 +41,7 @@ function App() {
     const unlistenComplete = listen<{ volume: string; count: number }>('scan-complete', (_event) => {
       loadIndexStatus();
       setStatusMessage(`扫描完成: ${_event.payload.volume} (${_event.payload.count.toLocaleString()} 个文件)`);
+      loadAllFiles();
     });
 
     const unlistenUpdated = listen<{ volume: string; count: number; cache_total?: number }>('index-updated', async (_event) => {
@@ -48,8 +49,9 @@ function App() {
       if (_event.payload.cache_total !== undefined) {
         setTotalCount(_event.payload.cache_total);
       }
-      const { start, end } = visibleRangeRef.current;
-      fetchRecordsRange(start, end);
+      // USN 增量更新会清除后端 search_cache，直接调用 fetchRecordsRange 会报 "cache expired"。
+      // 改用 refreshCurrentView：先调用 search_files 重建缓存，再获取当前可见范围的数据。
+      refreshCurrentView();
     });
 
     return () => {
@@ -101,6 +103,9 @@ function App() {
         setResultsOffset(0);
         setResults(range.results);
       }
+      if (response.total > 0) {
+        setStatusMessage('');
+      }
     } catch (e) {
       console.error('Failed to load all files:', e);
       message(`加载文件失败: ${e}`, { title: '错误', kind: 'error' });
@@ -109,6 +114,10 @@ function App() {
 
   const sortStateRef = useRef(sortState);
   sortStateRef.current = sortState;
+
+  // 跟踪当前搜索状态，供事件监听器闭包中访问最新值
+  const searchStateRef = useRef(searchState);
+  searchStateRef.current = searchState;
 
   const fetchCounterRef = useRef(0);
   const visibleRangeRef = useRef({ start: 0, end: 50 });
@@ -144,18 +153,68 @@ function App() {
       if (!rangeCacheRef.current.has(nextKey) && nextStart < (totalCount || 0)) {
         invoke<RecordsRangeResponse>('get_records_range', { start: nextStart, end: nextEnd, sortBy: field, sortDirection: direction })
           .then(resp => { rangeCacheRef.current.set(nextKey, resp.results); })
-          .catch(() => {});
+          .catch(() => { });
       }
     } catch (e) {
       console.error('Failed to fetch records range:', e);
+      // 缓存过期是正常现象（USN 增量更新会清除缓存），不弹窗打扰用户
+      const errMsg = String(e);
+      if (errMsg.includes('Cache expired') || errMsg.includes('cache expired')) {
+        // 静默处理，由 index-updated 事件的 refreshCurrentView 负责重建缓存
+        return;
+      }
       message(`获取数据失败: ${e}`, { title: '错误', kind: 'error' });
     }
   }, [totalCount]);
+
+  /**
+   * USN 增量更新后刷新当前视图
+   *
+   * 后端 apply_incremental_usn 会清除 search_cache，导致 get_records_range 返回 "cache expired" 错误。
+   * 此函数通过重新调用 search_files 重建后端缓存，然后获取当前可见范围的数据，
+   * 避免向用户显示错误弹窗，且不重置滚动位置。
+   *
+   * 所有外部状态通过 ref 访问，useCallback 依赖为空数组，确保事件监听器闭包捕获的版本始终有效。
+   */
+  const refreshCurrentView = useCallback(async () => {
+    // 递增 fetchCounterRef，使正在进行的 fetchRecordsRange 失效，
+    // 防止旧 fetchRecordsRange 返回的旧缓存数据覆盖 refreshCurrentView 的新结果
+    ++fetchCounterRef.current;
+    // 清除前端 range 缓存（后端缓存已被 USN 增量更新清除）
+    rangeCacheRef.current.clear();
+    const { field, direction } = sortStateRef.current;
+    const { query, filesOnly, directoriesOnly } = searchStateRef.current;
+    try {
+      // 调用 search_files 重建后端缓存
+      const response = await invoke<SearchResponse>('search_files', {
+        params: { query, files_only: filesOnly, directories_only: directoriesOnly, sort_by: field, sort_direction: direction }
+      });
+      // search_files 已返回并重建后端缓存，再次递增 fetchCounterRef，
+      // 使正在进行的旧 fetchRecordsRange 失效（它可能用了旧缓存），防止覆盖新结果
+      ++fetchCounterRef.current;
+      setTotalCount(response.total);
+      const { start, end } = visibleRangeRef.current;
+      if (response.total > 0) {
+        // 获取当前可见范围的排序后数据
+        const range = await invoke<RecordsRangeResponse>('get_records_range', { start, end, sortBy: field, sortDirection: direction });
+        setResultsOffset(start);
+        setResults(range.results);
+      } else {
+        setResultsOffset(0);
+        setResults([]);
+      }
+    } catch (e) {
+      console.error('Failed to refresh current view after index update:', e);
+    }
+  }, []);
 
   const searchCounterRef = useRef(0);
 
   const handleSearch = useCallback(async (searchQuery: string, filesOnly?: boolean, directoriesOnly?: boolean) => {
     const myId = ++searchCounterRef.current;
+    // 同步递增 fetchCounterRef，使正在进行的 fetchRecordsRange 失效，
+    // 防止旧 fetchRecordsRange 返回的旧缓存数据覆盖 handleSearch 的新结果
+    ++fetchCounterRef.current;
     rangeCacheRef.current.clear();
     setSearchState({ query: searchQuery, filesOnly: filesOnly ?? true, directoriesOnly: directoriesOnly ?? false });
     setScrollTrigger(prev => prev + 1);
@@ -175,6 +234,9 @@ function App() {
         }
       });
       if (myId !== searchCounterRef.current) return;
+      // search_files 已返回并重建后端缓存，再次递增 fetchCounterRef，
+      // 使正在进行的旧 fetchRecordsRange 失效（它可能用了旧缓存），防止覆盖新结果
+      ++fetchCounterRef.current;
       setTotalCount(response.total);
       if (response.results.length > 0) {
         setResultsOffset(0);
