@@ -416,11 +416,11 @@ body {
   opacity: 0.4;
 }
 
-.result-row.header > div {
+.result-row.header>div {
   position: relative;
 }
 
-.result-row.header > div:not(:last-child)::after {
+.result-row.header>div:not(:last-child)::after {
   content: '';
   position: absolute;
   right: 0;
@@ -559,8 +559,13 @@ body {
 }
 
 @keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .search-spinner {
@@ -869,41 +874,6 @@ body {
   background: var(--primary-hover);
 }
 
-.context-menu {
-  position: fixed;
-  background: #fff;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-  z-index: 1000;
-  min-width: 120px;
-  padding: 4px 0;
-}
-
-.context-menu-item {
-  padding: 8px 16px;
-  cursor: pointer;
-  font-size: 13px;
-}
-
-.context-menu-item:hover {
-  background: #f3f4f6;
-}
-
-.context-menu-item.danger {
-  color: var(--danger-color);
-}
-
-.context-menu-separator {
-  height: 1px;
-  background: var(--border-color);
-  margin: 4px 8px;
-}
-
-.context-menu-item.danger:hover {
-  background: #fee2e2;
-}
-
 .hover-tooltip {
   position: fixed;
   background: #fff;
@@ -948,8 +918,15 @@ body {
 }
 
 @keyframes pulse-text {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
 }
 
 .modal-overlay.rebuilding {
@@ -992,12 +969,11 @@ body {
 }
 
 /* 按钮点击效果 */
-.context-menu-item:active,
 .suggestion-item:active {
   background: #e5e7eb;
 }
 
 /* 列头悬停效果 */
-.result-row.header > div:hover {
+.result-row.header>div:hover {
   background: #f3f4f6;
 }
