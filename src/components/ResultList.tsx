@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useVirtualScroll } from '../hooks/useVirtualScroll';
 import { useFileIcon } from '../hooks/useFileIcon';
 import type { SearchResult, SortField, SortDirection } from '../types';
@@ -12,7 +13,6 @@ interface ResultListProps {
   sortDirection: SortDirection;
   onOpenFile: (path: string) => void;
   onOpenFolder: (path: string) => void;
-  onDeleteFile?: (path: string) => void;
   onVisibleRangeChange?: (startIndex: number, endIndex: number) => void;
   onSortChange?: (field: SortField, direction: SortDirection) => void;
   scrollToTop?: number;
@@ -35,9 +35,8 @@ function FileIcon({ path, isDirectory }: { path: string; isDirectory: boolean })
   return <img className="file-icon-img" src={iconUrl} alt="" draggable={false} />;
 }
 
-function ResultList({ results, totalCount, resultsOffset, sortField, sortDirection, onOpenFile, onOpenFolder, onDeleteFile, onVisibleRangeChange, onSortChange, scrollToTop, searching }: ResultListProps) {
+function ResultList({ results, totalCount, resultsOffset, sortField, sortDirection, onOpenFile, onOpenFolder, onVisibleRangeChange, onSortChange, scrollToTop, searching }: ResultListProps) {
   const [selectedIndex, setSelectedIndex] = useState(-1);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string; isDirectory: boolean } | null>(null);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
   const [showTooltip, setShowTooltip] = useState(false);
   const [colWidths, setColWidths] = useState(['1fr', '2fr', '100px', '150px']);
@@ -113,13 +112,24 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
 
   const getSortIcon = (field: SortField) => sortField !== field ? '' : (sortDirection === 'asc' ? ' ▲' : ' ▼');
 
-  const handleContextMenu = (e: React.MouseEvent, path: string, isDirectory: boolean) => {
-    e.preventDefault(); setShowTooltip(false);
-    if (hoverTimeoutRef.current) { clearTimeout(hoverTimeoutRef.current); hoverTimeoutRef.current = null; }
-    setContextMenu({ x: e.clientX, y: e.clientY, path, isDirectory });
+  const handleContextMenu = (e: React.MouseEvent, path: string) => {
+    // 阻止浏览器/WebView 默认菜单
+    e.preventDefault();
+    setShowTooltip(false);
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current);
+      hoverTimeoutRef.current = null;
+    }
+    // 屏幕坐标 = 视口坐标 + 窗口偏移
+    // Tauri WebView2 顶层窗口的 window.screenX/Y 即窗口在屏幕上的位置
+    const screenX = e.clientX + (window.screenX || 0);
+    const screenY = e.clientY + (window.screenY || 0);
+    // 调用 Rust 端 show_context_menu，弹出系统 Shell 菜单
+    // 系统菜单会自动显示"打开/打开方式/属性/删除到回收站"等所有原生项
+    invoke('show_context_menu', { path, screenX, screenY }).catch(err => {
+      console.error('Failed to show context menu:', err);
+    });
   };
-
-  const closeContextMenu = () => setContextMenu(null);
 
   const handleMouseEnter = (e: React.MouseEvent, index: number, data: SearchResult) => {
     const rect = (e.target as HTMLElement).getBoundingClientRect();
@@ -148,7 +158,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   };
 
   return (
-    <div className="result-list" tabIndex={0} onKeyDown={handleKeyDown} onClick={closeContextMenu}>
+    <div className="result-list" tabIndex={0} onKeyDown={handleKeyDown}>
       <div className="result-table">
         <div className="result-row header" style={{ gridTemplateColumns: colWidths.join(' ') }}>
           <div className="col-name" onClick={() => handleSort('name')}>
@@ -217,7 +227,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
                       onClick={() => handleRowClick(globalIndex)}
                       onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
-                      onContextMenu={(e) => handleContextMenu(e, result.path, result.is_directory)}
+                      onContextMenu={(e) => handleContextMenu(e, result.path)}
                       onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
                       onMouseLeave={handleMouseLeave}
                     >
@@ -236,22 +246,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
           })()}
         </div>
       </div>
-      {contextMenu && (
-        <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(e) => e.stopPropagation()}>
-          <div className="context-menu-item" onClick={() => { onOpenFile(contextMenu.path); closeContextMenu(); }}>打开</div>
-          <div className="context-menu-item" onClick={() => { onOpenFolder(contextMenu.path); closeContextMenu(); }}>打开文件夹</div>
-          <div className="context-menu-separator" />
-          <div className="context-menu-item" onClick={() => { navigator.clipboard.writeText(contextMenu.path); closeContextMenu(); }}>复制路径</div>
-          <div className="context-menu-item" onClick={() => { const name = contextMenu.path.split('\\').pop() || contextMenu.path; navigator.clipboard.writeText(name); closeContextMenu(); }}>复制名称</div>
-          <div className="context-menu-item" onClick={() => { const folder = contextMenu.path.substring(0, contextMenu.path.lastIndexOf('\\')); navigator.clipboard.writeText(folder); closeContextMenu(); }}>复制文件夹路径</div>
-          {onDeleteFile && (
-            <>
-              <div className="context-menu-separator" />
-              <div className="context-menu-item danger" onClick={() => { onDeleteFile(contextMenu.path); closeContextMenu(); }}>删除</div>
-            </>
-          )}
-        </div>
-      )}
+
       {hoveredItem && showTooltip && (
         <div className="hover-tooltip" style={{ left: hoveredItem.x, top: hoveredItem.y }}>
           <div className="hover-tooltip-row"><strong>名称:</strong> {hoveredItem.data.name}</div>
