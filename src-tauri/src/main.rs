@@ -661,6 +661,8 @@ fn main() {
             commands::file::delete_file,
             commands::file::copy_file,
             commands::file::move_file,
+            // Shell 菜单相关命令
+            commands::shell_menu::show_context_menu,
             // 导出相关命令
             commands::export::export_csv,
             commands::export::export_txt,
