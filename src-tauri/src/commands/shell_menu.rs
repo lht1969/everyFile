@@ -11,8 +11,14 @@
 // - 用户选择命令后调用 IContextMenu3::InvokeCommand 执行
 //
 // 多线程模型：
-// - Tauri command 用 spawn_blocking 跑在独立线程
-// - 该线程初始化 COM(STA)，独立消息循环
+// - Tauri command 用 std::thread::spawn 跑在独立线程（不是 tokio::task::spawn_blocking）
+// - 原因：TrackPopupMenuEx 模态运行要求调用线程拥有 Windows 消息队列；
+//   消息队列是 per-thread 资源，线程第一次调用 GetMessageW/PeekMessageW/
+//   SendMessageW 等 API 时由系统创建。std::thread::spawn 创建的原生 OS 线程
+//   没有自动消息队列，调用 TrackPopupMenuEx 会立即返回 0。
+//   解决：在 TrackPopupMenuEx 之前用 PeekMessageW(PM_NOREMOVE) 强制创建队列。
+// - 该线程初始化 COM(STA)，独立消息循环（spawn_blocking 跑在 tokio 池里，
+//   池化线程反复复用，可能也不保证有消息队列）
 //
 // 依赖：windows crate 0.52 已开启 Win32_UI_Shell / Win32_System_Com / Win32_UI_WindowsAndMessaging
 
@@ -30,8 +36,8 @@ use windows::Win32::UI::Shell::{
     CMINVOKECOMMANDINFO, DEFCONTEXTMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, SetForegroundWindow, TrackPopupMenuEx, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_TOPALIGN,
+    CreatePopupMenu, DestroyMenu, PeekMessageW, SetForegroundWindow, TrackPopupMenuEx, MSG,
+    PM_NOREMOVE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
 };
 
 // 常量
@@ -95,23 +101,38 @@ pub async fn show_context_menu(
     let hwnd = HWND(hwnd_tauri.0 as isize);
     log::info!("[CTX_MENU] Bridged to windows 0.52 HWND: {:?}", hwnd);
 
-    // 2. spawn_blocking 避免污染 tokio 运行时
-    let result = tokio::task::spawn_blocking(move || {
-        log::info!("[CTX_MENU] spawn_blocking thread started");
+    // 2. 用 std::thread::spawn（不是 tokio::task::spawn_blocking）
+    // 原因：TrackPopupMenuEx 要求调用线程拥有 Windows 消息队列。
+    // spawn_blocking 跑在 tokio 线程池里，池化线程没有自动消息队列，
+    // 且可能与 Tauri 主线程共享资源；std::thread::spawn 创建原生 OS 线程，
+    // 可控性更高，再配合 PeekMessageW 强制创建消息队列。
+    // 用 std::sync::mpsc::channel 把结果从工作线程回传：
+    // - 工作线程在 ShowMenu_blocking 内部可以长时间阻塞（菜单模态运行）
+    // - Tauri command 是 async 函数，rx.recv() 阻塞等待不阻塞 tokio 运行时
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    std::thread::spawn(move || {
+        log::info!("[CTX_MENU] std::thread started");
         let r = show_menu_blocking(hwnd, &path, screen_x, screen_y);
         log::info!(
-            "[CTX_MENU] spawn_blocking thread finished: {:?}",
+            "[CTX_MENU] std::thread finished: {:?}",
             r.as_ref().map(|_| "ok").map_err(|e| e.as_str())
         );
-        r
-    })
-    .await;
+        // 忽略 send 错误：若接收端已 drop，菜单仍可能已正常显示
+        let _ = tx.send(r);
+    });
 
-    match result {
+    // 在 Tauri command 里阻塞等待工作线程结果
+    // Tauri command 是 async 函数，std::sync::mpsc::channel 的 recv 是同步阻塞，
+    // 但这发生在 tokio runtime worker 线程上，阻塞此 worker 会影响同一 worker 上的其他 task。
+    // 因为这是 Tauri command 入口，前端在等返回值，且菜单必须模态运行，
+    // 所以短暂阻塞 worker 是可接受的（菜单关闭前其他 task 也无法继续）。
+    // rx.recv() 返回 Result<Result<(), String>, RecvError>，用 match 平铺成 Result<(), String>
+    match rx.recv() {
         Ok(inner) => inner,
         Err(e) => {
-            log::error!("[CTX_MENU] Join error: {}", e);
-            Err(format!("Join error: {}", e))
+            log::error!("[CTX_MENU] Menu thread channel error: {}", e);
+            Err(format!("Menu thread channel error: {}", e))
         }
     }
 }
@@ -308,6 +329,27 @@ fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), Stri
                 })?;
         }
         log::info!("[CTX_MENU] QueryContextMenu succeeded");
+
+        // 12.5 强制创建线程 Windows 消息队列
+        // 原因：TrackPopupMenuEx 模态运行需要调用线程有消息队列（系统会向队列投递
+        // WM_COMMAND/WM_MENUSELECT 等并内部 pump）。Windows 消息队列是 per-thread 资源，
+        // 线程第一次调用 GetMessageW/PeekMessageW/SendMessageW 等 API 时系统才会创建。
+        // std::thread::spawn 创建的新线程没有自动消息队列，TrackPopupMenuEx 会立即
+        // 返回 0（cmd=0），菜单"无反应"。
+        // PeekMessageW(PM_NOREMOVE) 创建队列但不阻塞、不移除任何消息。
+        // windows 0.52 实际签名：
+        //   pub unsafe fn PeekMessageW<P0>(lpmsg: *mut MSG, hwnd: P0,
+        //       wmsgfiltermin: u32, wmsgfiltermax: u32,
+        //       wremovemsg: PEEK_MESSAGE_REMOVE_TYPE) -> BOOL
+        //   where P0: IntoParam<HWND>
+        // HWND 是 pub struct HWND(pub isize)，用 HWND(0) 传 NULL 等价 hWnd=NULL。
+        // wmsgfiltermin/max=0 表示不过滤；wremovemsg=PM_NOREMOVE 不移除消息。
+        log::info!("[CTX_MENU] Forcing creation of thread message queue via PeekMessageW");
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            let _ = PeekMessageW(&mut msg, HWND(0), 0, 0, PM_NOREMOVE);
+        }
+        log::info!("[CTX_MENU] Message queue created (PeekMessageW returned)");
 
         // 13. 弹出菜单（设置前置窗口确保 Z-order 正确）
         // windows 0.52 中 TrackPopupMenuEx 的 uflags 参数是 u32，
