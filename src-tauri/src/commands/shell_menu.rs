@@ -16,7 +16,7 @@ use tauri::{AppHandle, Manager, WebviewWindow};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::{
     IShellItem, IContextMenu3,
-    SHCreateItemFromParsingName, CMF_NORMAL,
+    SHCreateItemFromParsingName, CMF_NORMAL, CMINVOKECOMMANDINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, TrackPopupMenuEx, TPM_RETURNCMD, TPM_LEFTALIGN, TPM_TOPALIGN,
@@ -26,7 +26,7 @@ use windows::Win32::System::Com::{
     CoInitializeEx, CoUninitialize,
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
-use windows::core::PCWSTR;
+use windows::core::{PCSTR, PCWSTR};
 
 /// BHID_ContextMenu：用于 BindToHandler 直接拿到 IContextMenu 接口
 /// GUID 值来自 Windows SDK shobjidl.h
@@ -127,9 +127,44 @@ fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), Stri
         // 9. 销毁菜单句柄
         unsafe { DestroyMenu(menu).ok(); }
 
-        // 10. 用户选中某项则执行（InvokeCommand 实现在 Task 3）
+        // 10. 用户选中某项则执行命令
+        // TPM_RETURNCMD 模式下 TrackPopupMenuEx 返回的 cmd 是从 QueryContextMenu 时
+        // 传入的 idFirst(=1) 开始的相对 menu item ID。Windows 资源管理器调用
+        // IContextMenu3::InvokeCommand 时，lpVerb 传的是 MAKEINTRESOURCE 形式的 verb
+        // 偏移（即 cmd - idFirst），这是 Windows shell context menu 的标准调用约定。
         if cmd.0 != 0 {
-            // 占位：Task 3 会补充完整 CMINVOKECOMMANDINFO 调用
+            // 因为 QueryContextMenu 时 idFirst=1，cmd 减 1 才是 verb index
+            let verb_index: i32 = cmd.0 - 1;
+            // windows crate 0.52 中 CMINVOKECOMMANDINFO 的 lpVerb 字段类型是 PCSTR
+            // （pub struct PCSTR(pub *const u8)），与 Win32 SDK 的 LPCSTR 对应。
+            // 通过把 verb_index cast 为 usize 再 cast 为 *const u8 模拟 MAKEINTRESOURCE：
+            // Windows API 收到该"指针"时，会检查低 16 位非零，把它当 WORD 整数 ID 解释
+            // （IContextMenu3 内部会与 idFirst 相减得到 verb 偏移）。
+            let lp_verb = PCSTR(verb_index as usize as *const u8);
+            // 构造 CMINVOKECOMMANDINFO 结构体
+            // - cbSize 必须正确设置
+            // - fMask 留 0（不需要扩展信息）
+            // - hwnd 透传主窗口句柄
+            // - nShow = 1 对应 SW_SHOWNORMAL
+            // - 其余字段 Default::default() 即可（lpParameters/lpDirectory 留 null，
+            //   dwHotKey 留 0，hIcon 留 null）
+            let invoke = CMINVOKECOMMANDINFO {
+                cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                fMask: 0,
+                hwnd,
+                lpVerb: lp_verb,
+                lpParameters: PCSTR::null(),
+                lpDirectory: PCSTR::null(),
+                nShow: 1, // SW_SHOWNORMAL
+                dwHotKey: 0,
+                hIcon: windows::Win32::Foundation::HANDLE(0),
+            };
+            // IContextMenu3::InvokeCommand 接受 *const CMINVOKECOMMANDINFO 指针
+            unsafe {
+                ctx_menu
+                    .InvokeCommand(&invoke)
+                    .map_err(|e| format!("InvokeCommand failed: {}", e))?;
+            }
         }
 
         Ok(())
