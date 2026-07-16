@@ -50,25 +50,59 @@ pub async fn show_context_menu(
     screen_x: i32,
     screen_y: i32,
 ) -> Result<(), String> {
+    // 诊断日志：Tauri command 入口，确认 Rust 端被调用，记录路径与屏幕坐标
+    log::info!(
+        "[CTX_MENU] show_context_menu called: path={}, screen=({}, {})",
+        path,
+        screen_x,
+        screen_y
+    );
+
     // 1. 拿到主窗口 HWND
     // Tauri 2 通过 windows 0.61 的 HWND 返回（pub struct HWND(pub *mut c_void)），
     // 而本项目使用 windows 0.52（pub struct HWND(pub isize)），
     // 两个版本的 HWND 类型不同，需要 .0 as isize 桥接。
-    let window: WebviewWindow = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window not found".to_string())?;
-    let hwnd_tauri = window.hwnd().map_err(|e| format!("Failed to get hwnd: {}", e))?;
+    let window: WebviewWindow = match app.get_webview_window("main") {
+        Some(w) => {
+            log::info!("[CTX_MENU] Got main window");
+            w
+        }
+        None => {
+            log::error!("[CTX_MENU] Main window not found");
+            return Err("Main window not found".to_string());
+        }
+    };
+    let hwnd_tauri = match window.hwnd() {
+        Ok(h) => {
+            log::info!("[CTX_MENU] Got hwnd (Tauri HWND): {:?}", h);
+            h
+        }
+        Err(e) => {
+            log::error!("[CTX_MENU] Failed to get hwnd: {}", e);
+            return Err(format!("Failed to get hwnd: {}", e));
+        }
+    };
     let hwnd = HWND(hwnd_tauri.0 as isize);
+    log::info!("[CTX_MENU] Bridged to windows 0.52 HWND: {:?}", hwnd);
 
     // 2. spawn_blocking 避免污染 tokio 运行时
     let result = tokio::task::spawn_blocking(move || {
-        show_menu_blocking(hwnd, &path, screen_x, screen_y)
+        log::info!("[CTX_MENU] spawn_blocking thread started");
+        let r = show_menu_blocking(hwnd, &path, screen_x, screen_y);
+        log::info!(
+            "[CTX_MENU] spawn_blocking thread finished: {:?}",
+            r.as_ref().map(|_| "ok").map_err(|e| e.as_str())
+        );
+        r
     })
     .await;
 
     match result {
         Ok(inner) => inner,
-        Err(e) => Err(format!("Join error: {}", e)),
+        Err(e) => {
+            log::error!("[CTX_MENU] Join error: {}", e);
+            Err(format!("Join error: {}", e))
+        }
     }
 }
 
@@ -76,42 +110,75 @@ pub async fn show_context_menu(
 fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), String> {
     // 3. 初始化 COM（STA 模式 + 禁用旧 OLE）
     // windows 0.52 中 CoInitializeEx 返回 Result<()>，不再需要 .ok() 转 Option
+    // 诊断日志：CoInitializeEx 在已经初始化的线程上会返回 S_FALSE（视为 Err），
+    // 这里只警告不返回错误，避免误判为致命失败
     unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-            .map_err(|e| format!("CoInitializeEx failed: {}", e))?;
+        match CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) {
+            Ok(()) => log::info!("[CTX_MENU] CoInitializeEx succeeded"),
+            Err(e) => {
+                log::warn!(
+                    "[CTX_MENU] CoInitializeEx returned error (may be already initialized): {}",
+                    e
+                );
+                // 不返回错误，可能是 S_FALSE（已初始化）
+            }
+        }
     }
 
     let result = (|| -> Result<(), String> {
         // 4. 路径 → IShellItem
+        // 诊断日志：即将创建 IShellItem（失败通常意味着路径非法/不存在/无权限）
         let path_w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        log::info!("[CTX_MENU] Creating IShellItem for path: {}", path);
         let item: IShellItem = unsafe {
-            SHCreateItemFromParsingName(PCWSTR(path_w.as_ptr()), None)
-                .map_err(|e| format!("SHCreateItemFromParsingName failed: {}", e))?
+            SHCreateItemFromParsingName(PCWSTR(path_w.as_ptr()), None).map_err(|e| {
+                log::error!("[CTX_MENU] SHCreateItemFromParsingName failed: {}", e);
+                format!("SHCreateItemFromParsingName failed: {}", e)
+            })?
         };
+        log::info!("[CTX_MENU] IShellItem created successfully");
 
         // 5. IShellItem → IContextMenu3
+        // 诊断日志：BindToHandler 失败通常意味着 shell 扩展未注册或权限不足
+        log::info!("[CTX_MENU] Calling BindToHandler with BHID_CONTEXT_MENU");
         let ctx_menu: IContextMenu3 = unsafe {
-            item.BindToHandler(None, &BHID_CONTEXT_MENU)
-                .map_err(|e| format!("BindToHandler failed: {}", e))?
+            item.BindToHandler(None, &BHID_CONTEXT_MENU).map_err(|e| {
+                log::error!("[CTX_MENU] BindToHandler failed: {}", e);
+                format!("BindToHandler failed: {}", e)
+            })?
         };
+        log::info!("[CTX_MENU] BindToHandler returned IContextMenu (cast to IContextMenu3)");
 
         // 6. 创建弹出菜单
         // windows 0.52 中 CreatePopupMenu 返回 Result<HMENU, Error>，用 ? 直接解包
-        let menu = unsafe { CreatePopupMenu() }
-            .map_err(|e| format!("CreatePopupMenu failed: {}", e))?;
+        // 诊断日志：记录 HMENU 句柄值，便于追踪
+        log::info!("[CTX_MENU] Creating popup menu");
+        let menu = unsafe { CreatePopupMenu() }.map_err(|e| {
+            log::error!("[CTX_MENU] CreatePopupMenu failed: {}", e);
+            format!("CreatePopupMenu failed: {}", e)
+        })?;
+        log::info!("[CTX_MENU] Popup menu created: HMENU={:?}", menu);
 
         // 7. 填充菜单项
         // windows 0.52 中 CMF_NORMAL 是 pub const CMF_NORMAL: u32，直接传值
+        // 诊断日志：QueryContextMenu 失败意味着 shell 扩展注册时失败或路径不可读
+        log::info!("[CTX_MENU] Calling QueryContextMenu");
         unsafe {
             ctx_menu
                 .QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL)
-                .map_err(|e| format!("QueryContextMenu failed: {}", e))?;
+                .map_err(|e| {
+                    log::error!("[CTX_MENU] QueryContextMenu failed: {}", e);
+                    format!("QueryContextMenu failed: {}", e)
+                })?;
         }
+        log::info!("[CTX_MENU] QueryContextMenu succeeded");
 
         // 8. 弹出菜单（设置前置窗口确保 Z-order 正确）
         // windows 0.52 中 TrackPopupMenuEx 的 uflags 参数是 u32，
         // 而 TPM_* 常量是 TRACK_POPUP_MENU_FLAGS 类型（#[repr(transparent)] pub struct(pub u32)），
         // 用 .0 取底层 u32 后按位或组合
+        // 诊断日志：记录弹出坐标。如果菜单"无反应"是出现在这里，说明菜单没显示
+        log::info!("[CTX_MENU] Calling TrackPopupMenuEx at ({}, {})", x, y);
         let cmd = unsafe {
             SetForegroundWindow(hwnd);
             TrackPopupMenuEx(
@@ -123,9 +190,12 @@ fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), Stri
                 None,
             )
         };
+        log::info!("[CTX_MENU] TrackPopupMenuEx returned: cmd={}", cmd.0);
 
         // 9. 销毁菜单句柄
+        // 诊断日志：菜单销毁前的最终记录点
         unsafe { DestroyMenu(menu).ok(); }
+        log::info!("[CTX_MENU] Menu destroyed");
 
         // 10. 用户选中某项则执行命令
         // TPM_RETURNCMD 模式下 TrackPopupMenuEx 返回的 cmd 是从 QueryContextMenu 时
@@ -133,6 +203,8 @@ fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), Stri
         // IContextMenu3::InvokeCommand 时，lpVerb 传的是 MAKEINTRESOURCE 形式的 verb
         // 偏移（即 cmd - idFirst），这是 Windows shell context menu 的标准调用约定。
         if cmd.0 != 0 {
+            // 诊断日志：用户确实选了某项，准备执行
+            log::info!("[CTX_MENU] User selected menu item, invoking command");
             // 因为 QueryContextMenu 时 idFirst=1，cmd 减 1 才是 verb index
             let verb_index: i32 = cmd.0 - 1;
             // windows crate 0.52 中 CMINVOKECOMMANDINFO 的 lpVerb 字段类型是 PCSTR
@@ -161,16 +233,26 @@ fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), Stri
             };
             // IContextMenu3::InvokeCommand 接受 *const CMINVOKECOMMANDINFO 指针
             unsafe {
-                ctx_menu
-                    .InvokeCommand(&invoke)
-                    .map_err(|e| format!("InvokeCommand failed: {}", e))?;
+                ctx_menu.InvokeCommand(&invoke).map_err(|e| {
+                    log::error!("[CTX_MENU] InvokeCommand failed: {}", e);
+                    format!("InvokeCommand failed: {}", e)
+                })?;
             }
+            log::info!("[CTX_MENU] Command invoked successfully");
+        } else {
+            // 诊断日志：cmd=0 通常意味着用户按 Esc 或点击菜单外区域关闭菜单
+            log::info!("[CTX_MENU] User dismissed menu (cmd=0)");
         }
 
         Ok(())
     })();
 
     // 11. 反初始化 COM
+    // 诊断日志：COM 释放前的最终状态记录（result 是 Ok/Err）
+    log::info!(
+        "[CTX_MENU] About to CoUninitialize, inner result: {:?}",
+        result.as_ref().map(|_| "ok").map_err(|e| e.as_str())
+    );
     unsafe { CoUninitialize(); }
     result
 }

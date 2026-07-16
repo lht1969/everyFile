@@ -115,6 +115,8 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   const handleContextMenu = (e: React.MouseEvent, path: string) => {
     // 阻止浏览器/WebView 默认菜单
     e.preventDefault();
+    // 诊断日志：确认右键事件是否触发、坐标、窗口位置（用于定位"无反应"根因）
+    console.log('[CTX_MENU] handleContextMenu called, path:', path, 'clientX:', e.clientX, 'clientY:', e.clientY, 'window.screenX:', window.screenX, 'window.screenY:', window.screenY);
     setShowTooltip(false);
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
@@ -124,11 +126,20 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
     // Tauri WebView2 顶层窗口的 window.screenX/Y 即窗口在屏幕上的位置
     const screenX = e.clientX + (window.screenX || 0);
     const screenY = e.clientY + (window.screenY || 0);
+    // 诊断日志：打印即将发送到 Rust 端的最终屏幕坐标
+    console.log('[CTX_MENU] invoking show_context_menu with screenX:', screenX, 'screenY:', screenY);
     // 调用 Rust 端 show_context_menu，弹出系统 Shell 菜单
     // 系统菜单会自动显示"打开/打开方式/属性/删除到回收站"等所有原生项
-    invoke('show_context_menu', { path, screenX, screenY }).catch(err => {
-      console.error('Failed to show context menu:', err);
-    });
+    invoke('show_context_menu', { path, screenX, screenY })
+      .then(ret => {
+        // 诊断日志：Rust 端正常返回
+        console.log('[CTX_MENU] show_context_menu returned successfully:', ret);
+      })
+      .catch(err => {
+        // 诊断日志：Rust 端失败，打印错误类型/消息/堆栈
+        console.error('[CTX_MENU] show_context_menu FAILED:', err);
+        console.error('[CTX_MENU] error type:', typeof err, 'message:', err?.message, 'stack:', err?.stack);
+      });
   };
 
   const handleMouseEnter = (e: React.MouseEvent, index: number, data: SearchResult) => {
