@@ -337,12 +337,16 @@ fn main() {
                 // 释放卷管理器锁
                 drop(volume_manager);
 
+                // Channel to signal when first full scan result arrives
+                let (full_scan_done_tx, full_scan_done_rx) = tokio::sync::watch::channel(false);
+
                 // Spawn USN response handler thread (admin only)
                 if let Some(ref usn) = usn_manager {
                     let resp_rx = usn.resp_rx_clone();
                     let vm_for_handler = vm.clone();
                     let handle_for_handler = handle.clone();
                     let rt_handle = tokio::runtime::Handle::current();
+                    let scan_done_tx = full_scan_done_tx;
 
                     std::thread::Builder::new()
                         .name("usn-response-handler".into())
@@ -353,16 +357,18 @@ fn main() {
                                     Ok(UsnResponse::FullScanResult {
                                         drive_letter,
                                         files,
+                                        path_table,
                                         ..
                                     }) => {
                                         let drive_string = format!("{}:", drive_letter);
                                         log::info!(
-                                            "[USN] Full scan result for {}: {} files",
+                                            "[USN] Full scan result for {}: {} files, {} paths",
                                             drive_string,
-                                            files.len()
+                                            files.len(),
+                                            path_table.len()
                                         );
                                         let mut vm = rt_handle.block_on(vm_for_handler.lock());
-                                        vm.apply_full_scan(&drive_string, files);
+                                        vm.apply_full_scan(&drive_string, files, path_table);
                                         let count = vm.get_file_count(&drive_string);
                                         drop(vm);
                                         let _ = handle_for_handler.emit(
@@ -372,6 +378,8 @@ fn main() {
                                                 "count": count
                                             }),
                                         );
+                                        // Signal polling task that full scan data is available
+                                        let _ = scan_done_tx.send(true);
                                     }
                                     Ok(UsnResponse::IncrementalResult {
                                         drive_letter,
@@ -432,10 +440,18 @@ fn main() {
                 if let Some(ref usn) = usn_manager {
                     let usn_clone = usn.clone();
                     let vm_clone_for_usn = vm.clone();
+                    let mut scan_done_rx = full_scan_done_rx;
 
                     tauri::async_runtime::spawn(async move {
-                        // 初始延迟：等待全量扫描完成后开始轮询
-                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        // 等待全量扫描完成后再开始轮询
+                        if !*scan_done_rx.borrow() {
+                            log::info!("[USN] Polling task waiting for full scan to complete...");
+                            while scan_done_rx.changed().await.is_ok() {
+                                if *scan_done_rx.borrow() {
+                                    break;
+                                }
+                            }
+                        }
                         log::info!("[USN] Polling task started");
 
                         loop {

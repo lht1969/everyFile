@@ -144,7 +144,7 @@ fn filetime_to_unix(ft: &FILETIME) -> i64 {
 ///
 /// # 返回
 /// - `Vec<(u64, i64)>`: 每个条目对应的 (文件大小, 修改时间戳)
-pub fn batch_metadata(entries: &[(Box<str>, bool)]) -> Vec<(u64, i64)> {
+pub fn batch_metadata(entries: &[(compact_str::CompactString, bool)]) -> Vec<(u64, i64)> {
     const CHUNK_SIZE: usize = 4096;
 
     // 并行分块处理：每块 4096 个文件

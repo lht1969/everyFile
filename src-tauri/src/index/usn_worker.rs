@@ -1,7 +1,8 @@
 use crate::index::lib as mft_lib;
 use crate::index::ntfs_mft;
+use crate::index::path_table::PathTable;
 use crate::index::usn_types::{UsnCommand, UsnResponse, UsnState, VolumeState};
-use crate::search::SearchResult;
+use crate::search::{FileEntry, SearchResult};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
@@ -270,6 +271,79 @@ fn resolve_path_from_batch(
     Some(path)
 }
 
+/// 从 dir_map 解析目录的完整路径
+///
+/// dir_map: record_number → (parent_record, dir_name)
+/// 从 target_record 开始向上遍历 parent 链，拼接所有目录名。
+///
+/// 返回值：如 "C:\Windows\System32"（不含末尾反斜杠）
+/// 如果 parent 链中有未知 record（不在 dir_map 中），返回 None
+///
+/// 注意：不跳过 $-前缀目录名，让它们出现在路径中。
+/// $-前缀路径会在 callback 中被后续过滤（跳过路径中包含 $-前缀组件的条目）。
+/// 这与旧代码（records_by_number 包含所有记录）的行为一致。
+fn resolve_dir_path(
+    target_record: u64,
+    dir_map: &HashMap<u64, (u64, CompactString)>,
+    drive_letter: char,
+) -> Option<CompactString> {
+    // record 0 无效
+    if target_record == 0 {
+        return None;
+    }
+    // record 5 是 NTFS 卷根目录，其 name 通常是 "."（被跳过，不会加入 components）
+    // 直接返回 "X:"（仅盘符），调用方会拼接 "\" + name 得到 "X:\name"
+    if target_record == 5 {
+        return Some(CompactString::from(format!("{}:", drive_letter)));
+    }
+
+    let mut components: Vec<&CompactString> = Vec::with_capacity(16);
+    let mut cur = target_record;
+    for _ in 0..64 {
+        // 防止循环引用
+        match dir_map.get(&cur) {
+            Some((parent, name)) => {
+                // 跳过 NTFS 虚拟条目 (. 和 ..)
+                // 注意：不跳过 $-前缀目录，让它们出现在路径中，后续统一过滤
+                if !name.is_empty() && name != "." && name != ".." {
+                    components.push(name);
+                }
+                // 到达根目录或循环（record 5 的 parent 通常为自身或 0）
+                if *parent == cur || *parent == 0 {
+                    break;
+                }
+                cur = *parent;
+            }
+            None => {
+                // parent 未知，路径解析失败
+                return None;
+            }
+        }
+    }
+
+    if components.is_empty() {
+        return None;
+    }
+
+    components.reverse();
+
+    // 拼接路径：C:\dir1\dir2
+    let total_len: usize = components.iter().map(|c| c.len()).sum::<usize>()
+        + components.len()  // 分隔符
+        + 4;                // "X:\" 前缀
+    let mut path = String::with_capacity(total_len);
+    path.push(drive_letter);
+    path.push(':');
+    path.push('\\');
+    for (i, comp) in components.iter().enumerate() {
+        if i > 0 {
+            path.push('\\');
+        }
+        path.push_str(comp);
+    }
+    Some(CompactString::from(path))
+}
+
 pub fn spawn_usn_worker(
     cmd_rx: Receiver<UsnCommand>,
     resp_tx: Sender<UsnResponse>,
@@ -330,190 +404,299 @@ fn handle_full_scan(
     log::info!("[USN] Full scan starting for drive {}", drive_letter);
     let scan_start = Instant::now();
 
-    // Phase 1a: Use MftScanner to read raw MFT records directly from disk
-    // This bypasses FSCTL_ENUM_USN_DATA and reads data runs directly — much faster
+    // 流式扫描 + 目录优先策略
+    //
+    // 内存优势（对比旧方案）：
+    // - 旧方案：all_records(260MB) + records_by_number(借用) + entries(180MB) = 440MB 峰值
+    // - 新方案：dir_map(18MB) + files(106MB) + path_table(40MB) + deferred(<1MB) = 164MB 峰值
+    // - 节省约 276MB
+    //
+    // 策略：
+    // 1. 流式读取 MFT 记录，不收集到 Vec（消除 all_records 260MB）
+    // 2. 目录立即加入 dir_map（仅 30万目录 × ~60字节 = 18MB）
+    // 3. 文件/目录立即通过 dir_map 解析路径，构建 FileEntry（消除 entries 180MB）
+    // 4. parent 未知的条目暂存到 deferred，扫描结束后统一处理
     let t0 = Instant::now();
     let volume_path = format!("\\\\.\\{}:", drive_letter);
 
-    let scan_output = match mft_lib::scan_volume(&volume_path, u64::MAX) {
-        Ok((output, _info)) => output,
+    /// deferred 条目：record_number, parent_record, name, is_dir, mtime, size
+    /// 用于暂存 parent 在扫描时还未加入 dir_map 的条目（通常 <1%）
+    struct DeferredEntry {
+        record_number: u64,
+        parent_record: u64,
+        name: CompactString,
+        is_dir: bool,
+        mtime: i64,
+        size: u64,
+    }
+
+    let mut dir_map: HashMap<u64, (u64, CompactString)> = HashMap::with_capacity(500_000);
+    let mut files: Vec<FileEntry> = Vec::with_capacity(2_000_000);
+    let mut path_table = PathTable::new();
+    let mut deferred: Vec<DeferredEntry> = Vec::new();
+    // 暂存 pending_sizes（$ATTRIBUTE_LIST 扩展记录的真实 size）
+    // 在 Phase 2 之后统一更新，确保 deferred 条目也被覆盖
+    // Err 分支会提前 return，所以只有 Ok 分支会赋值，无需初始化为 None
+    let pending_sizes_opt: Option<std::collections::HashMap<u64, u64>>;
+
+    const RECYCLE_BIN: &str = "$recycle.bin";
+    const SYSTEM_VOL_INFO: &str = "system volume information";
+
+    // 路径过滤检查的闭包，避免重复代码
+    // 返回 true 表示应跳过该路径
+    let should_skip_path = |path_str: &str| -> bool {
+        path_str.split('\\').any(|comp| {
+            let sl = comp.to_lowercase();
+            sl == RECYCLE_BIN || (!include_system_files && sl == SYSTEM_VOL_INFO)
+        })
+    };
+
+    let stats = match mft_lib::scan_volume_streaming(&volume_path, u64::MAX, &mut |r| {
+        // 跳过系统记录 (MFT 前 5 条: $MFT, $MFTMirr, $LogFile, $Volume, $AttrDef)
+        if r.record_number < 5 {
+            return;
+        }
+        // 跳过无名/占位记录 (<Record#N>, <no name>)
+        if r.name.starts_with('<') {
+            return;
+        }
+
+        let record_number = r.record_number;
+        let parent_record = r.parent_record;
+        let name = CompactString::from(r.name.as_str());
+        let is_dir = r.is_directory;
+        let mtime = ntfs_time_to_unix(r.mtime);
+        let size = r.size;
+
+        // 目录：必须在所有过滤之前加入 dir_map！
+        // 原因：即使目录被 hidden/system/$-前缀过滤，它的子文件路径解析仍然需要
+        // 通过 dir_map 查找 parent 链。如果被过滤的目录不在 dir_map 中，
+        // 会导致 parent 链中断，所有子文件路径解析失败，被错误跳过。
+        // 这就是之前少了100万文件的根本原因。
+        if is_dir {
+            dir_map.insert(record_number, (parent_record, name.clone()));
+        }
+
+        // 以下过滤仅影响是否构建 FileEntry，不影响 dir_map
+        // 跳过 $-前缀的 NTFS 元数据文件 ($Bitmap, $Boot 等)
+        if r.name.starts_with('$') {
+            return;
+        }
+        // 跳过 NTFS 虚拟条目 (. 和 ..)
+        if r.name == "." || r.name == ".." {
+            return;
+        }
+
+        // hidden/system 属性检查
+        if !include_hidden_files && (r.attributes & 0x02) != 0 {
+            return;
+        }
+        if !include_system_files && (r.attributes & 0x04) != 0 {
+            return;
+        }
+
+        // 解析完整路径
+        // 通过 parent_record 在 dir_map 中查找父目录链
+        // 分离 parent_path 和完整路径：
+        // - parent_path_id 由 intern(parent_path) 得到，用于 FileEntry.path_id
+        // - 完整路径仅用于过滤检查和目录自身注册
+        // 这样 PathTable 只存储目录路径（~40万），避免为 221万文件存储完整路径
+        let parent_path_id: u32;
+        // 完整路径，用于过滤检查和目录自身注册
+        let path_str: CompactString = if parent_record == 0 || parent_record == record_number {
+            // parent 为 0 或自身：根目录级别的条目
+            // 先 intern 根目录路径 "X:\" 得到 parent_path_id
+            let mut root = String::with_capacity(3);
+            root.push(drive_letter);
+            root.push(':');
+            root.push('\\');
+            parent_path_id = path_table.intern(&root);
+            // 构建 "X:\name" 形式用于过滤检查
+            let mut path = String::with_capacity(root.len() + name.len());
+            path.push_str(&root);
+            path.push_str(&name);
+            CompactString::from(path)
+        } else {
+            // 解析父目录路径
+            match resolve_dir_path(parent_record, &dir_map, drive_letter) {
+                Some(parent_path) => {
+                    // intern 父目录路径得到 parent_path_id（FileEntry 使用）
+                    parent_path_id = path_table.intern(&parent_path);
+                    // 构建完整路径用于过滤检查
+                    let mut path = String::with_capacity(parent_path.len() + 1 + name.len());
+                    path.push_str(&parent_path);
+                    path.push('\\');
+                    path.push_str(&name);
+                    CompactString::from(path)
+                }
+                None => {
+                    // parent 未知，暂存到 deferred
+                    // 扫描结束后 dir_map 完整，再统一处理
+                    deferred.push(DeferredEntry {
+                        record_number,
+                        parent_record,
+                        name,
+                        is_dir,
+                        mtime,
+                        size,
+                    });
+                    return;
+                }
+            }
+        };
+
+        // 路径过滤：跳过 $recycle.bin 和 system volume information
+        if should_skip_path(&path_str) {
+            return;
+        }
+
+        // 跳过路径中包含 $-前缀组件的条目（NTFS 特殊目录）
+        if path_str.split('\\').any(|comp| comp.starts_with('$') && comp.len() > 1) {
+            return;
+        }
+
+        // 对于目录，注册自身路径到 PathTable（供子条目 resolve_dir_path 使用）
+        // 文件不需要注册，因为 FileEntry.path_id 指向父目录
+        if is_dir {
+            path_table.intern(&path_str);
+        }
+
+        // 构建 FileEntry 并推入 files
+        // path_id 指向父目录，resolve_file_path(path_id, name) 可还原完整路径
+        files.push(FileEntry::new(
+            name,
+            parent_path_id,
+            size,
+            mtime,
+            record_number as u32,
+            is_dir,
+        ));
+    }) {
+        Ok((s, pending_sizes)) => {
+            // 暂存 pending_sizes，待 Phase 2（deferred 处理）结束后再更新
+            // 原因：deferred 条目在 Phase 2 才加入 files，此时更新会遗漏它们
+            pending_sizes_opt = Some(pending_sizes);
+            s
+        }
         Err(e) => {
-            log::warn!("[USN] MftScanner failed for {}: {}, falling back to FSCTL_ENUM_USN_DATA", drive_letter, e);
+            log::warn!(
+                "[USN] MftScanner streaming failed for {}: {}, falling back to FSCTL_ENUM_USN_DATA",
+                drive_letter, e
+            );
             handle_full_scan_legacy(
-                drive_letter, include_hidden_files, include_system_files,
-                volumes, last_usn_map, journal_id_map, resp_tx,
+                drive_letter,
+                include_hidden_files,
+                include_system_files,
+                volumes,
+                last_usn_map,
+                journal_id_map,
+                resp_tx,
             );
             return;
         }
     };
 
     log::info!(
-        "[USN] Phase 1a: MftScanner read {} records ({} files, {} dirs) for {} in {:?}",
-        scan_output.total_records, scan_output.files, scan_output.dirs,
-        drive_letter, t0.elapsed()
+        "[USN] Phase 1: Streamed {} records ({} files, {} dirs) for {} in {:?}, deferred={}",
+        stats.total_records, stats.files, stats.dirs,
+        drive_letter, t0.elapsed(), deferred.len()
     );
 
-    // Phase 1b: Resolve full paths from parent_record chain
+    // Phase 2: 处理 deferred 条目（此时 dir_map 已包含所有目录）
     let t1 = Instant::now();
+    let deferred_count = deferred.len();
+    for entry in deferred.drain(..) {
+        // 分离 parent_path 和完整路径（与 Phase 1 callback 相同的逻辑）
+        let parent_path_id: u32;
+        let path_str: CompactString = if entry.parent_record == 0 || entry.parent_record == entry.record_number {
+            let mut root = String::with_capacity(3);
+            root.push(drive_letter);
+            root.push(':');
+            root.push('\\');
+            parent_path_id = path_table.intern(&root);
+            let mut path = String::with_capacity(root.len() + entry.name.len());
+            path.push_str(&root);
+            path.push_str(&entry.name);
+            CompactString::from(path)
+        } else {
+            match resolve_dir_path(entry.parent_record, &dir_map, drive_letter) {
+                Some(parent_path) => {
+                    parent_path_id = path_table.intern(&parent_path);
+                    let mut path = String::with_capacity(parent_path.len() + 1 + entry.name.len());
+                    path.push_str(&parent_path);
+                    path.push('\\');
+                    path.push_str(&entry.name);
+                    CompactString::from(path)
+                }
+                None => {
+                    // parent 仍然未知（可能是孤儿条目），跳过
+                    continue;
+                }
+            }
+        };
 
-    // Build record_number → (parent_record, name, is_dir, size, mtime, attributes) map
-    // Use a HashMap for memory-efficient sparse storage (MFT record numbers can be sparse)
-    let mut records_by_number: std::collections::HashMap<u64, (u64, &str, bool, u64, Option<u64>, u32)> =
-        std::collections::HashMap::with_capacity(scan_output.all_records.len());
-    for r in &scan_output.all_records {
-        records_by_number.insert(r.record_number, (
-            r.parent_record,
-            &r.name,
-            r.is_directory,
-            r.size,
-            r.mtime,
-            r.attributes,
+        if should_skip_path(&path_str) {
+            continue;
+        }
+        if path_str.split('\\').any(|comp| comp.starts_with('$') && comp.len() > 1) {
+            continue;
+        }
+
+        // 目录注册自身路径，文件不需要
+        if entry.is_dir {
+            path_table.intern(&path_str);
+        }
+
+        // FileEntry.path_id 指向父目录
+        files.push(FileEntry::new(
+            entry.name,
+            parent_path_id,
+            entry.size,
+            entry.mtime,
+            entry.record_number as u32,
+            entry.is_dir,
         ));
     }
 
-    // Resolve paths in parallel using rayon
-
-    const RECYCLE_BIN: &str = "$recycle.bin";
-    const SYSTEM_VOL_INFO: &str = "system volume information";
-
-    let entries: Vec<(u64, CompactString, CompactString, bool, i64, u64)> = scan_output
-        .all_records
-        .par_iter()
-        .filter_map(|r| {
-            let record_number = r.record_number;
-
-            // Skip root and metadata records
-            if record_number < 5 {
-                return None;
-            }
-
-            // Skip unnamed / placeholder records (<Record#N>, <no name>)
-            if r.name.starts_with('<') {
-                return None;
-            }
-
-            // Skip $-prefixed NTFS metadata files
-            if r.name.starts_with('$') {
-                return None;
-            }
-
-            // Skip NTFS virtual entries (. and ..)
-            if r.name == "." || r.name == ".." {
-                return None;
-            }
-
-            // Hidden check
-            if !include_hidden_files && (r.attributes & 0x02) != 0 {
-                return None;
-            }
-            // System check
-            if !include_system_files && (r.attributes & 0x04) != 0 {
-                return None;
-            }
-
-            // Resolve path via parent chain — O(depth) with HashMap lookups
-            let mut parts: Vec<&str> = Vec::with_capacity(16);
-            parts.push(&r.name);
-            let mut cur = record_number;
-            for _ in 0..50 {
-                let parent = records_by_number.get(&cur)
-                    .map(|(p, _, _, _, _, _)| *p);
-                match parent {
-                    Some(p) if p != cur && p != 0 => {
-                        cur = p;
-                        if let Some((_, name, _, _, _, _)) = records_by_number.get(&cur) {
-                            // Skip NTFS virtual entries (. and ..) to avoid paths like C:\.\windows
-                            if *name == "." || *name == ".." {
-                                continue;
-                            }
-                            parts.push(name);
-                        } else {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-            parts.reverse();
-
-            // Skip paths containing $-prefixed components (NTFS special directories)
-            if parts.iter().any(|p| p.starts_with('$')) {
-                return None;
-            }
-
-            // Build path string: "C:\folder\subfolder\file.txt"
-            let estimated_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
-                + parts.len()  // separators
-                + 4;            // "X:\" prefix
-            let path_str: CompactString = {
-                let mut path = String::with_capacity(estimated_len);
-                path.push(drive_letter);
-                path.push(':');
-                path.push('\\');
-                for (i, part) in parts.iter().enumerate() {
-                    if i > 0 {
-                        path.push('\\');
-                    }
-                    path.push_str(part);
-                }
-                CompactString::from(path)
-            };
-
-            // Path component checks
-            let skip = path_str.split('\\').any(|comp| {
-                let sl = comp.to_lowercase();
-                sl == RECYCLE_BIN || (!include_system_files && sl == SYSTEM_VOL_INFO)
-            });
-            if skip {
-                return None;
-            }
-
-            let name_str: CompactString = CompactString::from(r.name.as_str());
-            let is_dir = r.is_directory;
-            let size = r.size;
-            let modified_time = ntfs_time_to_unix(r.mtime);
-            let file_id = r.record_number;
-
-            Some((file_id, name_str, path_str, is_dir, modified_time, size))
-        })
-        .collect();
-
     log::info!(
-        "[USN] Phase 1b: Resolved {} file paths for {} in {:?}",
-        entries.len(), drive_letter, t1.elapsed()
+        "[USN] Phase 2: Resolved {} deferred entries in {:?}, total {} files (path_table size={})",
+        deferred_count, t1.elapsed(), files.len(), path_table.len()
     );
 
-    // Free records_by_number and scan_output — no longer needed
-    // Drop records_by_number first since it borrows &str from scan_output
-    drop(records_by_number);
-    drop(scan_output);
-
-    // Phase 2: Build SearchResult entries (size already from MFT, no need for batch_metadata)
-    let t2 = Instant::now();
-    let files: Vec<SearchResult> = entries
-        .into_iter()
-        .map(|(fid, name_str, path_str, is_dir, modified_time, size)| {
-            SearchResult {
-                file_id: fid,
-                name: name_str,
-                path: path_str,
-                size,
-                modified_time,
-                is_directory: is_dir,
+    // Phase 3: 用 pending_sizes 更新 files 中 size=0 的 FileEntry
+    // 必须在 Phase 2 之后执行，因为 deferred 条目在 Phase 2 才加入 files
+    // pending_sizes: record_number → real_size（来自 $ATTRIBUTE_LIST 扩展记录）
+    if let Some(ref pending_sizes) = pending_sizes_opt {
+        if !pending_sizes.is_empty() {
+            let mut updated_count = 0usize;
+            let mut zero_size_count = 0usize;
+            for f in files.iter_mut() {
+                if f.size == 0 {
+                    zero_size_count += 1;
+                    // file_id 就是 MFT record_number
+                    if let Some(&real_size) = pending_sizes.get(&(f.file_id as u64)) {
+                        f.size = real_size;
+                        updated_count += 1;
+                    }
+                }
             }
-        })
-        .collect();
+            log::info!(
+                "[USN] Phase 3: Updated {} file sizes via pending_ext ({} resolved, {} files had size=0)",
+                updated_count, pending_sizes.len(), zero_size_count
+            );
+        }
+    }
 
-    log::info!(
-        "[USN] Phase 2: Built {} SearchResult entries in {:?}",
-        files.len(), t2.elapsed()
-    );
+    // 释放 dir_map 和 deferred（不再需要）
+    drop(dir_map);
+    drop(deferred);
+
     log::info!(
         "[USN] Full scan complete for drive {}: {} files, total {:?}",
         drive_letter, files.len(), scan_start.elapsed()
     );
 
-    // Create or verify USN journal (required for incremental updates)
+    // 创建或验证 USN journal（增量更新所需）
     let volume = match Volume::from_drive_letter(drive_letter) {
         Ok(v) => v,
         Err(e) => {
@@ -580,6 +763,7 @@ fn handle_full_scan(
     let _ = resp_tx.send(UsnResponse::FullScanResult {
         drive_letter,
         files,
+        path_table,
         last_usn,
         journal_id,
     });
@@ -795,34 +979,63 @@ fn handle_full_scan_legacy(
     // 优化收益：每个文件节省一次 timestamp 字段的传输，
     // 实际节省效果取决于 NTFS 元数据缓存命中率
     let t2 = Instant::now();
-    let path_isdir: Vec<(Box<str>, bool)> = entries
+    let path_isdir: Vec<(CompactString, bool)> = entries
         .iter()
-        .map(|(_, _, path, is_dir, _)| (Box::from(path.as_str()), *is_dir))
+        .map(|(_, _, path, is_dir, _)| (path.clone(), *is_dir))
         .collect();
     let sizes = ntfs_mft::batch_metadata(&path_isdir);
     drop(path_isdir); // 释放临时内存
 
-    let files: Vec<SearchResult> = entries
+    // 并行查询 size 和 modified_time，准备 FileEntry 所需数据
+    // PathTable::intern 需要可变借用，无法在 rayon 并行闭包中使用，
+    // 因此先并行收集 (name, path, fid, is_dir, size, modified_time)，
+    // 再在顺序循环中完成 path 注册和 FileEntry 构建
+    let resolved: Vec<(CompactString, CompactString, u64, bool, u64, i64)> = entries
         .par_iter()
         .enumerate()
         .map(|(i, (fid, name_str, path_str, is_dir, timestamp))| {
             let (size, fallback_modified) = sizes[i];
             // 优先使用 MFT 时间戳，回退到 GetFileAttributesExW 返回的 modified_time
             let modified_time = if *timestamp > 0 { *timestamp } else { fallback_modified };
-            SearchResult {
-                file_id: *fid,
-                name: name_str.clone(),
-                path: path_str.clone(),
-                size,
-                modified_time,
-                is_directory: *is_dir,
+            (name_str.clone(), path_str.clone(), *fid, *is_dir, size, modified_time)
+        })
+        .collect();
+
+    // 顺序构建 FileEntry + PathTable（path_table.intern 需要顺序执行以保证 path_id 一致性）
+    // 优化：FileEntry.path_id 指向父目录，而非完整文件路径
+    // 这样 PathTable 只存储目录路径（~40万），避免为 221万文件存储完整路径字符串
+    let mut path_table = PathTable::new();
+    let files: Vec<FileEntry> = resolved
+        .into_iter()
+        .map(|(name_str, path_str, fid, is_dir, size, modified_time)| {
+            // 从完整路径分离出父目录路径
+            // path_str 格式："X:\dir\...\filename" 或 "X:\name"
+            let parent_path_id = if let Some(pos) = path_str.rfind('\\') {
+                if pos <= 2 {
+                    // "X:\file" → parent = "X:\"
+                    path_table.intern(&path_str[..pos + 1])
+                } else {
+                    // "X:\dir\file" → parent = "X:\dir"
+                    path_table.intern(&path_str[..pos])
+                }
+            } else {
+                // 异常情况：没有反斜杠，用根目录占位
+                path_table.intern("X:\\")
+            };
+
+            // 对于目录，注册自身路径供子条目使用
+            if is_dir {
+                path_table.intern(&path_str);
             }
+
+            // FileEntry::new 内部会将 modified_time (i64) 截断为 i32
+            FileEntry::new(name_str, parent_path_id, size, modified_time, fid as u32, is_dir)
         })
         .collect();
 
     log::info!(
-        "[USN] Phase 2: Batch size lookup for {} files in {:?}",
-        files.len(), t2.elapsed()
+        "[USN] Phase 2: Batch size lookup + FileEntry build for {} files (path_table size={}) in {:?}",
+        files.len(), path_table.len(), t2.elapsed()
     );
     log::info!(
         "[USN] Full scan complete for drive {}: {} files, total {:?}",
@@ -886,6 +1099,7 @@ fn handle_full_scan_legacy(
     let _ = resp_tx.send(UsnResponse::FullScanResult {
         drive_letter,
         files,
+        path_table,
         last_usn,
         journal_id,
     });
@@ -1141,7 +1355,7 @@ fn handle_poll_changes(
                     is_directory: entry.is_dir(),
                 });
             added.push(SearchResult {
-                file_id: fid,
+                file_id: fid as u32,
                 name,
                 path: path_str,
                 size: meta.size,
@@ -1184,7 +1398,7 @@ fn handle_poll_changes(
                     is_directory: entry.is_dir(),
                 });
             updated.push((fid, SearchResult {
-                file_id: fid,
+                file_id: fid as u32,
                 name,
                 path: path_str,
                 size: meta.size,

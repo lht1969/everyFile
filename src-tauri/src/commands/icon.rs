@@ -7,8 +7,15 @@ use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+/// 图标缓存最大条目数
+/// 每个图标 BMP base64 约 1-2 KB，100 条约 200 KB
+/// 扩展名种类通常 <100，足够覆盖常见场景
+const ICON_CACHE_MAX_ENTRIES: usize = 100;
+
 lazy_static::lazy_static! {
     static ref ICON_CACHE: RwLock<HashMap<String, String>> = RwLock::new(HashMap::new());
+    /// 访问顺序记录（LRU）：最久未访问的在前，最近访问的在后
+    static ref ICON_ACCESS_ORDER: RwLock<Vec<String>> = RwLock::new(Vec::new());
 }
 
 #[tauri::command]
@@ -26,7 +33,15 @@ pub async fn get_file_icon(file_path: String, is_directory: bool) -> Result<Stri
     {
         let cache = ICON_CACHE.read().map_err(|e| e.to_string())?;
         if let Some(icon) = cache.get(&key) {
-            return Ok(icon.clone());
+            // 先 clone 再释放读锁，避免借用冲突
+            let icon_clone = icon.clone();
+            drop(cache);
+            // 命中缓存时更新访问顺序（移到末尾）
+            if let Ok(mut order) = ICON_ACCESS_ORDER.write() {
+                order.retain(|k| k != &key);
+                order.push(key.clone());
+            }
+            return Ok(icon_clone);
         }
     }
 
@@ -37,7 +52,20 @@ pub async fn get_file_icon(file_path: String, is_directory: bool) -> Result<Stri
 
     {
         let mut cache = ICON_CACHE.write().map_err(|e| e.to_string())?;
-        cache.insert(key, icon_data.clone());
+        let mut order = ICON_ACCESS_ORDER.write().map_err(|e| e.to_string())?;
+
+        // LRU 淘汰：超过最大条目数时移除最久未访问的
+        if cache.len() >= ICON_CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+            if let Some(evict_key) = order.first().cloned() {
+                cache.remove(&evict_key);
+                order.remove(0);
+            }
+        }
+
+        cache.insert(key.clone(), icon_data.clone());
+        // 更新访问顺序
+        order.retain(|k| k != &key);
+        order.push(key);
     }
 
     Ok(icon_data)

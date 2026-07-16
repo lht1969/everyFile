@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// 引入 FileEntry 和 PathTable 用于全量扫描结果传输
+use crate::search::FileEntry;
+use crate::index::path_table::PathTable;
+
 /// Command sent to the USN worker thread
 #[derive(Debug)]
 pub enum UsnCommand {
@@ -22,12 +26,15 @@ pub enum UsnCommand {
 }
 
 /// Response from the USN worker thread
-#[derive(Debug)]
 pub enum UsnResponse {
     /// Full index built from MFT
+    /// 携带 FileEntry（紧凑存储）和 PathTable（路径前缀压缩表）
     FullScanResult {
         drive_letter: char,
-        files: Vec<crate::search::SearchResult>,
+        /// 紧凑存储的文件条目列表（用 path_id 替代完整路径）
+        files: Vec<FileEntry>,
+        /// 路径前缀压缩表，用于按需解析完整路径
+        path_table: PathTable,
         #[allow(dead_code)]
         last_usn: i64,
         #[allow(dead_code)]

@@ -5,10 +5,15 @@ use regex::Regex;
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub keywords: Vec<String>,
+    /// 预小写化的 keywords，避免在 matches_entry 中为每个文件重复 to_lowercase
+    /// 在 parse() 时一次性计算，221万文件搜索时节省 221万 × k 次字符串分配
+    keywords_lower: Vec<String>,
     pub glob_patterns: Vec<Pattern>,
     pub size_filter: Option<SizeFilter>,
     pub date_filter: Option<DateFilter>,
     pub path_filter: Option<String>,
+    /// 预小写化的 path_filter，避免在 matches_entry 中为每个文件重复 to_lowercase
+    path_filter_lower: Option<String>,
     pub path_filter_dir_only: bool,
     pub regex_pattern: Option<Regex>,
 }
@@ -109,17 +114,25 @@ impl SearchQuery {
             i += 1;
         }
 
+        // 预小写化 keywords 和 path_filter，避免在 matches_entry 中为每个文件重复计算
+        // 对于 221万文件的搜索，这 saves 221万 × (k+1) 次字符串分配
+        let keywords_lower = keywords.iter().map(|k| k.to_lowercase()).collect();
+        let path_filter_lower = path_filter.as_ref().map(|p| p.to_lowercase());
+
         Self {
             keywords,
+            keywords_lower,
             glob_patterns,
             size_filter,
             date_filter,
             path_filter,
+            path_filter_lower,
             path_filter_dir_only,
             regex_pattern,
         }
     }
 
+    #[allow(dead_code)]
     pub fn matches(&self, file: &crate::search::SearchResult) -> bool {
         if !self.keywords.is_empty() {
             let name_lower = file.name.to_lowercase();
@@ -162,6 +175,67 @@ impl SearchQuery {
         }
         if let Some(ref regex_pattern) = self.regex_pattern {
             if !regex_pattern.is_match(&file.name) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 针对 FileEntry 的匹配函数
+    ///
+    /// 与 matches() 的区别：
+    /// - FileEntry 没有 path 字段，需通过 full_path 参数传入解析后的路径
+    /// - 当查询不含 path_filter 时，full_path 可传空字符串以跳过路径检查
+    /// - modified_time 从 i32 提升为 i64 用于比较
+    ///
+    /// 性能优化：使用预小写化的 keywords_lower 和 path_filter_lower，
+    /// 避免在 221万文件循环中为每个文件重复 to_lowercase 关键词
+    pub fn matches_entry(&self, entry: &crate::search::FileEntry, full_path: &str) -> bool {
+        if !self.keywords_lower.is_empty() {
+            // 注意：name 仍需 per-file to_lowercase，但 keywords 已预计算
+            // 使用 to_ascii_lowercase 比 to_lowercase 更快（仅处理 ASCII，跳过 Unicode case folding）
+            // 对于中文文件名无影响（中文无大小写区分）
+            let name_lower = entry.name.to_ascii_lowercase();
+            if !self.keywords_lower.iter().all(|kw| name_lower.contains(kw)) {
+                return false;
+            }
+        }
+        if !self.glob_patterns.is_empty() {
+            if !self.glob_patterns.iter().all(|p| p.matches_path(std::path::Path::new(entry.name.as_str()))) {
+                return false;
+            }
+        }
+        if let Some(ref size_filter) = self.size_filter {
+            if !size_filter.matches(entry.size) {
+                return false;
+            }
+        }
+        if let Some(ref date_filter) = self.date_filter {
+            if let Some(ref target_date) = date_filter.date {
+                let file_ts = entry.modified_time as i64;
+                let target_ts = target_date.timestamp();
+                let target_end_ts = target_date.timestamp() + 86399;
+                let matches = match date_filter.operator {
+                    DateOperator::Equal => file_ts >= target_ts && file_ts <= target_end_ts,
+                    DateOperator::GreaterThan => file_ts > target_end_ts,
+                    DateOperator::LessThan => file_ts < target_ts,
+                    DateOperator::GreaterOrEqual => file_ts >= target_ts,
+                    DateOperator::LessOrEqual => file_ts <= target_end_ts,
+                };
+                if !matches { return false; }
+            }
+        }
+        // 使用预小写化的 path_filter_lower，避免 per-file to_lowercase
+        if let Some(ref path_filter_lower) = self.path_filter_lower {
+            if !full_path.to_ascii_lowercase().contains(path_filter_lower) {
+                return false;
+            }
+        }
+        if self.path_filter_dir_only && !entry.is_directory {
+            return false;
+        }
+        if let Some(ref regex_pattern) = self.regex_pattern {
+            if !regex_pattern.is_match(&entry.name) {
                 return false;
             }
         }

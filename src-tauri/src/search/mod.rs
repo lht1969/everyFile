@@ -4,14 +4,39 @@ use chrono::{DateTime, TimeZone, Utc};
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
+/// 对外传输的搜索结果（序列化给前端）
+///
+/// 保持完整 path 字段以兼容前端接口。
+/// 内部存储使用 FileEntry（紧凑结构），返回前端时通过 PathTable 转换。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub file_id: u64,
     pub name: CompactString,
     pub path: CompactString,
     pub size: u64,
     pub modified_time: i64,
+    pub file_id: u32,
     pub is_directory: bool,
+}
+
+/// 内部紧凑存储的文件条目
+///
+/// 相比 SearchResult 的优化：
+/// 1. 用 path_id (u32, 4字节) 替代 path (CompactString, 24字节 + 堆分配 ~100字节)
+///    - 通过 PathTable 按需解析完整路径
+/// 2. modified_time 用 i32 (4字节) 替代 i64 (8字节)
+///    - i32 Unix 秒可覆盖到 2038 年，足够当前使用
+///
+/// 结构体大小对比：
+/// - SearchResult: 72 字节 + 路径堆分配 ~116 字节 = ~188 字节
+/// - FileEntry:    48 字节（无路径堆分配）
+/// - 节省约 74%
+pub struct FileEntry {
+    pub name: CompactString,       // 24 字节 (inline，短名称不分配)
+    pub size: u64,                 // 8 字节
+    pub path_id: u32,              // 4 字节 (PathTable 中的路径 ID)
+    pub file_id: u32,              // 4 字节 (MFT record number)
+    pub modified_time: i32,        // 4 字节 (Unix 秒)
+    pub is_directory: bool,        // 1 字节 + 3 字节 padding
 }
 
 impl SearchResult {
@@ -42,6 +67,43 @@ impl SearchResult {
     pub fn format_time_static(timestamp: i64) -> String {
         let dt: DateTime<Utc> = Utc.timestamp_opt(timestamp, 0).single().unwrap_or_default();
         dt.format("%Y/%m/%d %H:%M:%S").to_string()
+    }
+}
+
+impl FileEntry {
+    /// 从 FileEntry 和完整路径构建 SearchResult（用于返回前端）
+    ///
+    /// modified_time 从 i32 提升为 i64 以兼容前端接口
+    #[inline]
+    pub fn to_search_result(&self, full_path: CompactString) -> SearchResult {
+        SearchResult {
+            name: self.name.clone(),
+            path: full_path,
+            size: self.size,
+            modified_time: self.modified_time as i64,
+            file_id: self.file_id,
+            is_directory: self.is_directory,
+        }
+    }
+
+    /// 从 i64 时间戳创建 FileEntry（用于 USN worker 构建）
+    #[inline]
+    pub fn new(
+        name: CompactString,
+        path_id: u32,
+        size: u64,
+        modified_time: i64,
+        file_id: u32,
+        is_directory: bool,
+    ) -> Self {
+        Self {
+            name,
+            path_id,
+            size,
+            modified_time: modified_time as i32,
+            file_id,
+            is_directory,
+        }
     }
 }
 

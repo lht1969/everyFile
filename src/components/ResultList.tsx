@@ -195,38 +195,42 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
             return (
               <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)`, height: renderLen * ROW_HEIGHT }}>
                 {Array.from({ length: renderLen }, (_, i) => {
-                const globalIndex = startIndex + i;
-                const result = results[globalIndex - resultsOffset];
-                if (!result) {
+                  const globalIndex = startIndex + i;
+                  const result = results[globalIndex - resultsOffset];
+                  if (!result) {
+                    return (
+                      <div
+                        key={`placeholder-${globalIndex}`}
+                        className="result-row"
+                        style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
+                      />
+                    );
+                  }
                   return (
                     <div
-                      key={`placeholder-${globalIndex}`}
-                      className="result-row"
+                      // 用 globalIndex 配合 result.path 作为 key，确保唯一性
+                      // 原因：不同排序时相同 path 在 results 中可能重复出现（如某次 0-50 区间里有它，
+                      // 下次排序后还在 0-50 区间里），仅用 result.path 会导致 React 复用错误的 DOM 节点，
+                      // 表现为"某些行固定不跟着排序"（其实是 DOM 节点没被替换，只是 props 改了）
+                      key={`${globalIndex}-${result.path}`}
+                      className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
                       style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
-                    />
-                  );
-                }
-                return (
-                  <div
-                    key={result.path}
-                    className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
-                    style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
-                    onClick={() => handleRowClick(globalIndex)}
-                    onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
-                    onContextMenu={(e) => handleContextMenu(e, result.path, result.is_directory)}
-                    onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
-                    onMouseLeave={handleMouseLeave}
-                  >
-                    <div className="col-name">
-                      <FileIcon path={result.path} isDirectory={result.is_directory} />
-                      <span className="col-name-text" title={result.name}>{result.name}</span>
+                      onClick={() => handleRowClick(globalIndex)}
+                      onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
+                      onContextMenu={(e) => handleContextMenu(e, result.path, result.is_directory)}
+                      onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
+                      onMouseLeave={handleMouseLeave}
+                    >
+                      <div className="col-name">
+                        <FileIcon path={result.path} isDirectory={result.is_directory} />
+                        <span className="col-name-text" title={result.name}>{result.name}</span>
+                      </div>
+                      <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
+                      <div className="col-size">{formatSize(result.size)}</div>
+                      <div className="col-modified">{formatTime(result.modified_time)}</div>
                     </div>
-                    <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
-                    <div className="col-size">{formatSize(result.size)}</div>
-                    <div className="col-modified">{formatTime(result.modified_time)}</div>
-                  </div>
-                );
-              })}
+                  );
+                })}
               </div>
             );
           })()}

@@ -2,6 +2,7 @@ pub mod database;
 pub mod lib;
 pub mod monitor;
 pub mod ntfs_mft;
+pub mod path_table;
 pub mod usn_types;
 pub mod usn_worker;
 

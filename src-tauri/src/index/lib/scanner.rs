@@ -38,8 +38,27 @@ pub struct ScanResult {
     pub attributes: u32,
 }
 
+#[allow(dead_code)]
 pub struct ScanOutput {
     pub all_records: Vec<ScanResult>,
+    pub total_records: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub skip_no_signature: u64,
+    pub skip_fixup_fail: u64,
+    pub skip_inactive: u64,
+    pub total_ads: u64,
+    pub total_hard_links: u64,
+    pub no_timestamp: u64,
+}
+
+/// 流式扫描的统计信息（不包含 all_records，内存占用恒定）
+///
+/// 与 ScanOutput 的区别：
+/// - 不收集 all_records: Vec<ScanResult>，避免 ~260MB 内存峰值（221万文件场景）
+/// - 不处理 pending_ext（$ATTRIBUTE_LIST 扩展记录的 size 更新）
+///   影响范围：极少数 NTFS 稀疏/大文件 size 显示为 0，对搜索功能影响可接受
+pub struct ScanStats {
     pub total_records: u64,
     pub files: u64,
     pub dirs: u64,
@@ -255,6 +274,183 @@ impl MftScanner {
             total_hard_links,
             no_timestamp,
         }
+    }
+
+    /// 流式扫描：对每条有效的 MFT 记录调用 callback，不收集到 Vec
+    ///
+    /// 内存优势：恒定占用（仅 record_buf ~1MB），不随文件数量增长
+    /// 对比 scan() 方法在 221万文件下 ~260MB 的 all_records，显著降低峰值内存
+    ///
+    /// 返回值：(ScanStats, pending_sizes)
+    /// - pending_sizes: HashMap<record_number, real_size>
+    ///   对于主记录 size=0 且有 $ATTRIBUTE_LIST 的文件，通过读取扩展 MFT 记录获取真实 size
+    ///   调用方需用此 map 更新 FileEntry 中 size=0 的条目
+    ///
+    /// callback 内可进行路径解析、FileEntry 构建等操作
+    /// callback 是 FnMut，允许修改捕获的变量（如 dir_map、files 等）
+    pub fn scan_streaming<F: FnMut(&ScanResult)>(
+        &mut self,
+        reader: &mut (impl Read + Seek),
+        max_records: u64,
+        callback: &mut F,
+    ) -> (ScanStats, std::collections::HashMap<u64, u64>) {
+        let mut total_records: u64 = 0;
+        let mut files: u64 = 0;
+        let mut dirs: u64 = 0;
+        let mut consecutive_errors: u64 = 0;
+        let mut record_buf = vec![0u8; self.file_record_size as usize];
+        let mut total_ads: u64 = 0;
+        let mut total_hard_links: u64 = 0;
+        let mut skip_no_signature: u64 = 0;
+        let mut skip_fixup_fail: u64 = 0;
+        let mut skip_inactive: u64 = 0;
+        let mut no_timestamp: u64 = 0;
+        // pending_ext: (record_number, ext_record_nums)
+        // 收集主记录 size=0 且有 $ATTRIBUTE_LIST 的文件，扫描结束后统一读取扩展记录获取真实 size
+        let mut pending_ext: Vec<(u64, Vec<u64>)> = Vec::new();
+
+        for run in &self.data_runs {
+            if total_records >= max_records {
+                break;
+            }
+
+            let run_bytes = run.length * self.cluster_size;
+            let records_in_run = run_bytes / self.file_record_size;
+
+            if run.is_sparse {
+                total_records += records_in_run;
+                continue;
+            }
+
+            let run_start = run.lcn * self.cluster_size;
+            if reader.seek(SeekFrom::Start(run_start)).is_err() {
+                consecutive_errors += 1;
+                if consecutive_errors > 100 {
+                    break;
+                }
+                total_records += records_in_run;
+                continue;
+            }
+
+            for _ in 0..records_in_run {
+                if total_records >= max_records {
+                    break;
+                }
+
+                if reader.read_exact(&mut record_buf).is_err() {
+                    consecutive_errors += 1;
+                    if consecutive_errors > 100 {
+                        break;
+                    }
+                    total_records += 1;
+                    continue;
+                }
+                consecutive_errors = 0;
+
+                if &record_buf[0..4] != b"FILE" {
+                    total_records += 1;
+                    skip_no_signature += 1;
+                    continue;
+                }
+
+                if apply_fixup(&mut record_buf, total_records, self.file_record_size).is_err() {
+                    total_records += 1;
+                    skip_fixup_fail += 1;
+                    continue;
+                }
+
+                let flags = read_u16(&record_buf, 22);
+                if (flags & 0x01) == 0 {
+                    total_records += 1;
+                    skip_inactive += 1;
+                    continue;
+                }
+
+                let is_dir = (flags & 0x02) != 0;
+                if is_dir {
+                    dirs += 1;
+                } else {
+                    files += 1;
+                }
+
+                let mut name = extract_name(&record_buf, self.file_record_size as usize);
+                if name == "<no name>" {
+                    if let Some(wk_name) = well_known_name(total_records) {
+                        name = wk_name.to_string();
+                    } else {
+                        name = format!("<Record#{}>", total_records);
+                    }
+                }
+                let parent_record = extract_parent_record(&record_buf, self.file_record_size as usize);
+                let size = extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
+                // 主记录 size=0 且非目录：可能是有 $ATTRIBUTE_LIST 的大文件
+                // 收集扩展记录号，扫描结束后批量读取以获取真实 size
+                if size == 0 && !is_dir {
+                    let ext = extract_data_extension_records(&record_buf, self.file_record_size as usize);
+                    if !ext.is_empty() {
+                        pending_ext.push((total_records, ext));
+                    }
+                }
+                let mtime = extract_mtime(&record_buf, self.file_record_size as usize);
+                let ctime = extract_ctime(&record_buf, self.file_record_size as usize);
+                let atime = extract_atime(&record_buf, self.file_record_size as usize);
+                if mtime.is_none() && ctime.is_none() && atime.is_none() {
+                    no_timestamp += 1;
+                }
+                let attributes = extract_attributes(&record_buf, self.file_record_size as usize);
+                let ads = count_ads(&record_buf, self.file_record_size as usize);
+                total_ads += ads;
+                let links = count_hard_links(&record_buf, self.file_record_size as usize);
+                total_hard_links += links;
+
+                // 构造临时 ScanResult 并调用 callback
+                // 注意：name 所有权转移给 record，callback 结束后 record 被 drop
+                let record = ScanResult {
+                    record_number: total_records,
+                    parent_record,
+                    is_directory: is_dir,
+                    name,
+                    size,
+                    mtime,
+                    ctime,
+                    atime,
+                    attributes,
+                };
+                callback(&record);
+
+                total_records += 1;
+            }
+        }
+
+        // 扫描结束后，批量读取扩展 MFT 记录获取真实 size
+        // 返回 HashMap<record_number, real_size> 供调用方更新 FileEntry
+        let pending_sizes = if !pending_ext.is_empty() {
+            log::info!(
+                "scan_streaming: resolving {} pending_ext entries for real sizes",
+                pending_ext.len()
+            );
+            resolve_pending_sizes_streaming(
+                reader,
+                &self.data_runs,
+                self.file_record_size,
+                self.cluster_size,
+                &pending_ext,
+            )
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        (ScanStats {
+            total_records,
+            files,
+            dirs,
+            skip_no_signature,
+            skip_fixup_fail,
+            skip_inactive,
+            total_ads,
+            total_hard_links,
+            no_timestamp,
+        }, pending_sizes)
     }
 }
 
@@ -659,6 +855,92 @@ fn record_disk_offset(data_runs: &[DataRun], file_record_size: u64, cluster_size
         record_number += records_in_run;
     }
     None
+}
+
+/// 流式版本的 resolve_pending_sizes
+///
+/// 与 resolve_pending_sizes 的区别：
+/// - 输入: pending 为 (record_number, ext_record_nums)，而非 (result_idx, ext_record_nums)
+/// - 输出: 返回 HashMap<record_number, real_size>，而非直接修改 results[result_idx]
+/// - 原因: scan_streaming 不收集 all_records，无法通过 result_idx 索引
+///   调用方通过 record_number 匹配 FileEntry.file_id 来更新 size
+fn resolve_pending_sizes_streaming(
+    reader: &mut (impl Read + Seek),
+    data_runs: &[DataRun],
+    file_record_size: u64,
+    cluster_size: u64,
+    pending: &[(u64, Vec<u64>)],
+) -> std::collections::HashMap<u64, u64> {
+    // 收集所有扩展记录的磁盘偏移，按偏移排序以实现顺序 I/O
+    let mut offsets: Vec<(u64, u64)> = Vec::new(); // (disk_offset, ext_record_number)
+    let mut total_ext_records = 0usize;
+    for &(_, ref ext_records) in pending {
+        total_ext_records += ext_records.len();
+        for &rn in ext_records {
+            if let Some(offset) = record_disk_offset(data_runs, file_record_size, cluster_size, rn) {
+                offsets.push((offset, rn));
+            }
+        }
+    }
+    offsets.sort_unstable_by_key(|&(offset, _)| offset);
+
+    log::info!(
+        "resolve_pending_sizes_streaming: {} pending entries, {} ext_records total, {} offsets resolved",
+        pending.len(), total_ext_records, offsets.len()
+    );
+
+    // 读取每个扩展记录，提取 $DATA 属性的 size
+    // ext_sizes: ext_record_number → size
+    let mut ext_sizes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut read_failures = 0usize;
+    let mut zero_size_ext = 0usize;
+    let mut record_buf = vec![0u8; file_record_size as usize];
+    for &(offset, record_number) in &offsets {
+        if reader.seek(SeekFrom::Start(offset)).is_err() {
+            read_failures += 1;
+            continue;
+        }
+        if reader.read_exact(&mut record_buf).is_err() {
+            read_failures += 1;
+            continue;
+        }
+        if apply_fixup(&mut record_buf, record_number, file_record_size).is_err() {
+            read_failures += 1;
+            continue;
+        }
+        let size = extract_data_size_from_bytes(&record_buf, record_buf.len());
+        if size > 0 {
+            ext_sizes.insert(record_number, size);
+        } else {
+            zero_size_ext += 1;
+        }
+    }
+
+    log::info!(
+        "resolve_pending_sizes_streaming: read {} ext records, {} with size>0, {} with size=0, {} read failures",
+        offsets.len(), ext_sizes.len(), zero_size_ext, read_failures
+    );
+
+    // 构建 record_number → real_size 映射
+    // 对于每个 pending 条目，遍历其扩展记录，取第一个 size>0 的作为真实 size
+    let mut result: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for &(record_number, ref ext_records) in pending {
+        for &rn in ext_records {
+            if let Some(&size) = ext_sizes.get(&rn) {
+                if size > 0 {
+                    result.insert(record_number, size);
+                    break;
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "resolve_pending_sizes_streaming: resolved {} real sizes from {} pending entries",
+        result.len(), pending.len()
+    );
+
+    result
 }
 
 /// Batch-resolve sizes for records that have $ATTRIBUTE_LIST.

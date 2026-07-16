@@ -16,7 +16,7 @@ impl IndexDatabase {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = -64000;
+             PRAGMA cache_size = -4000;
              PRAGMA temp_store = MEMORY;
              
              CREATE TABLE IF NOT EXISTS files (
@@ -93,7 +93,7 @@ impl IndexDatabase {
                 .unwrap_or(0);
 
             Ok(SearchResult {
-                file_id: row.get(1)?,
+                file_id: row.get::<_, u32>(1)?,
                 name: name.into(),
                 path: path.into(),
                 size: row.get(4)?,

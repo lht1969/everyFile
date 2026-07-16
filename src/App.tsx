@@ -122,6 +122,7 @@ function App() {
   const fetchCounterRef = useRef(0);
   const visibleRangeRef = useRef({ start: 0, end: 50 });
   const rangeCacheRef = useRef<Map<string, SearchResult[]>>(new Map());
+  const rangeChangeTimerRef = useRef<number | null>(null);
   const PAGE_SIZE = 100;
 
   const fetchRecordsRange = useCallback(async (start: number, end: number) => {
@@ -133,13 +134,24 @@ function App() {
       return;
     }
 
-    const myId = ++fetchCounterRef.current;
-    const { field, direction } = sortStateRef.current;
+    // 只读取当前 counter 值，不递增
+    // 原因：递增会使 handleSortChange/handleSearch 的 myId 失效，
+    // 导致用户主动排序/搜索的新结果被丢弃，旧数据残留
+    const myId = fetchCounterRef.current;
+    // 捕获 sortState 快照，await 期间若 sortState 变化（用户再次排序），
+    // 则丢弃本次结果，防止旧排序数据覆盖新排序结果
+    const sortSnapshot = { ...sortStateRef.current };
+    const { field, direction } = sortSnapshot;
     try {
       const response = await invoke<RecordsRangeResponse>('get_records_range', { start, end, sortBy: field, sortDirection: direction });
-      if (myId === fetchCounterRef.current) {
+      // 双重检查：counter 未变 且 sortState 未变，才应用结果
+      if (myId === fetchCounterRef.current &&
+        sortStateRef.current.field === sortSnapshot.field &&
+        sortStateRef.current.direction === sortSnapshot.direction) {
         rangeCacheRef.current.set(cacheKey, response.results);
-        if (rangeCacheRef.current.size > 20) {
+        // 缩容：从 20 条降至 10 条，每条 100 项
+        // 10 × 100 × ~100字节 ≈ 100KB，足够覆盖滚动预取场景
+        if (rangeCacheRef.current.size > 10) {
           const firstKey = rangeCacheRef.current.keys().next().value;
           if (firstKey) rangeCacheRef.current.delete(firstKey);
         }
@@ -263,54 +275,51 @@ function App() {
   }, [sortState]);
 
   const handleSortChange = useCallback(async (field: SortField, direction: SortDirection) => {
+    // 清除 pending 的 fetchRecordsRange debounce，防止竞态：
+    // resetScroll 会触发 onRangeChange，80ms 后调用 fetchRecordsRange，
+    // 可能在 handleSortChange 完成前执行并覆盖结果
+    if (rangeChangeTimerRef.current !== null) {
+      clearTimeout(rangeChangeTimerRef.current);
+      rangeChangeTimerRef.current = null;
+    }
     const myId = ++fetchCounterRef.current;
     rangeCacheRef.current.clear();
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
-    // setStatusMessage('排序中...');
+    setStatusMessage('排序中...');
     try {
-      const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
-        sortBy: field,
-        sortDirection: direction,
-        start: 0,
-        end: 50
-      });
-      if (myId === fetchCounterRef.current) {
-        setTotalCount(response.total);
-        setResultsOffset(0);
-        setResults(response.results);
-      }
-    } catch (e) {
-      console.error('Sort failed, falling back to re-search:', e);
-      try {
-        await invoke<SearchResponse>('search_files', {
-          params: {
-            query: searchState.query,
-            files_only: searchState.filesOnly,
-            directories_only: searchState.directoriesOnly,
-            sort_by: field,
-            sort_direction: direction
-          }
-        });
-        const response = await invoke<RecordsRangeResponse>('get_sorted_range', {
-          sortBy: field,
-          sortDirection: direction,
-          start: 0,
-          end: 50
-        });
-        if (myId === fetchCounterRef.current) {
-          setTotalCount(response.total);
-          setResultsOffset(0);
-          setResults(response.results);
+      const searchResp = await invoke<SearchResponse>('search_files', {
+        params: {
+          query: searchState.query,
+          files_only: searchState.filesOnly,
+          directories_only: searchState.directoriesOnly,
+          sort_by: field,
+          sort_direction: direction
         }
-      } catch (e2) {
-        console.error('Fallback sort also failed:', e2);
-        message(`排序失败: ${e2}`, { title: '错误', kind: 'error' });
+      });
+      if (myId !== fetchCounterRef.current) return;
+      // search_files 已返回并重建后端缓存，递增 counter 使正在进行的
+      // fetchRecordsRange 失效（它可能用了旧 sort state 的后端缓存），
+      // 防止其返回的旧数据覆盖本次新排序结果
+      ++fetchCounterRef.current;
+      setTotalCount(searchResp.total);
+      if (searchResp.total > 0) {
+        // 直接用 search_files 返回的 first_batch（0-50），不再调用 get_records_range
+        // 原因：减少一次 IPC 调用，且 search_files 已重建后端缓存，first_batch 就是新排序结果
+        rangeCacheRef.current.set('0-50', searchResp.results);
+        setResultsOffset(0);
+        setResults(searchResp.results);
+      } else {
+        setResultsOffset(0);
+        setResults([]);
       }
+      setStatusMessage('');
+    } catch (e) {
+      console.error('Sort failed:', e);
+      message(`排序失败: ${e}`, { title: '错误', kind: 'error' });
+      setStatusMessage('');
     }
   }, [searchState]);
-
-  const rangeChangeTimerRef = useRef<number | null>(null);
 
   const handleVisibleRangeChange = useCallback((start: number, end: number) => {
     visibleRangeRef.current = { start, end };
