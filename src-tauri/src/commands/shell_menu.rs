@@ -13,10 +13,9 @@
 // 依赖：windows crate 0.52 已开启 Win32_UI_Shell / Win32_System_Com / Win32_UI_WindowsAndMessaging
 
 use tauri::{AppHandle, Manager, WebviewWindow};
-use windows::core::Interface;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::{
-    IShellItem, IContextMenu3, IContextMenu2, IContextMenu,
+    IShellItem, IContextMenu3,
     SHCreateItemFromParsingName, CMF_NORMAL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -51,12 +50,15 @@ pub async fn show_context_menu(
     screen_x: i32,
     screen_y: i32,
 ) -> Result<(), String> {
-    // 1. 拿到主窗口 HWND（Tauri 2 公开 API）
+    // 1. 拿到主窗口 HWND
+    // Tauri 2 通过 windows 0.61 的 HWND 返回（pub struct HWND(pub *mut c_void)），
+    // 而本项目使用 windows 0.52（pub struct HWND(pub isize)），
+    // 两个版本的 HWND 类型不同，需要 .0 as isize 桥接。
     let window: WebviewWindow = app
         .get_webview_window("main")
         .ok_or_else(|| "Main window not found".to_string())?;
-    let hwnd_raw = window.hwnd().map_err(|e| format!("Failed to get hwnd: {}", e))?.0 as isize;
-    let hwnd = HWND(hwnd_raw);
+    let hwnd_tauri = window.hwnd().map_err(|e| format!("Failed to get hwnd: {}", e))?;
+    let hwnd = HWND(hwnd_tauri.0 as isize);
 
     // 2. spawn_blocking 避免污染 tokio 运行时
     let result = tokio::task::spawn_blocking(move || {
@@ -73,9 +75,9 @@ pub async fn show_context_menu(
 /// 在独立线程中执行菜单弹出（COM 初始化/反初始化在此完成）
 fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), String> {
     // 3. 初始化 COM（STA 模式 + 禁用旧 OLE）
+    // windows 0.52 中 CoInitializeEx 返回 Result<()>，不再需要 .ok() 转 Option
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-            .ok()
             .map_err(|e| format!("CoInitializeEx failed: {}", e))?;
     }
 
@@ -94,24 +96,27 @@ fn show_menu_blocking(hwnd: HWND, path: &str, x: i32, y: i32) -> Result<(), Stri
         };
 
         // 6. 创建弹出菜单
-        let menu = unsafe { CreatePopupMenu() };
-        if menu.is_invalid() {
-            return Err("CreatePopupMenu failed".to_string());
-        }
+        // windows 0.52 中 CreatePopupMenu 返回 Result<HMENU, Error>，用 ? 直接解包
+        let menu = unsafe { CreatePopupMenu() }
+            .map_err(|e| format!("CreatePopupMenu failed: {}", e))?;
 
         // 7. 填充菜单项
+        // windows 0.52 中 CMF_NORMAL 是 pub const CMF_NORMAL: u32，直接传值
         unsafe {
             ctx_menu
-                .QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL.0 as u32)
+                .QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL)
                 .map_err(|e| format!("QueryContextMenu failed: {}", e))?;
         }
 
         // 8. 弹出菜单（设置前置窗口确保 Z-order 正确）
+        // windows 0.52 中 TrackPopupMenuEx 的 uflags 参数是 u32，
+        // 而 TPM_* 常量是 TRACK_POPUP_MENU_FLAGS 类型（#[repr(transparent)] pub struct(pub u32)），
+        // 用 .0 取底层 u32 后按位或组合
         let cmd = unsafe {
             SetForegroundWindow(hwnd);
             TrackPopupMenuEx(
                 menu,
-                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                TPM_RETURNCMD.0 | TPM_LEFTALIGN.0 | TPM_TOPALIGN.0,
                 x,
                 y,
                 hwnd,
