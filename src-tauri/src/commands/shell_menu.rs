@@ -19,6 +19,8 @@
 //   解决：在 TrackPopupMenuEx 之前用 PeekMessageW(PM_NOREMOVE) 强制创建队列。
 // - 该线程初始化 COM(STA)，独立消息循环（spawn_blocking 跑在 tokio 池里，
 //   池化线程反复复用，可能也不保证有消息队列）
+// - 接收线程结果用 tokio::sync::oneshot（异步）而非 std::sync::mpsc（同步阻塞），
+//   避免冻结 tokio runtime 当前 worker 上的其他异步任务。
 //
 // 依赖：windows crate 0.52 已开启 Win32_UI_Shell / Win32_System_Com / Win32_UI_WindowsAndMessaging
 
@@ -106,10 +108,11 @@ pub async fn show_context_menu(
     // spawn_blocking 跑在 tokio 线程池里，池化线程没有自动消息队列，
     // 且可能与 Tauri 主线程共享资源；std::thread::spawn 创建原生 OS 线程，
     // 可控性更高，再配合 PeekMessageW 强制创建消息队列。
-    // 用 std::sync::mpsc::channel 把结果从工作线程回传：
-    // - 工作线程在 ShowMenu_blocking 内部可以长时间阻塞（菜单模态运行）
-    // - Tauri command 是 async 函数，rx.recv() 阻塞等待不阻塞 tokio 运行时
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    // 用 tokio::sync::oneshot 异步通道把结果从工作线程回传：
+    // - 工作线程在 show_menu_blocking 内部可以长时间阻塞（菜单模态运行）
+    // - Tauri command 是 async 函数，rx.await 不会阻塞 tokio worker，
+    //   task 可被调度器挂起，到达后被重新唤醒，比 rx.recv() 同步阻塞更友好。
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
     std::thread::spawn(move || {
         log::info!("[CTX_MENU] std::thread started");
@@ -118,17 +121,14 @@ pub async fn show_context_menu(
             "[CTX_MENU] std::thread finished: {:?}",
             r.as_ref().map(|_| "ok").map_err(|e| e.as_str())
         );
-        // 忽略 send 错误：若接收端已 drop，菜单仍可能已正常显示
+        // tx 可能在主 task 已被取消（如客户端断开）时无人接收，
+        // 用 let _ = 忽略 send 错误
         let _ = tx.send(r);
     });
 
-    // 在 Tauri command 里阻塞等待工作线程结果
-    // Tauri command 是 async 函数，std::sync::mpsc::channel 的 recv 是同步阻塞，
-    // 但这发生在 tokio runtime worker 线程上，阻塞此 worker 会影响同一 worker 上的其他 task。
-    // 因为这是 Tauri command 入口，前端在等返回值，且菜单必须模态运行，
-    // 所以短暂阻塞 worker 是可接受的（菜单关闭前其他 task 也无法继续）。
-    // rx.recv() 返回 Result<Result<(), String>, RecvError>，用 match 平铺成 Result<(), String>
-    match rx.recv() {
+    // 异步等待工作线程结果，worker 不会被冻结
+    // rx.await 返回 Result<Result<(), String>, RecvError>，用 match 平铺成 Result<(), String>
+    match rx.await {
         Ok(inner) => inner,
         Err(e) => {
             log::error!("[CTX_MENU] Menu thread channel error: {}", e);
