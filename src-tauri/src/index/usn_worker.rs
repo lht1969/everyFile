@@ -360,6 +360,8 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
     let mut volumes: HashMap<char, Volume> = HashMap::new();
     let mut last_usn_map: HashMap<char, i64> = HashMap::new();
     let mut journal_id_map: HashMap<char, u64> = HashMap::new();
+    let mut last_save_time = std::time::Instant::now();
+    let save_interval = std::time::Duration::from_secs(30);
 
     loop {
         log::info!("[USN] Worker loop waiting for command, volumes stored: {:?}", volumes.keys().collect::<Vec<_>>());
@@ -382,6 +384,9 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
                     include_system_files,
                     &volumes,
                     &mut last_usn_map,
+                    &mut journal_id_map,
+                    &mut last_save_time,
+                    save_interval,
                     &resp_tx,
                 );
             }
@@ -1111,6 +1116,9 @@ fn handle_poll_changes(
     include_system_files: bool,
     volumes: &HashMap<char, Volume>,
     last_usn_map: &mut HashMap<char, i64>,
+    journal_id_map: &mut HashMap<char, u64>,
+    last_save_time: &mut std::time::Instant,
+    save_interval: std::time::Duration,
     resp_tx: &Sender<UsnResponse>,
 ) {
     log::info!("[USN] handle_poll_changes entered for drive {}", drive_letter);
@@ -1148,24 +1156,20 @@ fn handle_poll_changes(
         }
     };
 
-    // journal_id 一致性检查：若 journal 被重建（ID 变化），重置 last_usn
-    // 避免使用旧 journal 的 last_usn 读取新 journal 导致 ERROR_INVALID_PARAMETER
-    let mut state = UsnState::load();
-    let stored_journal_id = state
-        .volumes
-        .get(&drive_letter.to_string())
-        .map(|vs| vs.journal_id)
-        .unwrap_or(0);
+    // journal_id 一致性检查：使用内存中的 journal_id_map 而非每次从磁盘加载 UsnState
+    // 仅在 journal_id 变化时才持久化到磁盘
+    let stored_journal_id = journal_id_map.get(&drive_letter).copied().unwrap_or(0);
 
     let effective_last_usn = if stored_journal_id != 0 && stored_journal_id != journal_data.journal_id {
         log::warn!(
             "[USN] Journal ID changed for {}: stored={}, current={}, resetting last_usn",
             drive_letter, stored_journal_id, journal_data.journal_id
         );
-        // 重置到 next_usn - 1（跳过历史记录，仅监控后续新增变更）
         let reset_usn = journal_data.next_usn.saturating_sub(1);
         last_usn_map.insert(drive_letter, reset_usn);
-        // 同步更新持久化状态中的 journal_id 和 last_usn
+        journal_id_map.insert(drive_letter, journal_data.journal_id);
+        // 仅在 journal_id 变化时持久化（罕见情况）
+        let mut state = UsnState::load();
         if let Some(vs) = state.volumes.get_mut(&drive_letter.to_string()) {
             vs.journal_id = journal_data.journal_id;
             vs.last_usn = reset_usn;
@@ -1411,26 +1415,23 @@ fn handle_poll_changes(
         new_last_usn
     );
 
-    // 仅当 new_last_usn 有进展时更新持久化状态
-    // 注意：journal_id 变化时 state 已在上方保存，此处仅在 last_usn 推进时更新
+    // 仅当 new_last_usn 有进展时更新持久化状态，且距上次保存超过 30 秒
     if new_last_usn > effective_last_usn {
         last_usn_map.insert(drive_letter, new_last_usn);
 
-        // 重新加载 state 以避免覆盖其他卷的并发更新
-        let mut state = UsnState::load();
-        if let Some(vs) = state.volumes.get_mut(&drive_letter.to_string()) {
-            vs.last_usn = new_last_usn;
-        } else {
-            // 首次轮询时持久化状态可能不存在，补建一条
-            state.volumes.insert(
-                drive_letter.to_string(),
-                VolumeState {
-                    journal_id: journal_data.journal_id,
-                    last_usn: new_last_usn,
-                },
-            );
+        let now = std::time::Instant::now();
+        if now.duration_since(*last_save_time) >= save_interval {
+            let mut state = UsnState::default();
+            for (&dl, &usn) in last_usn_map.iter() {
+                let jid = journal_id_map.get(&dl).copied().unwrap_or(0);
+                state.volumes.insert(dl.to_string(), VolumeState {
+                    journal_id: jid,
+                    last_usn: usn,
+                });
+            }
+            state.save();
+            *last_save_time = now;
         }
-        state.save();
     }
 
     // 仅当有实际变更时才发送结果，避免触发无意义的缓存更新和前端刷新
