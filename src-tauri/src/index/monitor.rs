@@ -789,6 +789,14 @@ fn apply_incremental_to_cache(
     vol_idx: u8,
     result: &IncrementalResult,
 ) -> usize {
+    // 快速路径：如果没有新增文件，且 index_map 是恒等映射（无删除、无重排），
+    // 则 matched 向量无需重建，直接跳过以避免 221万次 drain+push
+    let is_identity = result.new_file_indices.is_empty()
+        && result.index_map.iter().enumerate().all(|(i, m)| *m == Some(i));
+    if is_identity {
+        return cache.matched.len();
+    }
+
     let mut new_matched: Vec<(u8, u32)> = Vec::with_capacity(cache.matched.len());
     let mut removed_count = 0usize;
 

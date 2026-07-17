@@ -1202,19 +1202,12 @@ fn handle_poll_changes(
         journal_data.next_usn, journal_data.journal_id, start_usn
     );
 
-    // 若 start_usn >= next_usn，说明无新变更，直接返回空结果
+    // 若 start_usn >= next_usn，说明无新变更，直接返回（不发送 IncrementalResult）
     if start_usn >= journal_data.next_usn {
         log::info!(
             "[USN] Poll {}: start_usn={} >= next_usn={}, no new changes, skipping",
             drive_letter, start_usn, journal_data.next_usn
         );
-        let _ = resp_tx.send(UsnResponse::IncrementalResult {
-            drive_letter,
-            added: Vec::new(),
-            removed: Vec::new(),
-            updated: Vec::new(),
-            last_usn: effective_last_usn,
-        });
         return;
     }
 
@@ -1438,6 +1431,12 @@ fn handle_poll_changes(
             );
         }
         state.save();
+    }
+
+    // 仅当有实际变更时才发送结果，避免触发无意义的缓存更新和前端刷新
+    if added.is_empty() && removed.is_empty() && updated.is_empty() {
+        log::info!("[USN] Poll {}: no relevant changes after filtering, skipping notification", drive_letter);
+        return;
     }
 
     let _ = resp_tx.send(UsnResponse::IncrementalResult {
