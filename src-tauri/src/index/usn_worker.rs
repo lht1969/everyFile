@@ -359,7 +359,6 @@ pub fn spawn_usn_worker(
 fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
     let mut volumes: HashMap<char, Volume> = HashMap::new();
     let mut last_usn_map: HashMap<char, i64> = HashMap::new();
-    let mut journal_id_map: HashMap<char, u64> = HashMap::new();
     let mut last_save_time = std::time::Instant::now();
     let save_interval = std::time::Duration::from_secs(30);
 
@@ -373,7 +372,6 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
                     include_system_files,
                     &mut volumes,
                     &mut last_usn_map,
-                    &mut journal_id_map,
                     &resp_tx,
                 );
             }
@@ -384,7 +382,6 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
                     include_system_files,
                     &volumes,
                     &mut last_usn_map,
-                    &mut journal_id_map,
                     &mut last_save_time,
                     save_interval,
                     &resp_tx,
@@ -403,7 +400,6 @@ fn handle_full_scan(
     include_system_files: bool,
     volumes: &mut HashMap<char, Volume>,
     last_usn_map: &mut HashMap<char, i64>,
-    journal_id_map: &mut HashMap<char, u64>,
     resp_tx: &Sender<UsnResponse>,
 ) {
     log::info!("[USN] Full scan starting for drive {}", drive_letter);
@@ -594,7 +590,6 @@ fn handle_full_scan(
                 include_system_files,
                 volumes,
                 last_usn_map,
-                journal_id_map,
                 resp_tx,
             );
             return;
@@ -716,7 +711,7 @@ fn handle_full_scan(
     let journal_max_size = usn_journal_rs::DEFAULT_JOURNAL_MAX_SIZE;
     let allocation_delta = usn_journal_rs::DEFAULT_JOURNAL_ALLOCATION_DELTA;
 
-    let (journal_id, last_usn) = match journal.query(true) {
+    let (_journal_id, last_usn) = match journal.query(true) {
         Ok(data) => {
             if data.maximum_size < journal_max_size {
                 if let Err(e) = journal.create_or_update(journal_max_size, allocation_delta) {
@@ -754,12 +749,11 @@ fn handle_full_scan(
     };
 
     last_usn_map.insert(drive_letter, last_usn);
-    journal_id_map.insert(drive_letter, journal_id);
 
     let mut state = UsnState::load();
     state.volumes.insert(
         drive_letter.to_string(),
-        VolumeState { journal_id, last_usn },
+        VolumeState { last_usn },
     );
     state.save();
 
@@ -770,7 +764,6 @@ fn handle_full_scan(
         files,
         path_table,
         last_usn,
-        journal_id,
     });
 }
 
@@ -780,7 +773,6 @@ fn handle_full_scan_legacy(
     include_system_files: bool,
     volumes: &mut HashMap<char, Volume>,
     last_usn_map: &mut HashMap<char, i64>,
-    journal_id_map: &mut HashMap<char, u64>,
     resp_tx: &Sender<UsnResponse>,
 ) {
     log::info!("[USN] Full scan (legacy) starting for drive {}", drive_letter);
@@ -1052,7 +1044,7 @@ fn handle_full_scan_legacy(
     let journal_max_size = usn_journal_rs::DEFAULT_JOURNAL_MAX_SIZE;
     let allocation_delta = usn_journal_rs::DEFAULT_JOURNAL_ALLOCATION_DELTA;
 
-    let (journal_id, last_usn) = match journal.query(true) {
+    let (_journal_id, last_usn) = match journal.query(true) {
         Ok(data) => {
             if data.maximum_size < journal_max_size {
                 if let Err(e) = journal.create_or_update(journal_max_size, allocation_delta) {
@@ -1090,12 +1082,11 @@ fn handle_full_scan_legacy(
     };
 
     last_usn_map.insert(drive_letter, last_usn);
-    journal_id_map.insert(drive_letter, journal_id);
 
     let mut state = UsnState::load();
     state.volumes.insert(
         drive_letter.to_string(),
-        VolumeState { journal_id, last_usn },
+        VolumeState { last_usn },
     );
     state.save();
 
@@ -1106,7 +1097,6 @@ fn handle_full_scan_legacy(
         files,
         path_table,
         last_usn,
-        journal_id,
     });
 }
 
@@ -1116,7 +1106,6 @@ fn handle_poll_changes(
     include_system_files: bool,
     volumes: &HashMap<char, Volume>,
     last_usn_map: &mut HashMap<char, i64>,
-    journal_id_map: &mut HashMap<char, u64>,
     last_save_time: &mut std::time::Instant,
     save_interval: std::time::Duration,
     resp_tx: &Sender<UsnResponse>,
@@ -1156,37 +1145,9 @@ fn handle_poll_changes(
         }
     };
 
-    // journal_id 一致性检查：使用内存中的 journal_id_map 而非每次从磁盘加载 UsnState
-    // 仅在 journal_id 变化时才持久化到磁盘
-    let stored_journal_id = journal_id_map.get(&drive_letter).copied().unwrap_or(0);
-
-    let effective_last_usn = if stored_journal_id != 0 && stored_journal_id != journal_data.journal_id {
-        log::warn!(
-            "[USN] Journal ID changed for {}: stored={}, current={}, resetting last_usn",
-            drive_letter, stored_journal_id, journal_data.journal_id
-        );
-        let reset_usn = journal_data.next_usn.saturating_sub(1);
-        last_usn_map.insert(drive_letter, reset_usn);
-        journal_id_map.insert(drive_letter, journal_data.journal_id);
-        // 仅在 journal_id 变化时持久化（罕见情况）
-        let mut state = UsnState::load();
-        if let Some(vs) = state.volumes.get_mut(&drive_letter.to_string()) {
-            vs.journal_id = journal_data.journal_id;
-            vs.last_usn = reset_usn;
-        } else {
-            state.volumes.insert(
-                drive_letter.to_string(),
-                VolumeState {
-                    journal_id: journal_data.journal_id,
-                    last_usn: reset_usn,
-                },
-            );
-        }
-        state.save();
-        reset_usn
-    } else {
-        last_usn
-    };
+    // journal_id 一致性检查已移除：journal_id 不再持久化，
+    // 如果日志被重建导致 last_usn 无效，轮询会报错并触发重新全量扫描。
+    let effective_last_usn = last_usn;
 
     // 直接使用 effective_last_usn 作为 start_usn（不 +1）
     //
@@ -1423,9 +1384,7 @@ fn handle_poll_changes(
         if now.duration_since(*last_save_time) >= save_interval {
             let mut state = UsnState::default();
             for (&dl, &usn) in last_usn_map.iter() {
-                let jid = journal_id_map.get(&dl).copied().unwrap_or(0);
                 state.volumes.insert(dl.to_string(), VolumeState {
-                    journal_id: jid,
                     last_usn: usn,
                 });
             }

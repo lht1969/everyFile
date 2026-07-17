@@ -37,8 +37,6 @@ pub enum UsnResponse {
         path_table: PathTable,
         #[allow(dead_code)]
         last_usn: i64,
-        #[allow(dead_code)]
-        journal_id: u64,
     },
     /// Incremental changes from USN journal
     IncrementalResult {
@@ -64,7 +62,6 @@ pub struct UsnState {
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct VolumeState {
-    pub journal_id: u64,
     pub last_usn: i64,
 }
 
@@ -154,13 +151,11 @@ mod tests {
         state.volumes.insert(
             "C".to_string(),
             VolumeState {
-                journal_id: 12345,
                 last_usn: 67890,
             },
         );
         state.save_test(suffix);
         let loaded = UsnState::load_test(suffix);
-        assert_eq!(loaded.volumes["C"].journal_id, 12345);
         assert_eq!(loaded.volumes["C"].last_usn, 67890);
         let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
     }
@@ -173,21 +168,19 @@ mod tests {
         state.volumes.insert(
             "C".to_string(),
             VolumeState {
-                journal_id: 100,
                 last_usn: 200,
             },
         );
         state.volumes.insert(
             "D".to_string(),
             VolumeState {
-                journal_id: 300,
                 last_usn: 400,
             },
         );
         state.save_test(suffix);
         let loaded = UsnState::load_test(suffix);
         assert_eq!(loaded.volumes.len(), 2);
-        assert_eq!(loaded.volumes["C"].journal_id, 100);
+        assert_eq!(loaded.volumes["C"].last_usn, 200);
         assert_eq!(loaded.volumes["D"].last_usn, 400);
         let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
     }
