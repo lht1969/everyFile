@@ -641,43 +641,46 @@ impl VolumeManager {
         removed: Vec<u64>,
         updated: Vec<(u64, SearchResult)>,
     ) {
-        let monitor = match self.volumes.get_mut(drive_letter) {
-            Some(m) => m,
+        let vol_idx = match self.volume_index.get(drive_letter).copied() {
+            Some(i) => i,
             None => return,
         };
 
-        if monitor.fid_index.is_none() {
-            log::warn!("[USN] No fid_index for {}, skipping incremental update", drive_letter);
-            return;
-        }
+        let has_cache = self.search_cache.is_some();
+        let added_count = added.len();
+        let updated_count = updated.len();
 
-        // 处理更新：通过 fid 查找当前索引（避免压缩后索引漂移）
-        // 将 SearchResult 转换为 FileEntry
-        for (fid, new_result) in updated {
-            let fid_u32 = fid as u32;
-            if let Some(idx) = monitor.fid_index.as_ref().and_then(|fi| fi.iter().find(|(id, _)| *id == fid_u32).map(|(_, idx)| *idx)) {
-                if (idx as usize) < monitor.files.len() {
-                    // 文件：intern 父目录路径得到 path_id（FileEntry.path_id 指向父目录）
-                    let parent_path = parent_dir_of(&new_result.path);
-                    let path_id = monitor.path_table.intern(parent_path);
-                    // 目录：额外注册自身路径供子条目使用
-                    if new_result.is_directory {
-                        monitor.path_table.intern(&new_result.path);
+        // === 阶段 1：修改 monitor.files（持有可变借用）===
+        let (removed_count, index_map, new_file_indices) = {
+            let monitor = match self.volumes.get_mut(drive_letter) {
+                Some(m) => m,
+                None => return,
+            };
+
+            if monitor.fid_index.is_none() {
+                log::warn!("[USN] No fid_index for {}, skipping incremental update", drive_letter);
+                return;
+            }
+
+            // 处理更新
+            for (fid, new_result) in updated {
+                let fid_u32 = fid as u32;
+                if let Some(idx) = monitor.fid_index.as_ref().and_then(|fi| fi.iter().find(|(id, _)| *id == fid_u32).map(|(_, idx)| *idx)) {
+                    if (idx as usize) < monitor.files.len() {
+                        let parent_path = parent_dir_of(&new_result.path);
+                        let path_id = monitor.path_table.intern(parent_path);
+                        if new_result.is_directory {
+                            monitor.path_table.intern(&new_result.path);
+                        }
+                        monitor.files[idx as usize] = FileEntry::new(
+                            new_result.name, path_id, new_result.size,
+                            new_result.modified_time, new_result.file_id, new_result.is_directory,
+                        );
                     }
-                    monitor.files[idx as usize] = FileEntry::new(
-                        new_result.name,
-                        path_id,
-                        new_result.size,
-                        new_result.modified_time,
-                        new_result.file_id,
-                        new_result.is_directory,
-                    );
                 }
             }
-        }
 
-        // 处理删除：通过 fid 映射到索引，标记 path_id 为已删除
-        {
+            // 处理删除
             let fid_index = monitor.fid_index.as_ref().unwrap();
             let indices_to_remove: Vec<usize> = removed
                 .iter()
@@ -686,38 +689,75 @@ impl VolumeManager {
                     fid_index.iter().find(|(id, _)| *id == fid_u32).map(|(_, idx)| *idx as usize)
                 })
                 .collect();
+            let removed_count = indices_to_remove.len();
             for idx in indices_to_remove {
                 if idx < monitor.files.len() {
-                    // 标记为已删除（替代原来的 path = ""）
                     monitor.files[idx].path_id = PathTable::deleted_id();
                 }
             }
-        }
 
-        // 处理新增：将 SearchResult 转换为 FileEntry 后追加
-        for search_result in added {
-            // 文件：intern 父目录路径得到 path_id（FileEntry.path_id 指向父目录）
-            let parent_path = parent_dir_of(&search_result.path);
-            let path_id = monitor.path_table.intern(parent_path);
-            // 目录：额外注册自身路径供子条目使用
-            if search_result.is_directory {
-                monitor.path_table.intern(&search_result.path);
+            // 处理新增
+            let old_file_count = monitor.files.len();
+            for search_result in added {
+                let parent_path = parent_dir_of(&search_result.path);
+                let path_id = monitor.path_table.intern(parent_path);
+                if search_result.is_directory {
+                    monitor.path_table.intern(&search_result.path);
+                }
+                monitor.files.push(FileEntry::new(
+                    search_result.name, path_id, search_result.size,
+                    search_result.modified_time, search_result.file_id, search_result.is_directory,
+                ));
             }
-            let entry = FileEntry::new(
-                search_result.name,
-                path_id,
-                search_result.size,
-                search_result.modified_time,
-                search_result.file_id,
-                search_result.is_directory,
-            );
-            monitor.files.push(entry);
+
+            // 构建 index_map（compaction 前）
+            let index_map: Vec<Option<usize>> = if has_cache {
+                let mut map = Vec::with_capacity(monitor.files.len());
+                let mut new_idx = 0usize;
+                for i in 0..monitor.files.len() {
+                    if PathTable::is_deleted(monitor.files[i].path_id) {
+                        map.push(None);
+                    } else {
+                        map.push(Some(new_idx));
+                        new_idx += 1;
+                    }
+                }
+                map
+            } else {
+                Vec::new()
+            };
+
+            let new_file_indices: Vec<usize> = if has_cache && added_count > 0 {
+                (old_file_count..monitor.files.len())
+                    .filter_map(|i| index_map.get(i).and_then(|&idx| idx))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // 压缩
+            monitor.compact_files();
+
+            (removed_count, index_map, new_file_indices)
+        }; // monitor 的可变借用在此释放
+
+        // === 阶段 2：增量更新缓存（只持有不可变借用）===
+        if has_cache {
+            let result = crate::index::monitor::IncrementalResult {
+                added: added_count,
+                updated: updated_count,
+                removed: removed_count,
+                total: self.volumes.get(drive_letter).map(|v| v.files.len()).unwrap_or(0),
+                index_map,
+                new_file_indices,
+            };
+            let mut cache = self.search_cache.take().unwrap();
+            let vol_names = self.vol_names.clone();
+            apply_incremental_to_cache(&mut cache, &self.volumes, &vol_names, None, vol_idx, &result);
+            self.search_cache = Some(cache);
+        } else {
+            self.search_cache = None;
         }
-
-        // 压缩：移除已删除条目，重建 fid_index
-        monitor.compact_files();
-
-        self.search_cache = None;
     }
 
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
