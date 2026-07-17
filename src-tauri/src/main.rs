@@ -204,114 +204,124 @@ fn main() {
 
             // 启动异步任务
             tauri::async_runtime::spawn(async move {
-                // 获取卷管理器的锁
-                let mut volume_manager = vm.lock().await;
+                // === 阶段 1：加载配置 + 添加卷 + 设置标志（短暂持锁）===
+                let (volumes_to_scan, include_hidden_files, include_system_files) = {
+                    let mut volume_manager = vm.lock().await;
 
-                // 加载配置
-                let config = crate::config::Config::load().ok();
-                // 获取配置中的监控卷
-                let monitored_from_config = config
-                    .as_ref()
-                    .map(|c| c.monitored_volumes.clone())
-                    .unwrap_or_default();
-                // 获取配置中的索引设置
-                let include_hidden_files = config
-                    .as_ref()
-                    .map(|c| c.index_settings.include_hidden_files)
-                    .unwrap_or(false);
-                let include_system_files = config
-                    .as_ref()
-                    .map(|c| c.index_settings.include_system_files)
-                    .unwrap_or(false);
-                // 获取配置中的扫描所有卷选项
-                let scan_all_volumes = config.as_ref().map(|c| c.scan_all_volumes).unwrap_or(false);
-                log::info!(
-                    "Config: scan_all_volumes={}, admin={}, monitored={:?}",
-                    scan_all_volumes, is_admin, monitored_from_config
-                );
+                    let config = crate::config::Config::load().ok();
+                    let monitored_from_config = config
+                        .as_ref()
+                        .map(|c| c.monitored_volumes.clone())
+                        .unwrap_or_default();
+                    let include_hidden_files = config
+                        .as_ref()
+                        .map(|c| c.index_settings.include_hidden_files)
+                        .unwrap_or(false);
+                    let include_system_files = config
+                        .as_ref()
+                        .map(|c| c.index_settings.include_system_files)
+                        .unwrap_or(false);
+                    let scan_all_volumes = config.as_ref().map(|c| c.scan_all_volumes).unwrap_or(false);
+                    log::info!(
+                        "Config: scan_all_volumes={}, admin={}, monitored={:?}",
+                        scan_all_volumes, is_admin, monitored_from_config
+                    );
 
-                if scan_all_volumes {
-                    // 扫描所有卷（不依赖管理员权限，非管理员也能尝试添加可访问的卷）
-                    log::info!("scan_all_volumes is enabled, adding all NTFS volumes");
-                    if let Ok(volumes) = fs::get_ntfs_volumes() {
-                        for volume in &volumes {
+                    if scan_all_volumes {
+                        log::info!("scan_all_volumes is enabled, adding all NTFS volumes");
+                        if let Ok(volumes) = fs::get_ntfs_volumes() {
+                            for volume in &volumes {
+                                if let Err(e) = volume_manager.add_volume(
+                                    &volume.drive_letter,
+                                    is_admin,
+                                    include_hidden_files,
+                                    include_system_files,
+                                ) {
+                                    log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
+                                }
+                            }
+                        }
+                    } else if !monitored_from_config.is_empty() {
+                        log::info!("Adding volumes from config: {:?}", monitored_from_config);
+                        for volume in &monitored_from_config {
                             if let Err(e) = volume_manager.add_volume(
-                                &volume.drive_letter,
+                                volume,
                                 is_admin,
                                 include_hidden_files,
                                 include_system_files,
                             ) {
-                                log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
+                                log::warn!("Failed to add volume {} from config: {}", volume, e);
                             }
                         }
-                    }
-                } else if !monitored_from_config.is_empty() {
-                    // 如果配置中有监控卷，添加这些卷
-                    log::info!("Adding volumes from config: {:?}", monitored_from_config);
-                    for volume in &monitored_from_config {
+                    } else if is_admin {
+                        log::info!("Admin mode: adding all NTFS volumes");
+                        if let Ok(volumes) = fs::get_ntfs_volumes() {
+                            for volume in &volumes {
+                                if let Err(e) = volume_manager.add_volume(
+                                    &volume.drive_letter,
+                                    is_admin,
+                                    include_hidden_files,
+                                    include_system_files,
+                                ) {
+                                    log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
+                                }
+                            }
+                        }
+                    } else {
+                        log::info!("Non-admin mode: adding default C: volume");
                         if let Err(e) = volume_manager.add_volume(
-                            volume,
+                            "C:",
                             is_admin,
                             include_hidden_files,
                             include_system_files,
                         ) {
-                            log::warn!("Failed to add volume {} from config: {}", volume, e);
+                            log::warn!("Failed to add volume C:: {}", e);
                         }
                     }
-                } else if is_admin {
-                    // 如果以管理员身份运行，添加所有 NTFS 卷
-                    log::info!("Admin mode: adding all NTFS volumes");
-                    if let Ok(volumes) = fs::get_ntfs_volumes() {
-                        for volume in &volumes {
-                            if let Err(e) = volume_manager.add_volume(
-                                &volume.drive_letter,
-                                is_admin,
-                                include_hidden_files,
-                                include_system_files,
-                            ) {
-                                log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
+
+                    // If admin, mark all monitors for USN and skip walkdir full scan
+                    if is_admin {
+                        for drive_letter in volume_manager.volumes() {
+                            if let Some(monitor) = volume_manager.get_monitor_mut(&drive_letter) {
+                                monitor.use_usn = true;
                             }
                         }
                     }
-                } else {
-                    // 如果不是管理员，默认添加 C 盘
-                    log::info!("Non-admin mode: adding default C: volume");
-                    if let Err(e) = volume_manager.add_volume(
-                        "C:",
-                        is_admin,
-                        include_hidden_files,
-                        include_system_files,
-                    ) {
-                        log::warn!("Failed to add volume C:: {}", e);
-                    }
-                }
 
-                // If admin, mark all monitors for USN and skip walkdir full scan
-                if is_admin {
-                    for drive_letter in volume_manager.volumes() {
-                        if let Some(monitor) = volume_manager.get_monitor_mut(&drive_letter) {
-                            monitor.use_usn = true;
-                        }
-                    }
-                }
+                    // 获取卷列表快照，用于后续逐卷扫描
+                    let volumes_to_scan = volume_manager.volumes();
+                    (volumes_to_scan, include_hidden_files, include_system_files)
+                }; // lock released here
 
-                // 扫描所有卷 (walkdir for non-USN volumes only)
-                for drive_letter in volume_manager.volumes() {
-                    // 获取卷监控器
-                    let monitor = volume_manager.take_monitor(&drive_letter);
+                // === 阶段 2：逐卷扫描（每卷只在 take/return 时短暂持锁）===
+                // walkdir 扫描在不持有 volume_manager 锁的情况下进行，
+                // 避免阻塞前端搜索和其他操作
+                for drive_letter in volumes_to_scan {
+                    // 短暂持锁：take monitor
+                    let monitor = {
+                        let mut vm = vm.lock().await;
+                        vm.take_monitor(&drive_letter)
+                    };
+
                     if let Some(mut m) = monitor {
                         if m.use_usn {
                             // USN volumes are scanned via the USN worker
-                            volume_manager.return_monitor(&drive_letter, m);
+                            let mut vm = vm.lock().await;
+                            vm.return_monitor(&drive_letter, m);
                             continue;
                         }
-                        // 克隆应用句柄
+                        // 不持锁：执行 walkdir 扫描（耗时操作）
                         let handle_clone = handle.clone();
-                        // 扫描卷并显示进度
-                        if let Ok(count) = m.scan_with_progress_callback(&handle_clone) {
-                            // 记录扫描结果
+                        let scan_result = m.scan_with_progress_callback(&handle_clone);
+
+                        // 短暂持锁：return monitor
+                        {
+                            let mut vm = vm.lock().await;
+                            vm.return_monitor(&drive_letter, m);
+                        }
+
+                        if let Ok(count) = scan_result {
                             log::info!("Scanned volume {}: {} files", drive_letter, count);
-                            // 发送扫描完成事件
                             let _ = handle.emit(
                                 "scan-complete",
                                 serde_json::json!({
@@ -320,22 +330,21 @@ fn main() {
                                 }),
                             );
                         }
-                        // 将监控器返回给卷管理器
-                        volume_manager.return_monitor(&drive_letter, m);
                     }
                 }
 
-                // If admin, issue full-scan commands to the USN worker
+                // === 阶段 3：dispatch USN full scan（短暂持锁）===
                 if let Some(ref usn) = usn_manager {
-                    for drive_letter in volume_manager.volumes() {
+                    let volumes = {
+                        let vm = vm.lock().await;
+                        vm.volumes()
+                    };
+                    for drive_letter in &volumes {
                         let dl_char = drive_letter.chars().next().unwrap_or('C');
                         log::info!("[USN] Issuing full scan for drive {} (hidden={}, system={})", dl_char, include_hidden_files, include_system_files);
                         usn.full_scan(dl_char, include_hidden_files, include_system_files);
                     }
                 }
-
-                // 释放卷管理器锁
-                drop(volume_manager);
 
                 // Channel to signal when first full scan result arrives
                 let (full_scan_done_tx, full_scan_done_rx) = tokio::sync::watch::channel(false);
@@ -440,6 +449,7 @@ fn main() {
                 if let Some(ref usn) = usn_manager {
                     let usn_clone = usn.clone();
                     let vm_clone_for_usn = vm.clone();
+                    let is_searching_for_usn = is_searching.clone();
                     let mut scan_done_rx = full_scan_done_rx;
 
                     tauri::async_runtime::spawn(async move {
@@ -472,6 +482,12 @@ fn main() {
                             if interval == 0 {
                                 log::info!("[USN] Poll interval is 0, skipping");
                                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                                continue;
+                            }
+
+                            // 搜索进行中时跳过轮询，避免与搜索竞争锁
+                            if is_searching_for_usn.load(Ordering::SeqCst) {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                                 continue;
                             }
 
@@ -560,35 +576,43 @@ fn main() {
                                 break;
                             }
 
-                            // 扫描阶段：短暂持锁
-                            let inc_result = {
+                            // 步骤 1：短暂持锁 take monitor
+                            let mut monitor = {
                                 let mut vm = vm_clone.lock().await;
-                                let mut monitor = vm.take_monitor(&drive_letter);
-                                let mut result = None;
-                                if let Some(ref mut m) = monitor {
-                                    if m.use_usn {
-                                        // USN volumes are handled by the USN polling task
-                                        if let Some(m) = monitor {
-                                            vm.return_monitor(&drive_letter, m);
-                                        }
-                                        continue;
-                                    }
-                                    m.update_settings(include_hidden, include_system);
-                                    if let Ok(r) = m.scan_incremental(&handle_clone) {
-                                        if r.added > 0 || r.updated > 0 || r.removed > 0 {
-                                            log::info!(
-                                                "Incremental {}: +{} ~{} -{} (total: {})",
-                                                drive_letter, r.added, r.updated, r.removed, r.total
-                                            );
-                                            result = Some(r);
-                                        }
-                                    }
-                                }
-                                if let Some(m) = monitor {
-                                    vm.return_monitor(&drive_letter, m);
-                                }
-                                result
+                                vm.take_monitor(&drive_letter)
                             };
+
+                            if let Some(ref mut m) = monitor {
+                                if m.use_usn {
+                                    // USN volumes are handled by the USN polling task
+                                    let mut vm = vm_clone.lock().await;
+                                    vm.return_monitor(&drive_letter, monitor.take().unwrap());
+                                    continue;
+                                }
+                                m.update_settings(include_hidden, include_system);
+                            }
+
+                            // 步骤 2：不持锁执行增量扫描（最耗时的部分）
+                            let inc_result = if let Some(ref mut m) = monitor {
+                                match m.scan_incremental(&handle_clone) {
+                                    Ok(r) if r.added > 0 || r.updated > 0 || r.removed > 0 => {
+                                        log::info!(
+                                            "Incremental {}: +{} ~{} -{} (total: {})",
+                                            drive_letter, r.added, r.updated, r.removed, r.total
+                                        );
+                                        Some(r)
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+
+                            // 步骤 3：短暂持锁 return monitor
+                            if let Some(m) = monitor {
+                                let mut vm = vm_clone.lock().await;
+                                vm.return_monitor(&drive_letter, m);
+                            }
 
                             // 更新缓存阶段：短暂持锁
                             if let Some(result) = inc_result {
