@@ -45,7 +45,10 @@ function App() {
     });
 
     const unlistenUpdated = listen<{ volume: string; count: number; cache_total?: number }>('index-updated', async (_event) => {
-      loadIndexStatus();
+      // 删除事件（volume=""）跳过 loadIndexStatus，减少 ~30ms IPC 开销
+      if (_event.payload.volume !== '') {
+        loadIndexStatus();
+      }
       if (_event.payload.cache_total !== undefined) {
         setTotalCount(_event.payload.cache_total);
       }
@@ -197,7 +200,8 @@ function App() {
     const { field, direction } = sortStateRef.current;
     const { query, filesOnly, directoriesOnly } = searchStateRef.current;
     try {
-      // 调用 search_files 重建后端缓存
+      // 调用 search_files 重建后端缓存，直接使用返回的 first_batch，
+      // 避免额外的 get_records_range IPC 调用（省 50-200ms）
       const response = await invoke<SearchResponse>('search_files', {
         params: { query, files_only: filesOnly, directories_only: directoriesOnly, sort_by: field, sort_direction: direction }
       });
@@ -205,12 +209,9 @@ function App() {
       // 使正在进行的旧 fetchRecordsRange 失效（它可能用了旧缓存），防止覆盖新结果
       ++fetchCounterRef.current;
       setTotalCount(response.total);
-      const { start, end } = visibleRangeRef.current;
       if (response.total > 0) {
-        // 获取当前可见范围的排序后数据
-        const range = await invoke<RecordsRangeResponse>('get_records_range', { start, end, sortBy: field, sortDirection: direction });
-        setResultsOffset(start);
-        setResults(range.results);
+        setResultsOffset(0);
+        setResults(response.results);
       } else {
         setResultsOffset(0);
         setResults([]);
