@@ -113,32 +113,18 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   const getSortIcon = (field: SortField) => sortField !== field ? '' : (sortDirection === 'asc' ? ' ▲' : ' ▼');
 
   const handleContextMenu = (e: React.MouseEvent, path: string) => {
-    // 阻止浏览器/WebView 默认菜单
     e.preventDefault();
-    // 诊断日志：确认右键事件是否触发、坐标、窗口位置（用于定位"无反应"根因）
-    console.log('[CTX_MENU] handleContextMenu called, path:', path, 'clientX:', e.clientX, 'clientY:', e.clientY, 'window.screenX:', window.screenX, 'window.screenY:', window.screenY);
     setShowTooltip(false);
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
       hoverTimeoutRef.current = null;
     }
     // 屏幕坐标 = 视口坐标 + 窗口偏移
-    // Tauri WebView2 顶层窗口的 window.screenX/Y 即窗口在屏幕上的位置
     const screenX = e.clientX + (window.screenX || 0);
     const screenY = e.clientY + (window.screenY || 0);
-    // 诊断日志：打印即将发送到 Rust 端的最终屏幕坐标
-    console.log('[CTX_MENU] invoking show_context_menu with screenX:', screenX, 'screenY:', screenY);
-    // 调用 Rust 端 show_context_menu，弹出系统 Shell 菜单
-    // 系统菜单会自动显示"打开/打开方式/属性/删除到回收站"等所有原生项
     invoke('show_context_menu', { path, screenX, screenY })
-      .then(ret => {
-        // 诊断日志：Rust 端正常返回
-        console.log('[CTX_MENU] show_context_menu returned successfully:', ret);
-      })
       .catch(err => {
-        // 诊断日志：Rust 端失败，打印错误类型/消息/堆栈
         console.error('[CTX_MENU] show_context_menu FAILED:', err);
-        console.error('[CTX_MENU] error type:', typeof err, 'message:', err?.message, 'stack:', err?.stack);
       });
   };
 
@@ -238,15 +224,14 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
                       onClick={() => handleRowClick(globalIndex)}
                       onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
-                      onContextMenu={(e) => handleContextMenu(e, result.path)}
                       onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
                       onMouseLeave={handleMouseLeave}
                     >
-                      <div className="col-name">
+                      <div className="col-name" onContextMenu={(e) => handleContextMenu(e, result.path)}>
                         <FileIcon path={result.path} isDirectory={result.is_directory} />
                         <span className="col-name-text" title={result.name}>{result.name}</span>
                       </div>
-                      <div className="col-path" title={result.path}>{getDirectoryPath(result.path, result.is_directory)}</div>
+                      <div className="col-path" title={result.path} onContextMenu={(e) => handleContextMenu(e, getDirectoryPath(result.path, result.is_directory))}>{getDirectoryPath(result.path, result.is_directory)}</div>
                       <div className="col-size">{formatSize(result.size)}</div>
                       <div className="col-modified">{formatTime(result.modified_time)}</div>
                     </div>
