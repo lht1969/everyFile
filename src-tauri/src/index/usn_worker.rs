@@ -1161,23 +1161,15 @@ fn handle_poll_changes(
         .max(journal_data.lowest_valid_usn)
         .min(journal_data.next_usn);
 
-    log::info!(
-        "[USN] Poll {}: last_usn={}, lowest_valid_usn={}, next_usn={}, journal_id={}, using start={}",
-        drive_letter, effective_last_usn, journal_data.lowest_valid_usn,
-        journal_data.next_usn, journal_data.journal_id, start_usn
-    );
+    log::info!("[USN] Poll {}: start_usn={}, next_usn={}, using start={}",
+        drive_letter, effective_last_usn, journal_data.next_usn, start_usn);
 
     // 若 start_usn >= next_usn，说明无新变更，直接返回（不发送 IncrementalResult）
     if start_usn >= journal_data.next_usn {
-        log::info!(
-            "[USN] Poll {}: start_usn={} >= next_usn={}, no new changes, skipping",
-            drive_letter, start_usn, journal_data.next_usn
-        );
         return;
     }
 
     // 直接调用 FSCTL_READ_USN_JOURNAL 读取变更记录
-    // 绕过 usn-journal-rs 的 iter_with_options，使用 API 返回的 next-start USN 作为 last_usn
     let vol_handle = match ntfs_mft::open_volume_handle(drive_letter) {
         Some(h) => h,
         None => {
@@ -1187,11 +1179,6 @@ fn handle_poll_changes(
             return;
         }
     };
-
-    log::info!(
-        "[USN] Poll {}: calling FSCTL_READ_USN_JOURNAL directly from start_usn={}",
-        drive_letter, start_usn
-    );
 
     let (records, next_start_usn) = match read_usn_records_direct(
         vol_handle,

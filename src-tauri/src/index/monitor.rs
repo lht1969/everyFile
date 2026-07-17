@@ -881,15 +881,20 @@ impl VolumeMonitor {
     /// 清理已删除条目（path_id == PathTable::deleted_id()）并重建 fid_index
     ///
     /// FileEntry 不再存储完整路径字符串，删除标记改为 path_id = u32::MAX
+    /// 优化：仅当有文件被删除时才重建 fid_index（O(N) + O(N log N)）
     pub fn compact_files(&mut self) {
-        // 通过 PathTable::is_deleted 判断是否已删除
+        let old_len = self.files.len();
         self.files.retain(|f| !PathTable::is_deleted(f.path_id));
-        let mut new_fid_index: Vec<(u32, u32)> = Vec::with_capacity(self.files.len());
-        for (i, f) in self.files.iter().enumerate() {
-            new_fid_index.push((f.file_id, i as u32));
+        let removed = old_len - self.files.len();
+        // 仅当有文件被删除时才重建 fid_index，避免每次轮询都做 O(N) + O(N log N) 操作
+        if removed > 0 {
+            let mut new_fid_index: Vec<(u32, u32)> = Vec::with_capacity(self.files.len());
+            for (i, f) in self.files.iter().enumerate() {
+                new_fid_index.push((f.file_id, i as u32));
+            }
+            new_fid_index.sort_unstable_by_key(|(id, _)| *id);
+            self.fid_index = Some(new_fid_index);
         }
-        new_fid_index.sort_unstable_by_key(|(id, _)| *id);
-        self.fid_index = Some(new_fid_index);
     }
 
     /// Update settings without recreating the monitor or clearing its file list.
