@@ -1,12 +1,16 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
+use tauri::Emitter;
 use tauri::Manager;
+use tauri::State;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+use super::search::AppState;
 
 static CTX_MENU_CMD: AtomicI32 = AtomicI32::new(0);
 static mut CTX_MENU_ICM3: usize = 0;
@@ -18,6 +22,7 @@ pub fn show_context_menu(
     screen_x: i32,
     screen_y: i32,
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
     log::info!("Showing context menu for '{}' at ({}, {})", path, screen_x, screen_y);
 
@@ -146,6 +151,27 @@ pub fn show_context_menu(
     }
 
     unsafe { let _ = DestroyMenu(hmenu); }
+
+    // 检查文件是否被删除（如"删除"命令），如果是则立即更新索引并通知前端刷新
+    if !Path::new(&path).exists() {
+        log::info!("File '{}' no longer exists after context menu action, updating index", path);
+        let vm = state.volume_manager.clone();
+        let path_clone = path.clone();
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut vm = vm.lock().await;
+            vm.remove_file(&path_clone);
+            drop(vm);
+            let _ = app_clone.emit("index-updated", serde_json::json!({
+                "volume": "",
+                "added": 0,
+                "updated": 0,
+                "removed": 1,
+                "total": 0,
+                "cache_total": 0
+            }));
+        });
+    }
 
     Ok(())
 }

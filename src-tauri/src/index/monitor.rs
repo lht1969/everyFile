@@ -372,16 +372,34 @@ impl VolumeManager {
             false
         };
 
-        let (matched, total) = if can_reuse_cache {
-            // 复用旧 cache 的 matched（move out 后再放回去）
+        // === 取出旧 cache：分离 matched 和 sort perm ===
+        // 当 can_reuse_cache 时，matched 和 perm 都有效（matched 向量相同）。
+        // 当 can_reuse_cache=false 时，matched 向量已变，旧 perm 索引越界不可复用，
+        // 必须丢弃并在下面重建。否则 release 模式下 panic=abort 会直接终止进程。
+        let (matched, total, old_perms) = if can_reuse_cache {
             log::info!("search_with_options: reusing cache (key={})", new_cache_key);
             let old = self.search_cache.take().unwrap();
             let m = old.matched;
             let t = old.total;
-            // 重新插入 cache（matched 移出来后再放回，下面会整体替换）
-            // 注意：此处仅在 query/files_only/directories_only 未变时走此分支
-            (m, t)
+            // 保留旧排序排列（matched 相同，perm 索引仍然有效）
+            let perms = SearchCache {
+                cache_key: old.cache_key,
+                query: old.query,
+                files_only: old.files_only,
+                directories_only: old.directories_only,
+                total: old.total,
+                created_at: old.created_at,
+                matched: Vec::new(),
+                sorted_by_name: old.sorted_by_name,
+                sorted_by_path: old.sorted_by_path,
+                sorted_by_size: old.sorted_by_size,
+                sorted_by_modified: old.sorted_by_modified,
+                sort_access_order: old.sort_access_order,
+            };
+            (m, t, Some(perms))
         } else {
+            // 丢弃旧 cache（其 perm 索引的是旧 matched，不可复用）
+            self.search_cache = None;
             // 正常搜索流程
             let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
             // 使用 Mutex 保护 Vec，允许多线程并发 push
@@ -440,12 +458,8 @@ impl VolumeManager {
             let m = matched_lock.into_inner().unwrap();
             let t = m.len();
             log::info!("search_with_options: matched {} files, {:?}", t, t0.elapsed());
-            (m, t)
+            (m, t, None)
         };
-
-        // === 取出旧 cache 的 perm 缓存（如果有）===
-        // 仅在复用 cache 时才有 old_perms，新搜索时为 None
-        let old_perms = self.search_cache.take();
 
         // 为当前 sort_by 准备 perm：复用旧 perm 或重新构建
         // 注意：当前 sort_by 的 perm 在 build_sort_permutation 中会构建，
