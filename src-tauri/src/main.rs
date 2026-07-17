@@ -346,8 +346,11 @@ fn main() {
                     }
                 }
 
-                // Channel to signal when first full scan result arrives
+                // 创建全量扫描完成信号：walkdir 扫描完成后立即发送，
+                // USN full scan 结果到达时也会发送（双保险）
                 let (full_scan_done_tx, full_scan_done_rx) = tokio::sync::watch::channel(false);
+                // walkdir 全量扫描已在阶段 2 完成，直接发送完成信号
+                let _ = full_scan_done_tx.send(true);
 
                 // Spawn USN response handler thread (admin only)
                 if let Some(ref usn) = usn_manager {
@@ -445,6 +448,9 @@ fn main() {
                         .expect("failed to spawn USN response handler thread");
                 }
 
+                // 克隆 full_scan_done_rx 供 walkdir 增量任务使用（USN 轮询任务会 take 原始值）
+                let incremental_done_rx = full_scan_done_rx.clone();
+
                 // Spawn USN polling task (admin only)
                 if let Some(ref usn) = usn_manager {
                     let usn_clone = usn.clone();
@@ -520,12 +526,24 @@ fn main() {
                 let handle_clone = handle.clone();
                 let is_searching_clone = is_searching.clone();
                 let last_update_clone = last_index_update.clone();
+                let mut incremental_done_rx = incremental_done_rx;
 
                 tauri::async_runtime::spawn(async move {
                     let mut next_scan: Option<tokio::time::Instant> = None;
 
-                    // 启动后延迟 60 秒再开始增量更新，让前端先完成初始加载和排序
-                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    // 等待全量扫描完成后再开始增量更新
+                    // 比固定 60 秒延迟更精确：全量扫描 30 秒完成则等 30 秒，5 分钟完成则等 5 分钟
+                    if !*incremental_done_rx.borrow() {
+                        log::info!("[Incremental] Waiting for full scan to complete...");
+                        while incremental_done_rx.changed().await.is_ok() {
+                            if *incremental_done_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                    // 全量扫描完成后延迟 5 秒，让前端完成初始加载
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    log::info!("[Incremental] Starting incremental scan task");
 
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
