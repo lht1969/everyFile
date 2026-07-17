@@ -221,14 +221,14 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
                   className="interval-input"
                   type="number"
                   min={0}
-                  max={1440}
-                  value={Math.round(config.update_interval / 60)}
+                  max={3600}
+                  value={config.update_interval}
                   onChange={(e) => {
-                    const minutes = Math.max(0, parseInt(e.target.value) || 0);
-                    setConfig({ ...config, update_interval: minutes * 60 });
+                    const seconds = Math.max(0, parseInt(e.target.value) || 0);
+                    setConfig({ ...config, update_interval: seconds });
                   }}
                 />
-                <span className="interval-hint">设为 0 表示不自动重建</span>
+                <span className="interval-hint">秒，设为 0 表示不自动更新</span>
               </div>
             )}
             <button className="rebuild-button" onClick={onRebuildIndex} disabled={rebuilding}>
