@@ -456,18 +456,25 @@ fn main() {
                     let usn_clone = usn.clone();
                     let vm_clone_for_usn = vm.clone();
                     let is_searching_for_usn = is_searching.clone();
-                    let mut scan_done_rx = full_scan_done_rx;
 
                     tauri::async_runtime::spawn(async move {
-                        // 等待全量扫描完成后再开始轮询
-                        if !*scan_done_rx.borrow() {
-                            log::info!("[USN] Polling task waiting for full scan to complete...");
-                            while scan_done_rx.changed().await.is_ok() {
-                                if *scan_done_rx.borrow() {
-                                    break;
-                                }
+                        // 等待所有卷的全量扫描完成（每个卷都有文件数据）再开始轮询
+                        // 不依赖 watch channel 信号，因为 USN full scan 是异步的，
+                        // 可能 C 盘完成后 D/E 盘还在扫描中
+                        log::info!("[USN] Polling task waiting for all volumes to have data...");
+                        loop {
+                            let all_ready = {
+                                let vm = vm_clone_for_usn.lock().await;
+                                let volumes = vm.volumes();
+                                volumes.iter().all(|v| vm.get_file_count(v) > 0)
+                            };
+                            if all_ready {
+                                break;
                             }
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
+                        // 额外等 3 秒让前端完成初始加载
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                         log::info!("[USN] Polling task started");
 
                         loop {
