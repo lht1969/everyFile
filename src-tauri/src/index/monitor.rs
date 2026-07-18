@@ -271,57 +271,65 @@ fn merge_sorted_results(
     for &idx in base_indices.unwrap() { all_indices.push((idx, true)); }
     for &idx in delta_indices.unwrap() { all_indices.push((idx, false)); }
 
-    // 获取排序键并归并
-    let base_keys: Vec<String> = base_indices.unwrap().iter()
+    // 获取排序键并归并（与 build_sort_permutation 使用相同的排序逻辑）
+    // Name/Score: 按文件名排序
+    // Path: 按 (ordinal, name) 排序（与 build_sort_permutation 一致）
+    // Size: 按文件大小排序
+    // ModifiedTime: 按修改时间排序
+    let base_keys: Vec<(u32, String)> = base_indices.unwrap().iter()
         .map(|&i| {
             let (vol, file_idx) = &base_matched[i as usize];
             let vol_name = &vol_names[*vol as usize];
-            volumes.get(vol_name).map_or(String::new(), |m| {
-                m.files.get(*file_idx as usize).map_or(String::new(), |f| {
+            volumes.get(vol_name).map_or((0, String::new()), |m| {
+                m.files.get(*file_idx as usize).map_or((0, String::new()), |f| {
                     match sort_by {
-                        SortBy::Name | SortBy::Score => f.name.to_string(),
+                        SortBy::Name | SortBy::Score => (0, f.name.to_string()),
                         SortBy::Path => {
                             let pt = &m.path_table;
-                            pt.resolve_file_path(f.path_id, &f.name).to_string()
+                            (pt.get_ordinal(f.path_id), f.name.to_string())
                         }
-                        SortBy::Size => format!("{:020}", f.size),
-                        SortBy::ModifiedTime => format!("{:020}", f.modified_time),
+                        SortBy::Size => (0, format!("{:020}", f.size)),
+                        SortBy::ModifiedTime => (0, format!("{:020}", f.modified_time)),
                     }
                 })
             })
         })
         .collect();
-    let delta_keys: Vec<String> = delta_indices.unwrap().iter()
+    let delta_keys: Vec<(u32, String)> = delta_indices.unwrap().iter()
         .map(|&i| {
             let (vol, file_idx) = &delta_matched[i as usize];
             let vol_name = &vol_names[*vol as usize];
-            volumes.get(vol_name).map_or(String::new(), |m| {
-                m.files.get(*file_idx as usize).map_or(String::new(), |f| {
+            volumes.get(vol_name).map_or((0, String::new()), |m| {
+                m.files.get(*file_idx as usize).map_or((0, String::new()), |f| {
                     match sort_by {
-                        SortBy::Name | SortBy::Score => f.name.to_string(),
+                        SortBy::Name | SortBy::Score => (0, f.name.to_string()),
                         SortBy::Path => {
                             let pt = &m.path_table;
-                            pt.resolve_file_path(f.path_id, &f.name).to_string()
+                            (pt.get_ordinal(f.path_id), f.name.to_string())
                         }
-                        SortBy::Size => format!("{:020}", f.size),
-                        SortBy::ModifiedTime => format!("{:020}", f.modified_time),
+                        SortBy::Size => (0, format!("{:020}", f.size)),
+                        SortBy::ModifiedTime => (0, format!("{:020}", f.modified_time)),
                     }
                 })
             })
         })
         .collect();
 
-    // 归并排序
+    // 归并排序（使用与 build_sort_permutation 相同的比较逻辑）
     let mut merged: Vec<(usize, bool)> = (0..base_len).map(|i| (i, true))
         .chain((0..delta_len).map(|i| (i, false)))
         .collect();
 
     merged.sort_by(|a, b| {
-        let key_a = if a.1 { &base_keys[a.0] } else { &delta_keys[a.0] };
-        let key_b = if b.1 { &base_keys[b.0] } else { &delta_keys[b.0] };
+        let (ord_a, name_a) = if a.1 { &base_keys[a.0] } else { &delta_keys[a.0] };
+        let (ord_b, name_b) = if b.1 { &base_keys[b.0] } else { &delta_keys[b.0] };
+        let cmp = match sort_by {
+            SortBy::Path => ord_a.cmp(ord_b).then(name_a.cmp(name_b)),
+            _ => name_a.cmp(name_b),
+        };
         match sort_direction {
-            SortDirection::Ascending => key_a.cmp(key_b),
-            SortDirection::Descending => key_b.cmp(key_a),
+            SortDirection::Ascending => cmp,
+            SortDirection::Descending => cmp.reverse(),
         }
     });
 
