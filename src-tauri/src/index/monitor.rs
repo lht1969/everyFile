@@ -165,7 +165,7 @@ impl SearchCache {
         start: usize,
         end: usize,
     ) -> Vec<SearchResult> {
-        // === base 排列：仅在需要时构建（稳定，不频繁重建）===
+        // === base 排列：直接在 matched 上构建（包含无效条目，提取时跳过）===
         let base_needs_build = match sort_by {
             SortBy::Name | SortBy::Score => self.sorted_by_name.is_none(),
             SortBy::Path => self.sorted_by_path.is_none(),
@@ -174,11 +174,7 @@ impl SearchCache {
         };
         if base_needs_build {
             self.evict_lru_permutation();
-            let base_valid: Vec<(u8, u32)> = self.matched.iter()
-                .filter(|(v, _)| *v != u8::MAX)
-                .copied()
-                .collect();
-            let perm = build_sort_permutation(&base_valid, volumes, vol_names, sort_by);
+            let perm = build_sort_permutation(&self.matched, volumes, vol_names, sort_by);
             match sort_by {
                 SortBy::Name | SortBy::Score => { self.sorted_by_name = Some(perm); }
                 SortBy::Path => { self.sorted_by_path = Some(perm); }
@@ -219,15 +215,9 @@ impl SearchCache {
             SortBy::ModifiedTime => self.delta_sorted_by_modified.as_ref(),
         };
 
-        // 收集 base 有效条目
-        let base_valid: Vec<(u8, u32)> = self.matched.iter()
-            .filter(|(v, _)| *v != u8::MAX)
-            .copied()
-            .collect();
-
-        // 归并两个有序列表
+        // 归并两个有序列表（base 中的无效条目在归并时跳过）
         merge_sorted_results(
-            &base_valid, base_indices,
+            &self.matched, base_indices,
             &self.delta_matched, delta_indices,
             volumes, vol_names, sort_by, sort_direction, start, end,
         )
@@ -272,16 +262,17 @@ fn merge_sorted_results(
     for &idx in delta_indices.unwrap() { all_indices.push((idx, false)); }
 
     // 获取排序键并归并（与 build_sort_permutation 使用相同的排序逻辑）
-    // Name/Score: 按文件名排序
-    // Path: 按 (ordinal, name) 排序（与 build_sort_permutation 一致）
-    // Size: 按文件大小排序
-    // ModifiedTime: 按修改时间排序
+    // base 中 vol=u8::MAX 的条目被跳过
+    let mut base_valid_positions: Vec<usize> = Vec::new();
     let base_keys: Vec<(u32, String)> = base_indices.unwrap().iter()
-        .map(|&i| {
+        .enumerate()
+        .filter_map(|(pos, &i)| {
             let (vol, file_idx) = &base_matched[i as usize];
+            if *vol == u8::MAX { return None; } // 跳过无效条目
+            base_valid_positions.push(pos);
             let vol_name = &vol_names[*vol as usize];
-            volumes.get(vol_name).map_or((0, String::new()), |m| {
-                m.files.get(*file_idx as usize).map_or((0, String::new()), |f| {
+            volumes.get(vol_name).and_then(|m| {
+                m.files.get(*file_idx as usize).map(|f| {
                     match sort_by {
                         SortBy::Name | SortBy::Score => (0, f.name.to_string()),
                         SortBy::Path => {
@@ -295,12 +286,15 @@ fn merge_sorted_results(
             })
         })
         .collect();
+    let mut delta_valid_positions: Vec<usize> = Vec::new();
     let delta_keys: Vec<(u32, String)> = delta_indices.unwrap().iter()
-        .map(|&i| {
+        .enumerate()
+        .filter_map(|(pos, &i)| {
+            delta_valid_positions.push(pos);
             let (vol, file_idx) = &delta_matched[i as usize];
             let vol_name = &vol_names[*vol as usize];
-            volumes.get(vol_name).map_or((0, String::new()), |m| {
-                m.files.get(*file_idx as usize).map_or((0, String::new()), |f| {
+            volumes.get(vol_name).and_then(|m| {
+                m.files.get(*file_idx as usize).map(|f| {
                     match sort_by {
                         SortBy::Name | SortBy::Score => (0, f.name.to_string()),
                         SortBy::Path => {
@@ -316,8 +310,8 @@ fn merge_sorted_results(
         .collect();
 
     // 归并排序（使用与 build_sort_permutation 相同的比较逻辑）
-    let mut merged: Vec<(usize, bool)> = (0..base_len).map(|i| (i, true))
-        .chain((0..delta_len).map(|i| (i, false)))
+    let mut merged: Vec<(usize, bool)> = (0..base_keys.len()).map(|i| (i, true))
+        .chain((0..delta_keys.len()).map(|i| (i, false)))
         .collect();
 
     merged.sort_by(|a, b| {
@@ -333,13 +327,15 @@ fn merge_sorted_results(
         }
     });
 
-    // 取 [start, end) 范围
+    // 取 [start, end) 范围，从原始 matched 中提取结果
     let sliced: Vec<_> = merged.into_iter().skip(start).take(end - start).collect();
     sliced.into_iter().filter_map(|(idx, is_base)| {
         let (vol, file_idx) = if is_base {
-            base_matched[base_indices.unwrap()[idx] as usize]
+            let original_pos = base_valid_positions[idx];
+            base_matched[base_indices.unwrap()[original_pos] as usize]
         } else {
-            delta_matched[delta_indices.unwrap()[idx] as usize]
+            let original_pos = delta_valid_positions[idx];
+            delta_matched[delta_indices.unwrap()[original_pos] as usize]
         };
         let vol_name = &vol_names[vol as usize];
         volumes.get(vol_name).and_then(|m| {
