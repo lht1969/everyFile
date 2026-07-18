@@ -218,9 +218,10 @@ impl SearchCache {
             SortBy::ModifiedTime => self.delta_sorted_by_modified.as_ref(),
         };
 
-        // 归并两个有序列表（base 中的无效条目在归并时跳过）
+        // 归并两个有序列表（base 中的已删除条目在归并时跳过）
         merge_sorted_results(
             &self.matched, base_indices,
+            &self.deleted_indices,
             &self.delta_matched, delta_indices,
             volumes, vol_names, sort_by, sort_direction, start, end,
         )
@@ -230,9 +231,11 @@ impl SearchCache {
 /// 归并两个有序列表的结果（base + delta），取 [start, end) 范围
 ///
 /// base 和 delta 各自已按 sort_by 排序，使用双指针归并，O(N) 时间
+/// base 中在 deleted_indices 里的条目会被跳过
 fn merge_sorted_results(
     base_matched: &[(u8, u32)],
     base_indices: Option<&Vec<u32>>,
+    deleted_indices: &std::collections::HashSet<usize>,
     delta_matched: &[(u8, u32)],
     delta_indices: Option<&Vec<u32>>,
     volumes: &HashMap<String, VolumeMonitor>,
@@ -249,29 +252,14 @@ fn merge_sorted_results(
         return Vec::new();
     }
 
-    // 如果 delta 为空，直接从 base 取
-    if delta_len == 0 {
-        return extract_results(base_matched, base_indices.unwrap(), volumes, vol_names, sort_direction, start, end);
-    }
-    // 如果 base 为空，直接从 delta 取
-    if base_len == 0 {
-        return extract_results(delta_matched, delta_indices.unwrap(), volumes, vol_names, sort_direction, start, end);
-    }
-
-    // 双指针归并：收集所有结果然后排序（简化实现，delta 通常很小）
-    let mut all_indices: Vec<(u32, bool)> = Vec::with_capacity(base_len + delta_len);
-    // true = base, false = delta
-    for &idx in base_indices.unwrap() { all_indices.push((idx, true)); }
-    for &idx in delta_indices.unwrap() { all_indices.push((idx, false)); }
-
     // 获取排序键并归并（与 build_sort_permutation 使用相同的排序逻辑）
-    // base 中 vol=u8::MAX 的条目被跳过
+    // base 中在 deleted_indices 里的条目被跳过
     let mut base_valid_positions: Vec<usize> = Vec::new();
     let base_keys: Vec<(u32, String)> = base_indices.unwrap().iter()
         .enumerate()
         .filter_map(|(pos, &i)| {
+            if deleted_indices.contains(&(i as usize)) { return None; } // 跳过已删除条目
             let (vol, file_idx) = &base_matched[i as usize];
-            if *vol == u8::MAX { return None; } // 跳过无效条目
             base_valid_positions.push(pos);
             let vol_name = &vol_names[*vol as usize];
             volumes.get(vol_name).and_then(|m| {
