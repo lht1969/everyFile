@@ -68,7 +68,6 @@ fn parent_dir_of(full_path: &str) -> &str {
 
 pub struct SearchCache {
     /// (query, files_only, directories_only) 三元组 hash
-    /// 用于 search_with_options 复用旧 cache，避免 sort 切换时重建整个 search_cache
     cache_key: u64,
     query: String,
     files_only: bool,
@@ -76,14 +75,22 @@ pub struct SearchCache {
     pub total: usize,
     pub created_at: Instant,
     pub matched: Vec<(u8, u32)>,
-    // 排序排列向量：使用 u32 索引而非 usize 以节省内存
-    // 221 万文件完全可用 u32 表示，每项从 8 字节降至 4 字节，节省 50%
+    /// 增量匹配结果：新增文件的搜索结果，不触发 base 排列重建
+    pub delta_matched: Vec<(u8, u32)>,
+    // 基础排序排列（稳定，仅 merge 时重建）
     sorted_by_name: Option<Vec<u32>>,
     sorted_by_path: Option<Vec<u32>>,
     sorted_by_size: Option<Vec<u32>>,
     sorted_by_modified: Option<Vec<u32>>,
-    // LRU tracking: order of last access for each sort permutation (most recent last)
+    // 增量排序排列（频繁重建，但文件少所以极快）
+    delta_sorted_by_name: Option<Vec<u32>>,
+    delta_sorted_by_path: Option<Vec<u32>>,
+    delta_sorted_by_size: Option<Vec<u32>>,
+    delta_sorted_by_modified: Option<Vec<u32>>,
+    // LRU tracking
     sort_access_order: Vec<SortBy>,
+    /// 增量条目计数，超过阈值时触发 merge
+    delta_count: usize,
 }
 
 impl SearchCache {
@@ -381,7 +388,6 @@ impl VolumeManager {
             let old = self.search_cache.take().unwrap();
             let m = old.matched;
             let t = old.total;
-            // 保留旧排序排列（matched 相同，perm 索引仍然有效）
             let perms = SearchCache {
                 cache_key: old.cache_key,
                 query: old.query,
@@ -390,11 +396,17 @@ impl VolumeManager {
                 total: old.total,
                 created_at: old.created_at,
                 matched: Vec::new(),
+                delta_matched: old.delta_matched,
                 sorted_by_name: old.sorted_by_name,
                 sorted_by_path: old.sorted_by_path,
                 sorted_by_size: old.sorted_by_size,
                 sorted_by_modified: old.sorted_by_modified,
+                delta_sorted_by_name: old.delta_sorted_by_name,
+                delta_sorted_by_path: old.delta_sorted_by_path,
+                delta_sorted_by_size: old.delta_sorted_by_size,
+                delta_sorted_by_modified: old.delta_sorted_by_modified,
                 sort_access_order: old.sort_access_order,
+                delta_count: old.delta_count,
             };
             (m, t, Some(perms))
         } else {
@@ -541,13 +553,19 @@ impl VolumeManager {
             files_only: options.files_only,
             directories_only: options.directories_only,
             matched,
+            delta_matched: Vec::new(),
             total,
             created_at: Instant::now(),
             sorted_by_name: sn,
             sorted_by_path: sp,
             sorted_by_size: ss,
             sorted_by_modified: sm,
+            delta_sorted_by_name: None,
+            delta_sorted_by_path: None,
+            delta_sorted_by_size: None,
+            delta_sorted_by_modified: None,
             sort_access_order,
+            delta_count: 0,
         });
         log::info!("search_with_options total: {:?}", t0.elapsed());
 
