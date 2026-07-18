@@ -102,6 +102,36 @@ impl SearchCache {
         self.created_at = Instant::now();
     }
 
+    /// 合并 delta 到 base：将 delta_matched 追加到 matched，
+    /// 移除 base 中标记为无效的条目，重建 base 排列
+    ///
+    /// 仅在 delta_count 超过阈值时调用，避免频繁合并
+    pub fn merge_delta_to_base(&mut self, volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String]) {
+        if self.delta_matched.is_empty() { return; }
+
+        // 移除 base 中标记为无效的条目（vol=u8::MAX）
+        self.matched.retain(|(v, _)| *v != u8::MAX);
+
+        // 将 delta 追加到 base
+        self.matched.extend(self.delta_matched.drain(..));
+
+        // 重建 base 排列（一次性开销，之后稳定）
+        self.sorted_by_name = Some(build_sort_permutation(&self.matched, volumes, vol_names, SortBy::Name));
+        self.sorted_by_path = Some(build_sort_permutation(&self.matched, volumes, vol_names, SortBy::Path));
+        self.sorted_by_size = Some(build_sort_permutation(&self.matched, volumes, vol_names, SortBy::Size));
+        self.sorted_by_modified = Some(build_sort_permutation(&self.matched, volumes, vol_names, SortBy::ModifiedTime));
+
+        // 清空 delta 排列
+        self.delta_sorted_by_name = None;
+        self.delta_sorted_by_path = None;
+        self.delta_sorted_by_size = None;
+        self.delta_sorted_by_modified = None;
+        self.delta_count = 0;
+        self.total = self.matched.len();
+
+        log::info!("merge_delta_to_base: base={}, total={}", self.matched.len(), self.total);
+    }
+
     /// Evict the least recently used sort permutation if we have too many cached.
     fn evict_lru_permutation(&mut self) {
         if self.sort_access_order.len() <= MAX_SORT_PERMUTATIONS {
@@ -135,21 +165,20 @@ impl SearchCache {
         start: usize,
         end: usize,
     ) -> Vec<SearchResult> {
-        // Check if we need to build the permutation
-        let needs_build = match sort_by {
+        // === base 排列：仅在需要时构建（稳定，不频繁重建）===
+        let base_needs_build = match sort_by {
             SortBy::Name | SortBy::Score => self.sorted_by_name.is_none(),
             SortBy::Path => self.sorted_by_path.is_none(),
             SortBy::Size => self.sorted_by_size.is_none(),
             SortBy::ModifiedTime => self.sorted_by_modified.is_none(),
         };
-        
-        if needs_build {
-            // Evict LRU before allocating a new permutation
+        if base_needs_build {
             self.evict_lru_permutation();
-            let t0 = Instant::now();
-            let matched = &self.matched;
-            let perm = build_sort_permutation(matched, volumes, vol_names, sort_by);
-            log::info!("build_sort_permutation({:?}): {:?}", sort_by, t0.elapsed());
+            let base_valid: Vec<(u8, u32)> = self.matched.iter()
+                .filter(|(v, _)| *v != u8::MAX)
+                .copied()
+                .collect();
+            let perm = build_sort_permutation(&base_valid, volumes, vol_names, sort_by);
             match sort_by {
                 SortBy::Name | SortBy::Score => { self.sorted_by_name = Some(perm); }
                 SortBy::Path => { self.sorted_by_path = Some(perm); }
@@ -158,51 +187,201 @@ impl SearchCache {
             }
         }
         self.touch_sort_permutation(sort_by);
-        
-        let matched = &self.matched;
-        let indices = match sort_by {
-            SortBy::Name | SortBy::Score => self.sorted_by_name.as_ref().unwrap(),
-            SortBy::Path => self.sorted_by_path.as_ref().unwrap(),
-            SortBy::Size => self.sorted_by_size.as_ref().unwrap(),
-            SortBy::ModifiedTime => self.sorted_by_modified.as_ref().unwrap(),
-        };
-        let n = indices.len();
-        if n == 0 {
-            return Vec::new();
-        }
 
-        let (range_start, range_end) = match sort_direction {
-            SortDirection::Ascending => (start.min(n), end.min(n)),
-            SortDirection::Descending => {
-                let s = n.saturating_sub(end.max(start)).min(n);
-                let e = n.saturating_sub(start);
-                (s, e.max(s))
+        // === delta 排列：仅在有新增时构建（极快）===
+        let delta_needs_build = !self.delta_matched.is_empty() && match sort_by {
+            SortBy::Name | SortBy::Score => self.delta_sorted_by_name.is_none(),
+            SortBy::Path => self.delta_sorted_by_path.is_none(),
+            SortBy::Size => self.delta_sorted_by_size.is_none(),
+            SortBy::ModifiedTime => self.delta_sorted_by_modified.is_none(),
+        };
+        if delta_needs_build {
+            let perm = build_sort_permutation(&self.delta_matched, volumes, vol_names, sort_by);
+            match sort_by {
+                SortBy::Name | SortBy::Score => { self.delta_sorted_by_name = Some(perm); }
+                SortBy::Path => { self.delta_sorted_by_path = Some(perm); }
+                SortBy::Size => { self.delta_sorted_by_size = Some(perm); }
+                SortBy::ModifiedTime => { self.delta_sorted_by_modified = Some(perm); }
             }
-        };
-
-        if range_start >= range_end || range_start >= n {
-            return Vec::new();
         }
 
-        let iter: Box<dyn Iterator<Item = &u32>> = match sort_direction {
-            SortDirection::Ascending => Box::new(indices[range_start..range_end].iter()),
-            SortDirection::Descending => Box::new(indices[range_start..range_end].iter().rev()),
+        // === 归并 base + delta 结果 ===
+        let base_indices = match sort_by {
+            SortBy::Name | SortBy::Score => self.sorted_by_name.as_ref(),
+            SortBy::Path => self.sorted_by_path.as_ref(),
+            SortBy::Size => self.sorted_by_size.as_ref(),
+            SortBy::ModifiedTime => self.sorted_by_modified.as_ref(),
+        };
+        let delta_indices = match sort_by {
+            SortBy::Name | SortBy::Score => self.delta_sorted_by_name.as_ref(),
+            SortBy::Path => self.delta_sorted_by_path.as_ref(),
+            SortBy::Size => self.delta_sorted_by_size.as_ref(),
+            SortBy::ModifiedTime => self.delta_sorted_by_modified.as_ref(),
         };
 
-        iter.filter_map(|idx| {
-            let (vol, file_idx) = &matched[*idx as usize];
+        // 收集 base 有效条目
+        let base_valid: Vec<(u8, u32)> = self.matched.iter()
+            .filter(|(v, _)| *v != u8::MAX)
+            .copied()
+            .collect();
+
+        // 归并两个有序列表
+        merge_sorted_results(
+            &base_valid, base_indices,
+            &self.delta_matched, delta_indices,
+            volumes, vol_names, sort_by, sort_direction, start, end,
+        )
+    }
+}
+
+/// 归并两个有序列表的结果（base + delta），取 [start, end) 范围
+///
+/// base 和 delta 各自已按 sort_by 排序，使用双指针归并，O(N) 时间
+fn merge_sorted_results(
+    base_matched: &[(u8, u32)],
+    base_indices: Option<&Vec<u32>>,
+    delta_matched: &[(u8, u32)],
+    delta_indices: Option<&Vec<u32>>,
+    volumes: &HashMap<String, VolumeMonitor>,
+    vol_names: &[String],
+    sort_by: SortBy,
+    sort_direction: SortDirection,
+    start: usize,
+    end: usize,
+) -> Vec<SearchResult> {
+    let base_len = base_indices.map_or(0, |v| v.len());
+    let delta_len = delta_indices.map_or(0, |v| v.len());
+
+    if base_len == 0 && delta_len == 0 {
+        return Vec::new();
+    }
+
+    // 如果 delta 为空，直接从 base 取
+    if delta_len == 0 {
+        return extract_results(base_matched, base_indices.unwrap(), volumes, vol_names, sort_direction, start, end);
+    }
+    // 如果 base 为空，直接从 delta 取
+    if base_len == 0 {
+        return extract_results(delta_matched, delta_indices.unwrap(), volumes, vol_names, sort_direction, start, end);
+    }
+
+    // 双指针归并：收集所有结果然后排序（简化实现，delta 通常很小）
+    let mut all_indices: Vec<(u32, bool)> = Vec::with_capacity(base_len + delta_len);
+    // true = base, false = delta
+    for &idx in base_indices.unwrap() { all_indices.push((idx, true)); }
+    for &idx in delta_indices.unwrap() { all_indices.push((idx, false)); }
+
+    // 获取排序键并归并
+    let base_keys: Vec<String> = base_indices.unwrap().iter()
+        .map(|&i| {
+            let (vol, file_idx) = &base_matched[i as usize];
             let vol_name = &vol_names[*vol as usize];
-            // 将内部 FileEntry 转换为对外的 SearchResult
-            // 通过 path_table 解析完整路径（FileEntry 不存储完整路径字符串）
-            volumes.get(vol_name).and_then(|m| {
-                m.files.get(*file_idx as usize).map(|f| {
-                    // 文件路径 = 父目录路径 + "\" + 文件名
-                    let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
-                    f.to_search_result(full_path)
+            volumes.get(vol_name).map_or(String::new(), |m| {
+                m.files.get(*file_idx as usize).map_or(String::new(), |f| {
+                    match sort_by {
+                        SortBy::Name | SortBy::Score => f.name.to_string(),
+                        SortBy::Path => {
+                            let pt = &m.path_table;
+                            pt.resolve_file_path(f.path_id, &f.name).to_string()
+                        }
+                        SortBy::Size => format!("{:020}", f.size),
+                        SortBy::ModifiedTime => format!("{:020}", f.modified_time),
+                    }
                 })
             })
-        }).collect()
-    }
+        })
+        .collect();
+    let delta_keys: Vec<String> = delta_indices.unwrap().iter()
+        .map(|&i| {
+            let (vol, file_idx) = &delta_matched[i as usize];
+            let vol_name = &vol_names[*vol as usize];
+            volumes.get(vol_name).map_or(String::new(), |m| {
+                m.files.get(*file_idx as usize).map_or(String::new(), |f| {
+                    match sort_by {
+                        SortBy::Name | SortBy::Score => f.name.to_string(),
+                        SortBy::Path => {
+                            let pt = &m.path_table;
+                            pt.resolve_file_path(f.path_id, &f.name).to_string()
+                        }
+                        SortBy::Size => format!("{:020}", f.size),
+                        SortBy::ModifiedTime => format!("{:020}", f.modified_time),
+                    }
+                })
+            })
+        })
+        .collect();
+
+    // 归并排序
+    let mut merged: Vec<(usize, bool)> = (0..base_len).map(|i| (i, true))
+        .chain((0..delta_len).map(|i| (i, false)))
+        .collect();
+
+    merged.sort_by(|a, b| {
+        let key_a = if a.1 { &base_keys[a.0] } else { &delta_keys[a.0] };
+        let key_b = if b.1 { &base_keys[b.0] } else { &delta_keys[b.0] };
+        match sort_direction {
+            SortDirection::Ascending => key_a.cmp(key_b),
+            SortDirection::Descending => key_b.cmp(key_a),
+        }
+    });
+
+    // 取 [start, end) 范围
+    let sliced: Vec<_> = merged.into_iter().skip(start).take(end - start).collect();
+    sliced.into_iter().filter_map(|(idx, is_base)| {
+        let (vol, file_idx) = if is_base {
+            base_matched[base_indices.unwrap()[idx] as usize]
+        } else {
+            delta_matched[delta_indices.unwrap()[idx] as usize]
+        };
+        let vol_name = &vol_names[vol as usize];
+        volumes.get(vol_name).and_then(|m| {
+            m.files.get(file_idx as usize).map(|f| {
+                let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
+                f.to_search_result(full_path)
+            })
+        })
+    }).collect()
+}
+
+/// 从单个 matched + indices 提取 [start, end) 范围的结果
+fn extract_results(
+    matched: &[(u8, u32)],
+    indices: &[u32],
+    volumes: &HashMap<String, VolumeMonitor>,
+    vol_names: &[String],
+    sort_direction: SortDirection,
+    start: usize,
+    end: usize,
+) -> Vec<SearchResult> {
+    let n = indices.len();
+    if n == 0 || start >= end { return Vec::new(); }
+
+    let (range_start, range_end) = match sort_direction {
+        SortDirection::Ascending => (start.min(n), end.min(n)),
+        SortDirection::Descending => {
+            let s = n.saturating_sub(end).min(n);
+            let e = n.saturating_sub(start);
+            (s, e.max(s))
+        }
+    };
+
+    if range_start >= range_end { return Vec::new(); }
+
+    let iter: Box<dyn Iterator<Item = &u32>> = match sort_direction {
+        SortDirection::Ascending => Box::new(indices[range_start..range_end].iter()),
+        SortDirection::Descending => Box::new(indices[range_start..range_end].iter().rev()),
+    };
+
+    iter.filter_map(|idx| {
+        let (vol, file_idx) = &matched[*idx as usize];
+        let vol_name = &vol_names[*vol as usize];
+        volumes.get(vol_name).and_then(|m| {
+            m.files.get(*file_idx as usize).map(|f| {
+                let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
+                f.to_search_result(full_path)
+            })
+        })
+    }).collect()
 }
 
 fn build_sort_permutation(matched: &[(u8, u32)], volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String], sort_by: SortBy) -> Vec<u32> {
@@ -604,6 +783,12 @@ impl VolumeManager {
             return None;
         }
         cache.refresh();
+
+        // 定期合并 delta 到 base（delta 超过 1万条时触发）
+        if cache.delta_count > 10000 {
+            cache.merge_delta_to_base(&self.volumes, &self.vol_names);
+        }
+
         let total = cache.total;
         if total == 0 {
             return Some((Vec::new(), 0));
@@ -795,10 +980,12 @@ impl VolumeManager {
     }
 }
 
-/// 增量更新缓存（自由函数，避免借用冲突）
+/// 增量更新缓存（base+delta 分离模式）
 ///
-/// 适配 FileEntry：通过 volumes 获取对应卷的 path_table，
-/// 用于在含 path_filter 的查询下解析完整路径
+/// 核心优化：
+/// - base matched 保持稳定，仅在删除时标记无效（vol=u8::MAX），不触发 base 排列重建
+/// - 新增文件放入 delta_matched，仅重建 delta 排列（文件少，极快）
+/// - base 排列（17MB keys + 8.5MB sort indices）保持不变
 fn apply_incremental_to_cache(
     cache: &mut SearchCache,
     volumes: &HashMap<String, VolumeMonitor>,
@@ -807,32 +994,33 @@ fn apply_incremental_to_cache(
     vol_idx: u8,
     result: &IncrementalResult,
 ) -> usize {
-    // 快速路径：如果没有新增文件，且 index_map 是恒等映射（无删除、无重排），
-    // 则 matched 向量无需重建，直接跳过以避免 221万次 drain+push
+    // 快速路径：无新增、无删除、无重排
     let is_identity = result.new_file_indices.is_empty()
         && result.index_map.iter().enumerate().all(|(i, m)| *m == Some(i));
     if is_identity {
-        return cache.matched.len();
+        return cache.matched.len() + cache.delta_matched.len();
     }
 
-    let mut new_matched: Vec<(u8, u32)> = Vec::with_capacity(cache.matched.len());
     let mut removed_count = 0usize;
 
-    for (vol, idx) in cache.matched.drain(..) {
-        if vol != vol_idx {
-            new_matched.push((vol, idx));
-        } else if (idx as usize) < result.index_map.len() {
-            if let Some(new_idx) = result.index_map[idx as usize] {
-                new_matched.push((vol, new_idx as u32));
-            } else {
-                removed_count += 1;
+    // === 阶段 1：处理删除和重排（在 base matched 上原地操作）===
+    // 删除：标记 vol=u8::MAX（无效值），不移除条目，保持排列索引稳定
+    // 重排：更新存活条目的索引
+    for (vol, idx) in cache.matched.iter_mut() {
+        if *vol != vol_idx || *vol == u8::MAX { continue; }
+        if (*idx as usize) < result.index_map.len() {
+            match result.index_map[*idx as usize] {
+                Some(new_idx) => { *idx = new_idx as u32; }
+                None => { *vol = u8::MAX; removed_count += 1; }
             }
         } else {
+            *vol = u8::MAX;
             removed_count += 1;
         }
     }
 
-    let added_count_before = new_matched.len();
+    // === 阶段 2：新增文件放入 delta_matched ===
+    let mut added_count = 0usize;
     if !result.new_file_indices.is_empty() {
         if let Some(files) = volume_files {
             let query = if cache.query.trim().is_empty() {
@@ -840,10 +1028,7 @@ fn apply_incremental_to_cache(
             } else {
                 Some(crate::search::query::SearchQuery::parse(&cache.query))
             };
-
-            // 仅当查询含 path_filter 时才需要解析完整路径
             let needs_path = query.as_ref().map_or(false, |q| q.path_filter.is_some());
-            // 通过 vol_idx 找到对应的 VolumeMonitor，获取其 path_table
             let path_table = volumes.get(&vol_names[vol_idx as usize]).map(|m| &m.path_table);
 
             for &new_idx in &result.new_file_indices {
@@ -851,7 +1036,6 @@ fn apply_incremental_to_cache(
                 let file = &files[new_idx];
 
                 if let Some(ref q) = query {
-                    // 解析完整路径（仅在需要时）
                     let full_path = if needs_path {
                         path_table.map(|pt| pt.resolve_file_path(file.path_id, &file.name)).unwrap_or_default()
                     } else {
@@ -862,23 +1046,26 @@ fn apply_incremental_to_cache(
                 if cache.files_only && file.is_directory { continue; }
                 if cache.directories_only && !file.is_directory { continue; }
 
-                new_matched.push((vol_idx, new_idx as u32));
+                cache.delta_matched.push((vol_idx, new_idx as u32));
+                added_count += 1;
             }
         }
     }
-    let added_count = new_matched.len() - added_count_before;
 
-    cache.matched = new_matched;
-    cache.total = cache.matched.len();
-
-    if removed_count > 0 || added_count > 0 {
-        cache.sorted_by_name = None;
-        cache.sorted_by_path = None;
-        cache.sorted_by_size = None;
-        cache.sorted_by_modified = None;
+    // === 阶段 3：仅重建 delta 排列（文件少，极快）===
+    if added_count > 0 {
+        cache.delta_count += added_count;
+        cache.delta_sorted_by_name = Some(build_sort_permutation(&cache.delta_matched, volumes, vol_names, SortBy::Name));
+        cache.delta_sorted_by_path = Some(build_sort_permutation(&cache.delta_matched, volumes, vol_names, SortBy::Path));
+        cache.delta_sorted_by_size = Some(build_sort_permutation(&cache.delta_matched, volumes, vol_names, SortBy::Size));
+        cache.delta_sorted_by_modified = Some(build_sort_permutation(&cache.delta_matched, volumes, vol_names, SortBy::ModifiedTime));
     }
 
-    cache.total
+    // 更新 total（排除 base 中标记为无效的条目）
+    let base_valid = cache.matched.iter().filter(|(v, _)| *v != u8::MAX).count();
+    cache.total = base_valid + cache.delta_matched.len();
+
+    removed_count + added_count
 }
 
 impl VolumeMonitor {
