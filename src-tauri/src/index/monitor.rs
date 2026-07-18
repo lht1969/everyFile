@@ -74,8 +74,11 @@ pub struct SearchCache {
     directories_only: bool,
     pub total: usize,
     pub created_at: Instant,
+    /// 基础 matched 向量：全量搜索结果，构建后不再修改
     pub matched: Vec<(u8, u32)>,
-    /// 增量匹配结果：新增文件的搜索结果，不触发 base 排列重建
+    /// 已删除的文件索引（在 matched 中的位置），不修改 matched 本身
+    pub deleted_indices: std::collections::HashSet<usize>,
+    /// 增量 matched 向量：新增文件，每次增量更新后重建
     pub delta_matched: Vec<(u8, u32)>,
     // 基础排序排列（稳定，仅 merge 时重建）
     sorted_by_name: Option<Vec<u32>>,
@@ -389,13 +392,15 @@ fn extract_results(
 }
 
 fn build_sort_permutation(matched: &[(u8, u32)], volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String], sort_by: SortBy) -> Vec<u32> {
-    let n = matched.len();
+    // 过滤掉无效条目（vol=u8::MAX，已被删除）
+    let valid_indices: Vec<u32> = (0..matched.len() as u32)
+        .filter(|&i| matched[i as usize].0 != u8::MAX)
+        .collect();
+    let n = valid_indices.len();
     if n == 0 {
         return Vec::new();
     }
     // 预构建 vol_idx → files 切片和 path_table 的数组
-    // 避免 221万次 HashMap 查找（volumes[&vol_names[*vol as usize]]）
-    // HashMap 查找需要哈希计算 + 比较，而数组索引是 O(1)
     let vol_files: Vec<&[FileEntry]> = (0..vol_names.len())
         .map(|i| volumes.get(&vol_names[i]).map(|v| v.files.as_slice()).unwrap_or(&[]))
         .collect();
@@ -403,28 +408,27 @@ fn build_sort_permutation(matched: &[(u8, u32)], volumes: &HashMap<String, Volum
         .map(|i| volumes.get(&vol_names[i]).map(|v| &v.path_table))
         .collect();
 
-    let mut v: Vec<u32> = (0..n as u32).collect();
+    // 排序有效条目的索引（这些索引指向 matched 中的位置）
+    let mut v: Vec<u32> = valid_indices;
     // 所有排序分支都添加原始索引作为二级排序键
     // 原因：par_sort_unstable_by 是不稳定排序，相同 key 的元素顺序不确定
     // 当 LRU 淘汰排序缓存后重新构建时，相同 key 的文件顺序会变化，导致"多次排序后结果错乱"
     // 用原始索引（即 matched 中的顺序）作为 tiebreaker，保证相同 key 时顺序确定性
     match sort_by {
         SortBy::Name | SortBy::Score => {
-            // 通过预构建的 vol_files 数组直接索引，避免 HashMap 查找
-            // 关键优化：使用 par_iter().map() 并行收集 keys，
-            // 把串行的 221万次指针解引用 + 字符串 slice 操作分摊到多核
-            let keys: Vec<&str> = matched.par_iter()
-                .map(|(vol, idx)| vol_files[*vol as usize][*idx as usize].name.as_str())
+            // 仅对有效条目构建 keys（跳过 vol=u8::MAX 的无效条目）
+            let keys: Vec<&str> = v.par_iter()
+                .map(|&i| {
+                    let (vol, idx) = &matched[i as usize];
+                    vol_files[*vol as usize][*idx as usize].name.as_str()
+                })
                 .collect();
             v.par_sort_unstable_by(|&a, &b| keys[a as usize].cmp(keys[b as usize]).then(a.cmp(&b)));
         }
         SortBy::Path => {
-            // FileEntry.path_id 指向父目录，需用 ordinal + name 排序
-            // 关键优化：用预计算的 ordinal (u32) 替代完整路径字符串比较
-            // 221万次比较从 O(strlen) 字符串 cmp 降至 O(1) u32 cmp
-            // 预期 8 核 CPU 上首次 Path 排序从 ~2s 降至 ~500ms
-            let keys: Vec<(u32, &str)> = matched.par_iter()
-                .map(|(vol, idx)| {
+            let keys: Vec<(u32, &str)> = v.par_iter()
+                .map(|&i| {
+                    let (vol, idx) = &matched[i as usize];
                     let pt = vol_path_tables[*vol as usize].unwrap();
                     let f = &vol_files[*vol as usize][*idx as usize];
                     (pt.get_ordinal(f.path_id), f.name.as_str())
@@ -437,16 +441,20 @@ fn build_sort_permutation(matched: &[(u8, u32)], volumes: &HashMap<String, Volum
             });
         }
         SortBy::Size => {
-            let keys: Vec<u64> = matched.par_iter()
-                .map(|(vol, idx)| vol_files[*vol as usize][*idx as usize].size)
+            let keys: Vec<u64> = v.par_iter()
+                .map(|&i| {
+                    let (vol, idx) = &matched[i as usize];
+                    vol_files[*vol as usize][*idx as usize].size
+                })
                 .collect();
             v.par_sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]).then(a.cmp(&b)));
         }
         SortBy::ModifiedTime => {
-            // FileEntry 的 modified_time 是 i32（SearchResult 是 i64）
-            // 直接以 i32 排序结果与 i64 一致，无需扩展
-            let keys: Vec<i32> = matched.par_iter()
-                .map(|(vol, idx)| vol_files[*vol as usize][*idx as usize].modified_time)
+            let keys: Vec<i32> = v.par_iter()
+                .map(|&i| {
+                    let (vol, idx) = &matched[i as usize];
+                    vol_files[*vol as usize][*idx as usize].modified_time
+                })
                 .collect();
             v.par_sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]).then(a.cmp(&b)));
         }
@@ -579,6 +587,7 @@ impl VolumeManager {
                 total: old.total,
                 created_at: old.created_at,
                 matched: Vec::new(),
+                deleted_indices: std::collections::HashSet::new(),
                 delta_matched: old.delta_matched,
                 sorted_by_name: old.sorted_by_name,
                 sorted_by_path: old.sorted_by_path,
@@ -736,6 +745,7 @@ impl VolumeManager {
             files_only: options.files_only,
             directories_only: options.directories_only,
             matched,
+            deleted_indices: std::collections::HashSet::new(),
             delta_matched: Vec::new(),
             total,
             created_at: Instant::now(),
@@ -1007,19 +1017,15 @@ fn apply_incremental_to_cache(
 
     let mut removed_count = 0usize;
 
-    // === 阶段 1：处理删除和重排（在 base matched 上原地操作）===
-    // 删除：标记 vol=u8::MAX（无效值），不移除条目，保持排列索引稳定
-    // 重排：更新存活条目的索引
-    for (vol, idx) in cache.matched.iter_mut() {
-        if *vol != vol_idx || *vol == u8::MAX { continue; }
-        if (*idx as usize) < result.index_map.len() {
-            match result.index_map[*idx as usize] {
-                Some(new_idx) => { *idx = new_idx as u32; }
-                None => { *vol = u8::MAX; removed_count += 1; }
+    // === 阶段 1：处理删除（记录到 deleted_indices，不修改 matched）===
+    // 不修改 matched 本身，保持 base 排列稳定
+    for (i, (vol, _idx)) in cache.matched.iter().enumerate() {
+        if *vol != vol_idx { continue; }
+        if i < result.index_map.len() {
+            if result.index_map[i].is_none() {
+                cache.deleted_indices.insert(i);
+                removed_count += 1;
             }
-        } else {
-            *vol = u8::MAX;
-            removed_count += 1;
         }
     }
 
@@ -1065,9 +1071,7 @@ fn apply_incremental_to_cache(
         cache.delta_sorted_by_modified = Some(build_sort_permutation(&cache.delta_matched, volumes, vol_names, SortBy::ModifiedTime));
     }
 
-    // 更新 total（排除 base 中标记为无效的条目）
-    let base_valid = cache.matched.iter().filter(|(v, _)| *v != u8::MAX).count();
-    cache.total = base_valid + cache.delta_matched.len();
+    cache.total = cache.matched.len() - cache.deleted_indices.len() + cache.delta_matched.len();
 
     removed_count + added_count
 }
