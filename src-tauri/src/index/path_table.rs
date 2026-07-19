@@ -207,38 +207,29 @@ impl PathTable {
 
     /// 为所有 path 分配字典序 ordinal
     ///
-    /// 算法：先按 (parent_id, name) 字典序稳定排序所有 entries，
+    /// 算法：解析所有目录的完整路径字符串，按字符串字典序排序，
     /// 然后分配 0, 1, 2, ... 连续编号（ROOT 已固定为 0）。
     ///
-    /// 正确性证明：
-    /// - 排序后，对于 entry A 和 entry B：
-    ///   - 若 A.parent_id = B.parent_id（同目录），则按 name 字典序，ordinal 顺序 = 字典序 ✓
-    ///   - 若 A.parent_id < B.parent_id，且 A 是 B 的祖先：
-    ///     A 排在前（祖先 parent_id 更小），ordinal 也更小 ✓
-    ///   - 若 A 和 B 不同子树：
-    ///     它们最终会共享某个共同祖先 C，按 C 的 name 字典序比较即可
-    ///     排序后 (A.parent_id, A.name) 和 (B.parent_id, B.name) 的相对顺序
-    ///     与字典序一致（因为 parent 已经被分配 ordinal，递归正确）
+    /// 这保证 ordinal 顺序 = 字典序，Path 排序可直接用 O(1) 整数比较。
     ///
     /// 调用时机：所有 intern 完成后（apply_full_scan 结束）
-    /// 复杂度：O(N log N)，N = entries.len()，~40万时 <100ms
+    /// 复杂度：O(N * depth + N log N)，N = entries.len()
     pub fn compute_ordinals(&mut self) {
         if self.entries.len() <= 1 {
             return;
         }
 
-        // 收集所有非 ROOT entries 的索引
         let mut sorted_indices: Vec<u32> = (1..self.entries.len() as u32).collect();
 
-        // 按 (parent_id, name) 字典序稳定排序
-        // 关键：parent_id 必须先比较，保证父目录排在子目录前
+        // 解析所有 entry 的完整路径字符串，用于字典序排序
+        let resolved: Vec<CompactString> = sorted_indices.iter()
+            .map(|&id| self.resolve_path(id))
+            .collect();
+
         sorted_indices.sort_by(|&a, &b| {
-            let ea = &self.entries[a as usize];
-            let eb = &self.entries[b as usize];
-            ea.parent_id.cmp(&eb.parent_id).then(ea.name.cmp(&eb.name))
+            resolved[(a - 1) as usize].cmp(&resolved[(b - 1) as usize])
         });
 
-        // 分配 ordinal（ROOT 已固定为 0，其他从 1 开始连续）
         for (i, &id) in sorted_indices.iter().enumerate() {
             self.entries[id as usize].ordinal = (i + 1) as u32;
         }

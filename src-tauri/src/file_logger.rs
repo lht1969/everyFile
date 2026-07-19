@@ -199,6 +199,10 @@ impl log::Log for DualLogger {
             return;
         }
 
+        if record.target().contains("usn_worker") {
+            return;
+        }
+
         // 格式: 2026-07-06 14:30:25.123 INFO  [main] message
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let level = record.level();

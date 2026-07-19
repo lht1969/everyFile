@@ -29,13 +29,38 @@ export function useVirtualScroll({
 }: UseVirtualScrollOptions): UseVirtualScrollReturn {
   const [, setTick] = useState(0);
   const scrollTopRef = useRef(0);
+  const viewportHeightRef = useRef(0);
   const rafId = useRef<number | null>(null);
   const lastFiredRef = useRef<string>('');
   const onRangeChangeRef = useRef(onRangeChange);
   onRangeChangeRef.current = onRangeChange;
 
   const scrollTop = scrollTopRef.current;
-  const viewportHeight = containerRef.current?.clientHeight ?? 0;
+  const [viewportHeight, setViewportHeight] = useState(0);
+
+  // ResizeObserver: detect container height changes and re-trigger render
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const h = entry.contentBoxSize?.[0]?.blockSize ?? entry.contentRect.height;
+        if (h !== viewportHeightRef.current) {
+          viewportHeightRef.current = h;
+          setViewportHeight(h);
+        }
+      }
+    });
+    // Read initial height
+    const initialH = container.clientHeight;
+    if (initialH !== viewportHeightRef.current) {
+      viewportHeightRef.current = initialH;
+      setViewportHeight(initialH);
+    }
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [containerRef]);
 
   const needsScaling = totalItems * itemHeight > SCROLL_SPACE;
   const effectiveItemHeight = needsScaling
@@ -43,14 +68,26 @@ export function useVirtualScroll({
     : itemHeight;
 
   const spacerHeight = needsScaling ? SCROLL_SPACE : totalItems * itemHeight;
-  const rawStartIndex = Math.floor(scrollTop / effectiveItemHeight);
-  const visibleCount = Math.ceil(viewportHeight / effectiveItemHeight) + overscan;
-  // 接近底部时钳制到最后一屏，防止浮动精度振荡
-  const atBottom = totalItems > 0 && scrollTop >= spacerHeight - viewportHeight - effectiveItemHeight * 2;
-  const maxStart = Math.max(totalItems - visibleCount, 0);
-  const startIndex = totalItems > 0 ? (atBottom ? maxStart : Math.min(rawStartIndex, maxStart)) : 0;
+  const maxScrollTop = Math.max(spacerHeight - viewportHeight, 0);
+  // 钳制 scrollTop 到有效范围，防止浏览器滚动越界导致内容偏移
+  const clampedScrollTop = Math.max(0, Math.min(scrollTop, maxScrollTop));
+  const rawStartIndex = Math.floor(clampedScrollTop / effectiveItemHeight);
+  const visibleCount = Math.ceil(viewportHeight / itemHeight) + overscan;
+
+  const atBottom = totalItems > 0 && maxScrollTop > 0 && clampedScrollTop >= maxScrollTop - 1;
+
+  let startIndex: number;
+  if (totalItems > 0) {
+    if (atBottom) {
+      startIndex = Math.max(totalItems - visibleCount, 0);
+    } else {
+      startIndex = Math.min(rawStartIndex, Math.max(totalItems - visibleCount, 0));
+    }
+  } else {
+    startIndex = 0;
+  }
   const endIndex = Math.min(startIndex + visibleCount, totalItems);
-  const offsetY = startIndex * effectiveItemHeight;
+  const offsetY = clampedScrollTop;
 
   const handleScroll = useCallback(() => {
     if (rafId.current !== null) {
@@ -96,14 +133,11 @@ export function useVirtualScroll({
 
   const scrollToIndex = useCallback((index: number) => {
     if (containerRef.current) {
-      const eih = totalItems * itemHeight > SCROLL_SPACE
-        ? SCROLL_SPACE / totalItems
-        : itemHeight;
-      containerRef.current.scrollTop = index * eih;
+      containerRef.current.scrollTop = index * itemHeight;
       scrollTopRef.current = containerRef.current.scrollTop;
       setTick(t => t + 1);
     }
-  }, [containerRef, totalItems, itemHeight]);
+  }, [containerRef, itemHeight]);
 
   const resetScroll = useCallback(() => {
     if (containerRef.current) {

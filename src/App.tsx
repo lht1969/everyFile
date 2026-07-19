@@ -49,18 +49,34 @@ function App() {
       if (_event.payload.volume !== '') {
         loadIndexStatus();
       }
-      if (_event.payload.cache_total !== undefined) {
-        setTotalCount(_event.payload.cache_total);
+    });
+
+    // 增量更新后刷新当前可见范围（文件删除/修改/新增时立即更新显示）
+    // 仅清除覆盖当前可见范围的缓存条目，保留其他范围的缓存避免不必要的重新拉取
+    const unlistenRefresh = listen('records-refresh', async () => {
+      const { start, end } = visibleRangeRef.current;
+      if (start !== undefined && end !== undefined && end > start) {
+        const fetchStart = Math.max(0, start - 50);
+        const fetchEnd = start + FETCH_SIZE;
+        for (const key of rangeCacheRef.current.keys()) {
+          const [s, e] = key.split('-').map(Number);
+          if (fetchStart >= s && fetchEnd <= e) {
+            rangeCacheRef.current.delete(key);
+            break;
+          }
+        }
+        // 使正在进行的 fetchRecordsRange 失效，防止旧数据覆盖刷新结果
+        ++fetchCounterRef.current;
+        isFetchingRef.current = false;
+        fetchRecordsRangeRef.current(start, end);
       }
-      // USN 增量更新会清除后端 search_cache，直接调用 fetchRecordsRange 会报 "cache expired"。
-      // 改用 refreshCurrentView：先调用 search_files 重建缓存，再获取当前可见范围的数据。
-      refreshCurrentView();
     });
 
     return () => {
       unlistenProgress.then(fn => fn());
       unlistenComplete.then(fn => fn());
       unlistenUpdated.then(fn => fn());
+      unlistenRefresh.then(fn => fn());
     };
   }, []);
 
@@ -98,15 +114,18 @@ function App() {
         params: { query: '', files_only: true, sort_by: sortState.field, sort_direction: sortState.direction }
       });
       setTotalCount(response.total);
-      if (response.results.length > 0) {
-        setResultsOffset(0);
-        setResults(response.results);
-      } else if (response.total > 0) {
-        const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50, sortBy: sortState.field, sortDirection: sortState.direction });
-        setResultsOffset(0);
-        setResults(range.results);
-      }
       if (response.total > 0) {
+        // Fetch a larger initial range to cover scroll area
+        try {
+          const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 500, sortBy: sortState.field, sortDirection: sortState.direction });
+          rangeCacheRef.current.set(`0-${range.results.length}`, range.results);
+          setResultsOffset(0);
+          setResults(range.results);
+        } catch {
+          // Fallback to first_batch from search_files
+          setResultsOffset(0);
+          setResults(response.results);
+        }
         setStatusMessage('');
       }
     } catch (e) {
@@ -126,102 +145,63 @@ function App() {
   const visibleRangeRef = useRef({ start: 0, end: 50 });
   const rangeCacheRef = useRef<Map<string, SearchResult[]>>(new Map());
   const rangeChangeTimerRef = useRef<number | null>(null);
-  const PAGE_SIZE = 100;
+  const FETCH_SIZE = 500;
+  const isFetchingRef = useRef(false);
 
-  const fetchRecordsRange = useCallback(async (start: number, end: number) => {
-    const cacheKey = `${start}-${end}`;
-    const cached = rangeCacheRef.current.get(cacheKey);
-    if (cached) {
-      setResultsOffset(start);
+  const fetchRecordsRange = useCallback(async (start: number, _end: number) => {
+    if (isFetchingRef.current) return;
+    const fetchStart = Math.max(0, start - 50);
+    const fetchEnd = start + FETCH_SIZE;
+    const cacheKey = `${fetchStart}-${fetchEnd}`;
+
+    // Check cache
+    const existingKey = Array.from(rangeCacheRef.current.keys()).find(k => {
+      const [s, e] = k.split('-').map(Number);
+      return fetchStart >= s && fetchEnd <= e;
+    });
+    if (existingKey) {
+      const cached = rangeCacheRef.current.get(existingKey)!;
+      const offset = parseInt(existingKey.split('-')[0]);
+      setResultsOffset(offset);
       setResults(cached);
       return;
     }
 
-    // 只读取当前 counter 值，不递增
-    // 原因：递增会使 handleSortChange/handleSearch 的 myId 失效，
-    // 导致用户主动排序/搜索的新结果被丢弃，旧数据残留
+    isFetchingRef.current = true;
     const myId = fetchCounterRef.current;
-    // 捕获 sortState 快照，await 期间若 sortState 变化（用户再次排序），
-    // 则丢弃本次结果，防止旧排序数据覆盖新排序结果
     const sortSnapshot = { ...sortStateRef.current };
     const { field, direction } = sortSnapshot;
     try {
-      const response = await invoke<RecordsRangeResponse>('get_records_range', { start, end, sortBy: field, sortDirection: direction });
-      // 双重检查：counter 未变 且 sortState 未变，才应用结果
+      const response = await invoke<RecordsRangeResponse>('get_records_range', { start: fetchStart, end: fetchEnd, sortBy: field, sortDirection: direction });
       if (myId === fetchCounterRef.current &&
         sortStateRef.current.field === sortSnapshot.field &&
         sortStateRef.current.direction === sortSnapshot.direction) {
         rangeCacheRef.current.set(cacheKey, response.results);
-        // 缩容：从 20 条降至 10 条，每条 100 项
-        // 10 × 100 × ~100字节 ≈ 100KB，足够覆盖滚动预取场景
-        if (rangeCacheRef.current.size > 10) {
+        if (rangeCacheRef.current.size > 5) {
           const firstKey = rangeCacheRef.current.keys().next().value;
           if (firstKey) rangeCacheRef.current.delete(firstKey);
         }
-        setResultsOffset(start);
+        setResultsOffset(fetchStart);
         setResults(response.results);
-      }
-
-      const nextStart = end;
-      const nextEnd = nextStart + PAGE_SIZE;
-      const nextKey = `${nextStart}-${nextEnd}`;
-      if (!rangeCacheRef.current.has(nextKey) && nextStart < (totalCount || 0)) {
-        invoke<RecordsRangeResponse>('get_records_range', { start: nextStart, end: nextEnd, sortBy: field, sortDirection: direction })
-          .then(resp => { rangeCacheRef.current.set(nextKey, resp.results); })
-          .catch(() => { });
+        if (response.total !== totalCount) {
+          setTotalCount(response.total);
+        }
       }
     } catch (e) {
       console.error('Failed to fetch records range:', e);
-      // 缓存过期是正常现象（USN 增量更新会清除缓存），不弹窗打扰用户
       const errMsg = String(e);
       if (errMsg.includes('Cache expired') || errMsg.includes('cache expired')) {
-        // 静默处理，由 index-updated 事件的 refreshCurrentView 负责重建缓存
         return;
       }
       message(`获取数据失败: ${e}`, { title: '错误', kind: 'error' });
+    } finally {
+      isFetchingRef.current = false;
     }
   }, [totalCount]);
 
-  /**
-   * USN 增量更新后刷新当前视图
-   *
-   * 后端 apply_incremental_usn 会清除 search_cache，导致 get_records_range 返回 "cache expired" 错误。
-   * 此函数通过重新调用 search_files 重建后端缓存，然后获取当前可见范围的数据，
-   * 避免向用户显示错误弹窗，且不重置滚动位置。
-   *
-   * 所有外部状态通过 ref 访问，useCallback 依赖为空数组，确保事件监听器闭包捕获的版本始终有效。
-   */
-  const refreshCurrentView = useCallback(async () => {
-    // 递增 fetchCounterRef，使正在进行的 fetchRecordsRange 失效，
-    // 防止旧 fetchRecordsRange 返回的旧缓存数据覆盖 refreshCurrentView 的新结果
-    ++fetchCounterRef.current;
-    // 清除前端 range 缓存（后端缓存已被 USN 增量更新清除）
-    rangeCacheRef.current.clear();
-    const { field, direction } = sortStateRef.current;
-    const { query, filesOnly, directoriesOnly } = searchStateRef.current;
-    try {
-      // 调用 search_files 重建后端缓存，直接使用返回的 first_batch，
-      // 避免额外的 get_records_range IPC 调用（省 50-200ms）
-      const response = await invoke<SearchResponse>('search_files', {
-        params: { query, files_only: filesOnly, directories_only: directoriesOnly, sort_by: field, sort_direction: direction }
-      });
-      // search_files 已返回并重建后端缓存，再次递增 fetchCounterRef，
-      // 使正在进行的旧 fetchRecordsRange 失效（它可能用了旧缓存），防止覆盖新结果
-      ++fetchCounterRef.current;
-      setTotalCount(response.total);
-      if (response.total > 0) {
-        setResultsOffset(0);
-        setResults(response.results);
-      } else {
-        setResultsOffset(0);
-        setResults([]);
-      }
-    } catch (e) {
-      console.error('Failed to refresh current view after index update:', e);
-    }
-  }, []);
-
   const searchCounterRef = useRef(0);
+  const fetchRecordsRangeRef = useRef(fetchRecordsRange);
+  fetchRecordsRangeRef.current = fetchRecordsRange;
 
   const handleSearch = useCallback(async (searchQuery: string, filesOnly?: boolean, directoriesOnly?: boolean) => {
     const myId = ++searchCounterRef.current;
@@ -247,18 +227,22 @@ function App() {
         }
       });
       if (myId !== searchCounterRef.current) return;
-      // search_files 已返回并重建后端缓存，再次递增 fetchCounterRef，
-      // 使正在进行的旧 fetchRecordsRange 失效（它可能用了旧缓存），防止覆盖新结果
       ++fetchCounterRef.current;
       setTotalCount(response.total);
-      if (response.results.length > 0) {
-        setResultsOffset(0);
-        setResults(response.results);
-      } else if (response.total > 0) {
-        const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 50, sortBy: sortState.field, sortDirection: sortState.direction });
-        if (myId === searchCounterRef.current) {
-          setResultsOffset(0);
-          setResults(range.results);
+      if (response.total > 0) {
+        // Fetch a larger initial range to cover scroll area
+        try {
+          const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 500, sortBy: sortState.field, sortDirection: sortState.direction });
+          if (myId === searchCounterRef.current) {
+      rangeCacheRef.current.set('0-500', range.results);
+            setResultsOffset(0);
+            setResults(range.results);
+          }
+        } catch {
+          if (myId === searchCounterRef.current) {
+            setResultsOffset(0);
+            setResults(response.results);
+          }
         }
       } else {
         setResultsOffset(0);
@@ -276,9 +260,6 @@ function App() {
   }, [sortState]);
 
   const handleSortChange = useCallback(async (field: SortField, direction: SortDirection) => {
-    // 清除 pending 的 fetchRecordsRange debounce，防止竞态：
-    // resetScroll 会触发 onRangeChange，80ms 后调用 fetchRecordsRange，
-    // 可能在 handleSortChange 完成前执行并覆盖结果
     if (rangeChangeTimerRef.current !== null) {
       clearTimeout(rangeChangeTimerRef.current);
       rangeChangeTimerRef.current = null;
@@ -289,31 +270,38 @@ function App() {
     setScrollTrigger(prev => prev + 1);
     setStatusMessage('排序中...');
     try {
-      const searchResp = await invoke<SearchResponse>('search_files', {
-        params: {
-          query: searchState.query,
-          files_only: searchState.filesOnly,
-          directories_only: searchState.directoriesOnly,
-          sort_by: field,
-          sort_direction: direction
+      let range: RecordsRangeResponse;
+      try {
+        range = await invoke<RecordsRangeResponse>('get_records_range', {
+          start: 0, end: 500, sortBy: field, sortDirection: direction
+        });
+      } catch {
+        const searchResp = await invoke<SearchResponse>('search_files', {
+          params: {
+            query: searchState.query,
+            files_only: searchState.filesOnly,
+            directories_only: searchState.directoriesOnly,
+            sort_by: field,
+            sort_direction: direction
+          }
+        });
+        if (myId !== fetchCounterRef.current) return;
+        setTotalCount(searchResp.total);
+        if (searchResp.total === 0) {
+          setResultsOffset(0);
+          setResults([]);
+          setStatusMessage('');
+          return;
         }
-      });
-      if (myId !== fetchCounterRef.current) return;
-      // search_files 已返回并重建后端缓存，递增 counter 使正在进行的
-      // fetchRecordsRange 失效（它可能用了旧 sort state 的后端缓存），
-      // 防止其返回的旧数据覆盖本次新排序结果
-      ++fetchCounterRef.current;
-      setTotalCount(searchResp.total);
-      if (searchResp.total > 0) {
-        // 直接用 search_files 返回的 first_batch（0-50），不再调用 get_records_range
-        // 原因：减少一次 IPC 调用，且 search_files 已重建后端缓存，first_batch 就是新排序结果
-        rangeCacheRef.current.set('0-50', searchResp.results);
-        setResultsOffset(0);
-        setResults(searchResp.results);
-      } else {
-        setResultsOffset(0);
-        setResults([]);
+        range = await invoke<RecordsRangeResponse>('get_records_range', {
+          start: 0, end: 500, sortBy: field, sortDirection: direction
+        });
       }
+      if (myId !== fetchCounterRef.current) return;
+      setTotalCount(range.total);
+      rangeCacheRef.current.set(`0-${range.results.length}`, range.results);
+      setResultsOffset(0);
+      setResults(range.results);
       setStatusMessage('');
     } catch (e) {
       console.error('Sort failed:', e);
@@ -329,7 +317,7 @@ function App() {
     }
     rangeChangeTimerRef.current = window.setTimeout(() => {
       fetchRecordsRange(start, end);
-    }, 80);
+    }, 30);
   }, [fetchRecordsRange]);
 
   const handleOpenFile = async (path: string) => {

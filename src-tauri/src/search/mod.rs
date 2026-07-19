@@ -30,6 +30,7 @@ pub struct SearchResult {
 /// - SearchResult: 72 字节 + 路径堆分配 ~116 字节 = ~188 字节
 /// - FileEntry:    48 字节（无路径堆分配）
 /// - 节省约 74%
+#[derive(Clone)]
 pub struct FileEntry {
     pub name: CompactString,       // 24 字节 (inline，短名称不分配)
     pub size: u64,                 // 8 字节

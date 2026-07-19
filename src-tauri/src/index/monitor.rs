@@ -43,9 +43,6 @@ fn should_skip_by_attr(include_hidden: bool, include_system: bool, meta: &std::f
 }
 
 // LRU 容量扩展到 4，支持所有排序字段同时缓存
-// 每个 perm Vec 内存：221万 × 4字节 ≈ 8.4MB，4 个共 33.6MB
-// 收益：用户在 Name/Path/Size/ModifiedTime 之间反复切换时无需重排序（每次重排 ~1-3s）
-const _MAX_SORT_PERMUTATIONS: usize = 4;
 
 /// 从完整文件路径中分离出父目录路径
 /// "X:\dir\file.txt" → "X:\dir"
@@ -66,13 +63,14 @@ fn parent_dir_of(full_path: &str) -> &str {
     }
 }
 
-/// Base cache: stable data from full scan. Sort permutations only rebuilt during merge.
+/// Base cache: stable data from full scan.
+/// `valid_indices` is the single source of truth for sort order — an unsorted list of
+/// indices into `matched` that reference valid file entries. Sort permutations are NO
+/// longer cached; instead, `get_sorted_slice` uses `select_nth_unstable_by` (O(n))
+/// + partial sort of only the K needed entries (O(k log k)) on each call.
 pub struct BaseCache {
     pub matched: Vec<(u8, u32)>,
-    sorted_by_name: Option<Vec<u32>>,
-    sorted_by_path: Option<Vec<u32>>,
-    sorted_by_size: Option<Vec<u32>>,
-    sorted_by_modified: Option<Vec<u32>>,
+    pub valid_indices: Option<Vec<u32>>,
 }
 
 /// Delta cache: incremental changes. new_files is APPEND-ONLY (no swap_remove!).
@@ -80,8 +78,20 @@ pub struct DeltaCache {
     pub new_files: Vec<(u8, FileEntry)>,
     pub file_id_index: HashMap<u32, usize>,
     pub deleted_ids: HashSet<u32>,
+    /// fids that were both deleted and re-added in the same batch (renames).
+    /// These stay in `deleted_ids` to hide old base entries, but the new
+    /// delta entry must NOT be filtered out by `deleted_ids`.
+    pub renamed_fids: HashSet<u32>,
     pub modified: HashMap<u32, (u8, FileEntry)>,
     pub matched: Vec<(u8, u32)>,
+    pub generation: u64,
+}
+
+struct SortedCache {
+    sort_by: SortBy,
+    sort_direction: SortDirection,
+    sorted_base: Vec<u32>,
+    delta_gen: u64,
 }
 
 pub struct SearchCache {
@@ -92,6 +102,7 @@ pub struct SearchCache {
     pub created_at: Instant,
     pub base: BaseCache,
     pub delta: DeltaCache,
+    sorted_cache: Option<SortedCache>,
 }
 
 impl SearchCache {
@@ -181,8 +192,11 @@ impl SearchCache {
         self.delta.new_files.clear();
         self.delta.file_id_index.clear();
         self.delta.deleted_ids.clear();
+        self.delta.renamed_fids.clear();
         self.delta.modified.clear();
         self.delta.matched.clear();
+        self.delta.generation += 1;
+        self.sorted_cache = None;
 
         // Rebuild base matched from scratch
         let mut matched = Vec::new();
@@ -197,11 +211,8 @@ impl SearchCache {
         }
         self.base.matched = matched;
 
-        // Invalidate base permutations (will be rebuilt lazily)
-        self.base.sorted_by_name = None;
-        self.base.sorted_by_path = None;
-        self.base.sorted_by_size = None;
-        self.base.sorted_by_modified = None;
+        // Invalidate base valid_indices (will be rebuilt lazily)
+        self.base.valid_indices = None;
 
         log::info!("merge_delta_to_base: done in {:?}, base={} entries", t0.elapsed(), self.base.matched.len());
     }
@@ -218,38 +229,20 @@ impl SearchCache {
         // Snapshot delta.new_files to avoid inconsistency if it's modified during this call
         let delta_files: Vec<(u8, FileEntry)> = self.delta.new_files.clone();
         let delta_deleted = self.delta.deleted_ids.clone();
+        let delta_renamed = self.delta.renamed_fids.clone();
         let delta_modified = self.delta.modified.clone();
 
-        // Build base permutation if needed
-        let base_needs_build = match sort_by {
-            SortBy::Name | SortBy::Score => self.base.sorted_by_name.is_none(),
-            SortBy::Path => self.base.sorted_by_path.is_none(),
-            SortBy::Size => self.base.sorted_by_size.is_none(),
-            SortBy::ModifiedTime => self.base.sorted_by_modified.is_none(),
-        };
-        if base_needs_build && !self.base.matched.is_empty() {
-            let perm = build_sort_permutation(&self.base.matched, volumes, vol_names, sort_by);
-            match sort_by {
-                SortBy::Name | SortBy::Score => { self.base.sorted_by_name = Some(perm); }
-                SortBy::Path => { self.base.sorted_by_path = Some(perm); }
-                SortBy::Size => { self.base.sorted_by_size = Some(perm); }
-                SortBy::ModifiedTime => { self.base.sorted_by_modified = Some(perm); }
-            }
+        // Build valid_indices if needed (unsorted list of valid indices into matched)
+        if self.base.valid_indices.is_none() && !self.base.matched.is_empty() {
+            self.base.valid_indices = Some(build_valid_indices(&self.base.matched, volumes, vol_names));
         }
 
-        let base_perm = match sort_by {
-            SortBy::Name | SortBy::Score => self.base.sorted_by_name.as_ref(),
-            SortBy::Path => self.base.sorted_by_path.as_ref(),
-            SortBy::Size => self.base.sorted_by_size.as_ref(),
-            SortBy::ModifiedTime => self.base.sorted_by_modified.as_ref(),
-        };
-
-        // Build filtered base indices (skip deleted_ids)
-        let active_base: Vec<u32> = if let Some(perm) = base_perm {
+        // Build active_base: filter deleted from valid_indices
+        let mut active_base: Vec<u32> = if let Some(ref indices) = self.base.valid_indices {
             if delta_deleted.is_empty() {
-                perm.clone()
+                indices.clone()
             } else {
-                perm.iter().copied().filter(|idx| {
+                indices.iter().copied().filter(|idx| {
                     let (vol, file_idx) = &self.base.matched[*idx as usize];
                     let vol_name = &vol_names[*vol as usize];
                     if let Some(m) = volumes.get(vol_name) {
@@ -271,10 +264,11 @@ impl SearchCache {
         };
         let needs_path = query.as_ref().map_or(false, |q| q.path_filter.is_some());
         let df_len = delta_files.len();
-        let mut delta_entries: Vec<(usize, &str, u64, i32, CompactString)> = Vec::new();
+        // Tuple: (delta_files_index, name, size, modified_time, path_ordinal)
+        let mut delta_entries: Vec<(usize, &str, u64, i32, u32)> = Vec::new();
         for i in 0..df_len {
             let (_vol, f) = &delta_files[i];
-            if delta_deleted.contains(&f.file_id) { continue; }
+            if delta_deleted.contains(&f.file_id) && !delta_renamed.contains(&f.file_id) { continue; }
             if let Some(ref q) = query {
                 let vol_name = &vol_names[*_vol as usize];
                 if let Some(m) = volumes.get(vol_name) {
@@ -286,11 +280,9 @@ impl SearchCache {
             }
             if self.files_only && f.is_directory { continue; }
             if self.directories_only && !f.is_directory { continue; }
-            let path = if needs_path {
-                let vol_name = &vol_names[*_vol as usize];
-                volumes.get(vol_name).map(|m| m.path_table.resolve_file_path(f.path_id, &f.name)).unwrap_or_default()
-            } else { CompactString::new("") };
-            delta_entries.push((i, f.name.as_str(), f.size, f.modified_time, path));
+            let vol_name = &vol_names[*_vol as usize];
+            let ordinal = volumes.get(vol_name).map(|m| m.path_table.get_ordinal(f.path_id)).unwrap_or(u32::MAX);
+            delta_entries.push((i, f.name.as_str(), f.size, f.modified_time, ordinal));
         }
 
         match sort_by {
@@ -323,6 +315,204 @@ impl SearchCache {
         };
         if eff_start >= eff_end || eff_start >= total_n { return Vec::new(); }
 
+        // Partial sort: use select_nth_unstable_by (O(n)) + sort only the K needed entries (O(k log k))
+        // Instead of sorting ALL 2.9M entries with O(n log n), we partition around the
+        // boundary element and only sort the slice that the merge actually reads.
+        if base_n > 0 {
+            let vol_files: Vec<&[FileEntry]> = (0..vol_names.len())
+                .map(|i| volumes.get(&vol_names[i]).map(|v| v.files.as_slice()).unwrap_or(&[]))
+                .collect();
+            let vol_path_tables: Vec<Option<&PathTable>> = (0..vol_names.len())
+                .map(|i| volumes.get(&vol_names[i]).map(|v| &v.path_table))
+                .collect();
+
+            // Check if we can reuse cached sorted permutation
+            let cache_hit = self.sorted_cache.as_ref().map_or(false, |sc| {
+                sc.sort_by == sort_by
+                    && sc.sort_direction == sort_direction
+                    && sc.sorted_base.len() == active_base.len()
+                    && sc.delta_gen == self.delta.generation
+            });
+
+            if cache_hit {
+                // Fast path: use cached sorted permutation, just filter out delta-deleted entries
+                let cached = self.sorted_cache.as_ref().unwrap();
+                if delta_deleted.is_empty() {
+                    active_base.clear();
+                    active_base.extend_from_slice(&cached.sorted_base);
+                } else {
+                    active_base.clear();
+                    active_base.extend(cached.sorted_base.iter().copied().filter(|idx| {
+                        let (vol, file_idx) = &self.base.matched[*idx as usize];
+                        let vol_name = &vol_names[*vol as usize];
+                        if let Some(m) = volumes.get(vol_name) {
+                            if let Some(f) = m.files.get(*file_idx as usize) {
+                                return !delta_deleted.contains(&f.file_id);
+                            }
+                        }
+                        false
+                    }));
+                }
+            } else {
+                // Slow path: build entries, sort, and cache the result
+                match sort_by {
+                    SortBy::Name | SortBy::Score => {
+                        let mut entries: Vec<(&str, u32, u32)> = active_base.par_iter()
+                            .map(|&idx| {
+                                let (vol, file_idx) = self.base.matched[idx as usize];
+                                let vi = vol as usize;
+                                let name = if vi < vol_files.len() && !vol_files[vi].is_empty() && (file_idx as usize) < vol_files[vi].len() {
+                                    vol_files[vi][file_idx as usize].name.as_str()
+                                } else { "" };
+                                (name, idx, idx)
+                            })
+                            .collect();
+                        let cmp = |a: &(&str, u32, u32), b: &(&str, u32, u32)| {
+                            a.0.cmp(b.0).then(a.1.cmp(&b.1))
+                        };
+                        if sort_direction == SortDirection::Ascending {
+                            let k = eff_end.min(base_n);
+                            if k > 1 {
+                                entries.select_nth_unstable_by(k - 1, |a, b| cmp(a, b));
+                            }
+                            if k > 0 {
+                                entries[0..k].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        } else {
+                            let k = eff_start.min(base_n);
+                            if k > 0 && k < base_n {
+                                entries.select_nth_unstable_by(k, |a, b| cmp(a, b));
+                            }
+                            let sort_end = eff_end.min(base_n);
+                            if sort_end > k {
+                                entries[k..sort_end].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        }
+                        for (i, e) in entries.iter().enumerate() {
+                            active_base[i] = e.2;
+                        }
+                    }
+                    SortBy::Path => {
+                        let mut entries: Vec<(u32, &str, u32, u32)> = active_base.par_iter()
+                            .map(|&idx| {
+                                let (vol, file_idx) = self.base.matched[idx as usize];
+                                let vi = vol as usize;
+                                if vi < vol_path_tables.len() && vol_path_tables[vi].is_some() && vi < vol_files.len() && !vol_files[vi].is_empty() && (file_idx as usize) < vol_files[vi].len() {
+                                    let pt = vol_path_tables[vi].unwrap();
+                                    let f = &vol_files[vi][file_idx as usize];
+                                    (pt.get_ordinal(f.path_id), f.name.as_str(), idx, idx)
+                                } else { (u32::MAX, "", idx, idx) }
+                            })
+                            .collect();
+                        let cmp = |a: &(u32, &str, u32, u32), b: &(u32, &str, u32, u32)| {
+                            a.0.cmp(&b.0).then(a.1.cmp(b.1)).then(a.2.cmp(&b.2))
+                        };
+                        if sort_direction == SortDirection::Ascending {
+                            let k = eff_end.min(base_n);
+                            if k > 1 {
+                                entries.select_nth_unstable_by(k - 1, |a, b| cmp(a, b));
+                            }
+                            if k > 0 {
+                                entries[0..k].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        } else {
+                            let k = eff_start.min(base_n);
+                            if k > 0 && k < base_n {
+                                entries.select_nth_unstable_by(k, |a, b| cmp(a, b));
+                            }
+                            let sort_end = eff_end.min(base_n);
+                            if sort_end > k {
+                                entries[k..sort_end].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        }
+                        for (i, e) in entries.iter().enumerate() {
+                            active_base[i] = e.3;
+                        }
+                    }
+                    SortBy::Size => {
+                        let mut entries: Vec<(u64, u32, u32)> = active_base.par_iter()
+                            .map(|&idx| {
+                                let (vol, file_idx) = self.base.matched[idx as usize];
+                                let vi = vol as usize;
+                                let size = if vi < vol_files.len() && !vol_files[vi].is_empty() && (file_idx as usize) < vol_files[vi].len() {
+                                    vol_files[vi][file_idx as usize].size
+                                } else { u64::MAX };
+                                (size, idx, idx)
+                            })
+                            .collect();
+                        let cmp = |a: &(u64, u32, u32), b: &(u64, u32, u32)| {
+                            a.0.cmp(&b.0).then(a.1.cmp(&b.1))
+                        };
+                        if sort_direction == SortDirection::Ascending {
+                            let k = eff_end.min(base_n);
+                            if k > 1 {
+                                entries.select_nth_unstable_by(k - 1, |a, b| cmp(a, b));
+                            }
+                            if k > 0 {
+                                entries[0..k].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        } else {
+                            let k = eff_start.min(base_n);
+                            if k > 0 && k < base_n {
+                                entries.select_nth_unstable_by(k, |a, b| cmp(a, b));
+                            }
+                            let sort_end = eff_end.min(base_n);
+                            if sort_end > k {
+                                entries[k..sort_end].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        }
+                        for (i, e) in entries.iter().enumerate() {
+                            active_base[i] = e.2;
+                        }
+                    }
+                    SortBy::ModifiedTime => {
+                        let mut entries: Vec<(i32, u32, u32)> = active_base.par_iter()
+                            .map(|&idx| {
+                                let (vol, file_idx) = self.base.matched[idx as usize];
+                                let vi = vol as usize;
+                                let mt = if vi < vol_files.len() && !vol_files[vi].is_empty() && (file_idx as usize) < vol_files[vi].len() {
+                                    vol_files[vi][file_idx as usize].modified_time
+                                } else { i32::MAX };
+                                (mt, idx, idx)
+                            })
+                            .collect();
+                        let cmp = |a: &(i32, u32, u32), b: &(i32, u32, u32)| {
+                            a.0.cmp(&b.0).then(a.1.cmp(&b.1))
+                        };
+                        if sort_direction == SortDirection::Ascending {
+                            let k = eff_end.min(base_n);
+                            if k > 1 {
+                                entries.select_nth_unstable_by(k - 1, |a, b| cmp(a, b));
+                            }
+                            if k > 0 {
+                                entries[0..k].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        } else {
+                            let k = eff_start.min(base_n);
+                            if k > 0 && k < base_n {
+                                entries.select_nth_unstable_by(k, |a, b| cmp(a, b));
+                            }
+                            let sort_end = eff_end.min(base_n);
+                            if sort_end > k {
+                                entries[k..sort_end].sort_unstable_by(|a, b| cmp(a, b));
+                            }
+                        }
+                        for (i, e) in entries.iter().enumerate() {
+                            active_base[i] = e.2;
+                        }
+                    }
+                }
+
+                // Cache the sorted result
+                self.sorted_cache = Some(SortedCache {
+                    sort_by,
+                    sort_direction,
+                    sorted_base: active_base.clone(),
+                    delta_gen: self.delta.generation,
+                });
+            }
+        }
+
         // Two-pointer merge
         match sort_direction {
             SortDirection::Ascending => {
@@ -338,24 +528,24 @@ impl SearchCache {
                             return results;
                         };
                         let fa = &ma.files[a.1 as usize];
-                        let (sort_name, sort_size, sort_modified, sort_path) = if let Some(&(mv, ref mf)) = delta_modified.get(&fa.file_id) {
+                        let (sort_name, sort_size, sort_modified, sort_ordinal) = if let Some(&(mv, ref mf)) = delta_modified.get(&fa.file_id) {
                             let mvol_name = &vol_names[mv as usize];
                             match volumes.get(mvol_name) {
-                                None => (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name)),
-                                Some(mb) => (mf.name.as_str(), mf.size, mf.modified_time, mb.path_table.resolve_file_path(mf.path_id, &mf.name)),
+                                None => (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.get_ordinal(fa.path_id)),
+                                Some(mb) => (mf.name.as_str(), mf.size, mf.modified_time, mb.path_table.get_ordinal(mf.path_id)),
                             }
                         } else {
-                            (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name))
+                            (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.get_ordinal(fa.path_id))
                         };
                         let b = &delta_files[delta_entries[di].0].1;
                         let vol_b_name = &vol_names[delta_files[delta_entries[di].0].0 as usize];
                         let Some(mb) = volumes.get(vol_b_name) else {
                             return results;
                         };
-                        let pb = mb.path_table.resolve_file_path(b.path_id, &b.name);
+                        let b_ordinal = mb.path_table.get_ordinal(b.path_id);
                         let ord = match sort_by {
                             SortBy::Name | SortBy::Score => sort_name.cmp(&b.name),
-                            SortBy::Path => sort_path.cmp(&pb),
+                            SortBy::Path => sort_ordinal.cmp(&b_ordinal).then(sort_name.cmp(&b.name)),
                             SortBy::Size => sort_size.cmp(&b.size),
                             SortBy::ModifiedTime => sort_modified.cmp(&b.modified_time),
                         };
@@ -408,24 +598,24 @@ impl SearchCache {
                             return results;
                         };
                         let fa = &ma.files[a.1 as usize];
-                        let (sort_name, sort_size, sort_modified, sort_path) = if let Some(&(mv, ref mf)) = delta_modified.get(&fa.file_id) {
+                        let (sort_name, sort_size, sort_modified, sort_ordinal) = if let Some(&(mv, ref mf)) = delta_modified.get(&fa.file_id) {
                             let mvol_name = &vol_names[mv as usize];
                             match volumes.get(mvol_name) {
-                                None => (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name)),
-                                Some(mb) => (mf.name.as_str(), mf.size, mf.modified_time, mb.path_table.resolve_file_path(mf.path_id, &mf.name)),
+                                None => (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.get_ordinal(fa.path_id)),
+                                Some(mb) => (mf.name.as_str(), mf.size, mf.modified_time, mb.path_table.get_ordinal(mf.path_id)),
                             }
                         } else {
-                            (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name))
+                            (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.get_ordinal(fa.path_id))
                         };
                         let b = &delta_files[delta_entries[di - 1].0].1;
                         let vol_b_name = &vol_names[delta_files[delta_entries[di - 1].0].0 as usize];
                         let Some(mb) = volumes.get(vol_b_name) else {
                             return results;
                         };
-                        let pb = mb.path_table.resolve_file_path(b.path_id, &b.name);
+                        let b_ordinal = mb.path_table.get_ordinal(b.path_id);
                         let ord = match sort_by {
                             SortBy::Name | SortBy::Score => sort_name.cmp(&b.name),
-                            SortBy::Path => sort_path.cmp(&pb),
+                            SortBy::Path => sort_ordinal.cmp(&b_ordinal).then(sort_name.cmp(&b.name)),
                             SortBy::Size => sort_size.cmp(&b.size),
                             SortBy::ModifiedTime => sort_modified.cmp(&b.modified_time),
                         };
@@ -470,76 +660,27 @@ impl SearchCache {
     }
 }
 
-fn build_sort_permutation(matched: &[(u8, u32)], volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String], sort_by: SortBy) -> Vec<u32> {
+/// Build unsorted list of valid indices into `matched`.
+/// Filters out entries whose volume or file index is out of bounds.
+/// This is O(n) and called once per cache build; subsequent sorts use
+/// `select_nth_unstable_by` on this list instead of a full O(n log n) sort.
+fn build_valid_indices(matched: &[(u8, u32)], volumes: &HashMap<String, VolumeMonitor>, vol_names: &[String]) -> Vec<u32> {
     let n = matched.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    // 预构建 vol_idx → files 切片和 path_table 的数组
-    // 避免 221万次 HashMap 查找（volumes[&vol_names[*vol as usize]]）
-    // HashMap 查找需要哈希计算 + 比较，而数组索引是 O(1)
+    if n == 0 { return Vec::new(); }
     let vol_files: Vec<&[FileEntry]> = (0..vol_names.len())
         .map(|i| volumes.get(&vol_names[i]).map(|v| v.files.as_slice()).unwrap_or(&[]))
         .collect();
-    let vol_path_tables: Vec<Option<&PathTable>> = (0..vol_names.len())
-        .map(|i| volumes.get(&vol_names[i]).map(|v| &v.path_table))
-        .collect();
-
-    let mut v: Vec<u32> = (0..n as u32).collect();
-    // Filter out entries referencing empty volumes (volume was cleared/removed)
-    v.retain(|&i| {
-        let (vol, _idx) = matched[i as usize];
-        !vol_files[vol as usize].is_empty()
-    });
-    // 所有排序分支都添加原始索引作为二级排序键
-    // 原因：par_sort_unstable_by 是不稳定排序，相同 key 的元素顺序不确定
-    // 当 LRU 淘汰排序缓存后重新构建时，相同 key 的文件顺序会变化，导致"多次排序后结果错乱"
-    // 用原始索引（即 matched 中的顺序）作为 tiebreaker，保证相同 key 时顺序确定性
-    match sort_by {
-        SortBy::Name | SortBy::Score => {
-            // 通过预构建的 vol_files 数组直接索引，避免 HashMap 查找
-            // 关键优化：使用 par_iter().map() 并行收集 keys，
-            // 把串行的 221万次指针解引用 + 字符串 slice 操作分摊到多核
-            let keys: Vec<&str> = matched.par_iter()
-                .map(|(vol, idx)| vol_files[*vol as usize][*idx as usize].name.as_str())
-                .collect();
-            v.par_sort_unstable_by(|&a, &b| keys[a as usize].cmp(keys[b as usize]).then(a.cmp(&b)));
-        }
-        SortBy::Path => {
-            // FileEntry.path_id 指向父目录，需用 ordinal + name 排序
-            // 关键优化：用预计算的 ordinal (u32) 替代完整路径字符串比较
-            // 221万次比较从 O(strlen) 字符串 cmp 降至 O(1) u32 cmp
-            // 预期 8 核 CPU 上首次 Path 排序从 ~2s 降至 ~500ms
-            let keys: Vec<(u32, &str)> = matched.par_iter()
-                .map(|(vol, idx)| {
-                    let pt = vol_path_tables[*vol as usize].unwrap();
-                    let f = &vol_files[*vol as usize][*idx as usize];
-                    (pt.get_ordinal(f.path_id), f.name.as_str())
-                })
-                .collect();
-            v.par_sort_unstable_by(|&a, &b| {
-                keys[a as usize].0.cmp(&keys[b as usize].0)
-                    .then(keys[a as usize].1.cmp(keys[b as usize].1))
-                    .then(a.cmp(&b))
-            });
-        }
-        SortBy::Size => {
-            let keys: Vec<u64> = matched.par_iter()
-                .map(|(vol, idx)| vol_files[*vol as usize][*idx as usize].size)
-                .collect();
-            v.par_sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]).then(a.cmp(&b)));
-        }
-        SortBy::ModifiedTime => {
-            // FileEntry 的 modified_time 是 i32（SearchResult 是 i64）
-            // 直接以 i32 排序结果与 i64 一致，无需扩展
-            let keys: Vec<i32> = matched.par_iter()
-                .map(|(vol, idx)| vol_files[*vol as usize][*idx as usize].modified_time)
-                .collect();
-            v.par_sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]).then(a.cmp(&b)));
+    let mut v: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..n as u32 {
+        let (vol, idx) = matched[i as usize];
+        let vi = vol as usize;
+        if vi < vol_files.len() && !vol_files[vi].is_empty() && (idx as usize) < vol_files[vi].len() {
+            v.push(i);
         }
     }
     v
 }
+
 
 pub struct VolumeManager {
     volumes: HashMap<String, VolumeMonitor>,
@@ -608,7 +749,6 @@ impl VolumeManager {
     }
 
     pub fn take_monitor(&mut self, drive_letter: &str) -> Option<VolumeMonitor> {
-        self.search_cache = None;
         self.volumes.remove(drive_letter)
     }
 
@@ -693,12 +833,6 @@ impl VolumeManager {
         let total = all_matched.len();
         log::info!("search_with_options: matched {} files, {:?}", total, t0.elapsed());
 
-        // Build all 4 base permutations
-        let sn = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::Name));
-        let sp = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::Path));
-        let ss = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::Size));
-        let sm = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::ModifiedTime));
-
         self.search_cache = Some(SearchCache {
             cache_key: new_cache_key,
             query: query.to_string(),
@@ -707,18 +841,18 @@ impl VolumeManager {
             created_at: Instant::now(),
             base: BaseCache {
                 matched: all_matched,
-                sorted_by_name: sn,
-                sorted_by_path: sp,
-                sorted_by_size: ss,
-                sorted_by_modified: sm,
+                valid_indices: None, // built lazily in get_sorted_slice
             },
             delta: DeltaCache {
                 new_files: Vec::new(),
                 file_id_index: HashMap::new(),
                 deleted_ids: HashSet::new(),
+                renamed_fids: HashSet::new(),
                 modified: HashMap::new(),
                 matched: Vec::new(),
+                generation: 0,
             },
+            sorted_cache: None,
         });
 
         // Use get_sorted_slice for first_batch (handles base+delta merge)
@@ -892,8 +1026,16 @@ impl VolumeManager {
             // Add new files to delta (append-only)
             for entry in added_entries {
                 let file_idx = cache.delta.new_files.len();
-                // If this file_id was previously deleted or modified, clear the stale entries
-                cache.delta.deleted_ids.remove(&entry.1.file_id);
+                // For renames (fid in both removed and added): keep fid in
+                // deleted_ids so the old base entry is hidden, but mark it
+                // in renamed_fids so the new delta entry is NOT filtered out.
+                // For pure additions (fid NOT in deleted_ids): no conflict.
+                if cache.delta.deleted_ids.contains(&entry.1.file_id) {
+                    cache.delta.renamed_fids.insert(entry.1.file_id);
+                } else {
+                    // Pure new file: clear any stale deleted/modified state
+                    cache.delta.deleted_ids.remove(&entry.1.file_id);
+                }
                 cache.delta.modified.remove(&entry.1.file_id);
                 cache.delta.file_id_index.insert(entry.1.file_id, file_idx);
                 cache.delta.new_files.push(entry);
@@ -901,17 +1043,11 @@ impl VolumeManager {
             // Rebuild delta.matched from delta.new_files
             let mut new_delta_matched: Vec<(u8, u32)> = Vec::new();
             for (i, (v, f)) in cache.delta.new_files.iter().enumerate() {
-                if cache.delta.deleted_ids.contains(&f.file_id) { continue; }
+                if cache.delta.deleted_ids.contains(&f.file_id) && !cache.delta.renamed_fids.contains(&f.file_id) { continue; }
                 new_delta_matched.push((*v, i as u32));
             }
             cache.delta.matched = new_delta_matched;
-            // Invalidate base permutations if base.files was modified
-            if !cache.delta.modified.is_empty() {
-                cache.base.sorted_by_name = None;
-                cache.base.sorted_by_path = None;
-                cache.base.sorted_by_size = None;
-                cache.base.sorted_by_modified = None;
-            }
+            cache.delta.generation += 1;
         }
     }
 
@@ -1002,10 +1138,8 @@ fn apply_incremental_to_cache(
     let _added_count = new_matched.len() - added_count_before;
 
     cache.base.matched = new_matched;
-    cache.base.sorted_by_name = None;
-    cache.base.sorted_by_path = None;
-    cache.base.sorted_by_size = None;
-    cache.base.sorted_by_modified = None;
+    cache.base.valid_indices = None;
+    cache.sorted_cache = None;
 
     cache.base.matched.len()
 }
