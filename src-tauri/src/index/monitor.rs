@@ -45,7 +45,7 @@ fn should_skip_by_attr(include_hidden: bool, include_system: bool, meta: &std::f
 // LRU 容量扩展到 4，支持所有排序字段同时缓存
 // 每个 perm Vec 内存：221万 × 4字节 ≈ 8.4MB，4 个共 33.6MB
 // 收益：用户在 Name/Path/Size/ModifiedTime 之间反复切换时无需重排序（每次重排 ~1-3s）
-const MAX_SORT_PERMUTATIONS: usize = 4;
+const _MAX_SORT_PERMUTATIONS: usize = 4;
 
 /// 从完整文件路径中分离出父目录路径
 /// "X:\dir\file.txt" → "X:\dir"
@@ -66,24 +66,32 @@ fn parent_dir_of(full_path: &str) -> &str {
     }
 }
 
-pub struct SearchCache {
-    /// (query, files_only, directories_only) 三元组 hash
-    /// 用于 search_with_options 复用旧 cache，避免 sort 切换时重建整个 search_cache
-    cache_key: u64,
-    query: String,
-    files_only: bool,
-    directories_only: bool,
-    pub total: usize,
-    pub created_at: Instant,
+/// Base cache: stable data from full scan. Sort permutations only rebuilt during merge.
+pub struct BaseCache {
     pub matched: Vec<(u8, u32)>,
-    // 排序排列向量：使用 u32 索引而非 usize 以节省内存
-    // 221 万文件完全可用 u32 表示，每项从 8 字节降至 4 字节，节省 50%
     sorted_by_name: Option<Vec<u32>>,
     sorted_by_path: Option<Vec<u32>>,
     sorted_by_size: Option<Vec<u32>>,
     sorted_by_modified: Option<Vec<u32>>,
-    // LRU tracking: order of last access for each sort permutation (most recent last)
-    sort_access_order: Vec<SortBy>,
+}
+
+/// Delta cache: incremental changes. new_files is APPEND-ONLY (no swap_remove!).
+pub struct DeltaCache {
+    pub new_files: Vec<(u8, FileEntry)>,
+    pub file_id_index: HashMap<u32, usize>,
+    pub deleted_ids: HashSet<u32>,
+    pub modified: HashMap<u32, (u8, FileEntry)>,
+    pub matched: Vec<(u8, u32)>,
+}
+
+pub struct SearchCache {
+    cache_key: u64,
+    query: String,
+    files_only: bool,
+    directories_only: bool,
+    pub created_at: Instant,
+    pub base: BaseCache,
+    pub delta: DeltaCache,
 }
 
 impl SearchCache {
@@ -95,28 +103,107 @@ impl SearchCache {
         self.created_at = Instant::now();
     }
 
-    /// Evict the least recently used sort permutation if we have too many cached.
-    fn evict_lru_permutation(&mut self) {
-        if self.sort_access_order.len() <= MAX_SORT_PERMUTATIONS {
-            return;
-        }
-        // The first element in access_order is the least recently used
-        let lru = self.sort_access_order.remove(0);
-        match lru {
-            SortBy::Name | SortBy::Score => { self.sorted_by_name = None; }
-            SortBy::Path => { self.sorted_by_path = None; }
-            SortBy::Size => { self.sorted_by_size = None; }
-            SortBy::ModifiedTime => { self.sorted_by_modified = None; }
-        }
-        log::info!("Evicted LRU sort permutation: {:?}", lru);
+    fn total_matched(&self) -> usize {
+        self.base.matched.len() + self.delta.matched.len()
     }
 
-    /// Record that a sort permutation was accessed (move to end of access order).
-    fn touch_sort_permutation(&mut self, sort_by: SortBy) {
-        // Remove existing entry if present
-        self.sort_access_order.retain(|&s| s != sort_by);
-        // Add to end (most recent)
-        self.sort_access_order.push(sort_by);
+    /// Merge delta into base. Called periodically.
+    pub fn merge_delta_to_base(&mut self, volumes: &mut HashMap<String, VolumeMonitor>, vol_names: &[String]) {
+        if self.delta.new_files.is_empty() && self.delta.deleted_ids.is_empty() && self.delta.modified.is_empty() {
+            return;
+        }
+        let t0 = Instant::now();
+
+        // Apply modifications to base.files
+        for (&fid, &(vol_idx, ref new_entry)) in &self.delta.modified {
+            let vol_name = &vol_names[vol_idx as usize];
+            if let Some(monitor) = volumes.get_mut(vol_name) {
+                if let Some(fi) = monitor.fid_index.as_ref() {
+                    if let Ok(pos) = fi.binary_search_by_key(&fid, |(id, _)| *id) {
+                        let idx = fi[pos].1 as usize;
+                        if idx < monitor.files.len() {
+                            monitor.files[idx] = new_entry.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mark deleted files in base.files
+        for &fid in &self.delta.deleted_ids {
+            for monitor in volumes.values_mut() {
+                if let Some(fi) = monitor.fid_index.as_ref() {
+                    if let Ok(pos) = fi.binary_search_by_key(&fid, |(id, _)| *id) {
+                        let idx = fi[pos].1 as usize;
+                        if idx < monitor.files.len() {
+                            monitor.files[idx].path_id = PathTable::deleted_id();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Append delta.new_files to base.files
+        for (vol_idx, file_entry) in &self.delta.new_files {
+            let vol_name = &vol_names[*vol_idx as usize];
+            if let Some(monitor) = volumes.get_mut(vol_name) {
+                monitor.files.push(file_entry.clone());
+            }
+        }
+
+        // Rebuild fid_index for affected volumes and compact
+        let mut affected_vols: HashSet<u8> = self.delta.new_files.iter().map(|(v, _)| *v).collect();
+        for &fid in self.delta.modified.keys().chain(self.delta.deleted_ids.iter()) {
+            for (idx, (_vn, monitor)) in volumes.iter().enumerate() {
+                if let Some(fi) = monitor.fid_index.as_ref() {
+                    if fi.binary_search_by_key(&fid, |(id, _)| *id).is_ok() {
+                        affected_vols.insert(idx as u8);
+                    }
+                }
+            }
+        }
+        for vol_idx in &affected_vols {
+            let vol_name = &vol_names[*vol_idx as usize];
+            if let Some(monitor) = volumes.get_mut(vol_name) {
+                let mut fid_index: Vec<(u32, u32)> = Vec::with_capacity(monitor.files.len());
+                for (i, f) in monitor.files.iter().enumerate() {
+                    if !PathTable::is_deleted(f.path_id) {
+                        fid_index.push((f.file_id, i as u32));
+                    }
+                }
+                fid_index.sort_unstable_by_key(|(id, _)| *id);
+                monitor.fid_index = Some(fid_index);
+                monitor.compact_files();
+            }
+        }
+
+        // Clear delta
+        self.delta.new_files.clear();
+        self.delta.file_id_index.clear();
+        self.delta.deleted_ids.clear();
+        self.delta.modified.clear();
+        self.delta.matched.clear();
+
+        // Rebuild base matched from scratch
+        let mut matched = Vec::new();
+        for (vol_name, monitor) in volumes.iter() {
+            let vol_idx = vol_names.iter().position(|n| n == vol_name).unwrap() as u8;
+            for (file_idx, file) in monitor.files.iter().enumerate() {
+                if PathTable::is_deleted(file.path_id) { continue; }
+                if self.files_only && file.is_directory { continue; }
+                if self.directories_only && !file.is_directory { continue; }
+                matched.push((vol_idx, file_idx as u32));
+            }
+        }
+        self.base.matched = matched;
+
+        // Invalidate base permutations (will be rebuilt lazily)
+        self.base.sorted_by_name = None;
+        self.base.sorted_by_path = None;
+        self.base.sorted_by_size = None;
+        self.base.sorted_by_modified = None;
+
+        log::info!("merge_delta_to_base: done in {:?}, base={} entries", t0.elapsed(), self.base.matched.len());
     }
 
     pub fn get_sorted_slice(
@@ -128,73 +215,258 @@ impl SearchCache {
         start: usize,
         end: usize,
     ) -> Vec<SearchResult> {
-        // Check if we need to build the permutation
-        let needs_build = match sort_by {
-            SortBy::Name | SortBy::Score => self.sorted_by_name.is_none(),
-            SortBy::Path => self.sorted_by_path.is_none(),
-            SortBy::Size => self.sorted_by_size.is_none(),
-            SortBy::ModifiedTime => self.sorted_by_modified.is_none(),
+        // Snapshot delta.new_files to avoid inconsistency if it's modified during this call
+        let delta_files: Vec<(u8, FileEntry)> = self.delta.new_files.clone();
+        let delta_deleted = self.delta.deleted_ids.clone();
+        let delta_modified = self.delta.modified.clone();
+
+        // Build base permutation if needed
+        let base_needs_build = match sort_by {
+            SortBy::Name | SortBy::Score => self.base.sorted_by_name.is_none(),
+            SortBy::Path => self.base.sorted_by_path.is_none(),
+            SortBy::Size => self.base.sorted_by_size.is_none(),
+            SortBy::ModifiedTime => self.base.sorted_by_modified.is_none(),
         };
-        
-        if needs_build {
-            // Evict LRU before allocating a new permutation
-            self.evict_lru_permutation();
-            let t0 = Instant::now();
-            let matched = &self.matched;
-            let perm = build_sort_permutation(matched, volumes, vol_names, sort_by);
-            log::info!("build_sort_permutation({:?}): {:?}", sort_by, t0.elapsed());
+        if base_needs_build && !self.base.matched.is_empty() {
+            let perm = build_sort_permutation(&self.base.matched, volumes, vol_names, sort_by);
             match sort_by {
-                SortBy::Name | SortBy::Score => { self.sorted_by_name = Some(perm); }
-                SortBy::Path => { self.sorted_by_path = Some(perm); }
-                SortBy::Size => { self.sorted_by_size = Some(perm); }
-                SortBy::ModifiedTime => { self.sorted_by_modified = Some(perm); }
+                SortBy::Name | SortBy::Score => { self.base.sorted_by_name = Some(perm); }
+                SortBy::Path => { self.base.sorted_by_path = Some(perm); }
+                SortBy::Size => { self.base.sorted_by_size = Some(perm); }
+                SortBy::ModifiedTime => { self.base.sorted_by_modified = Some(perm); }
             }
         }
-        self.touch_sort_permutation(sort_by);
-        
-        let matched = &self.matched;
-        let indices = match sort_by {
-            SortBy::Name | SortBy::Score => self.sorted_by_name.as_ref().unwrap(),
-            SortBy::Path => self.sorted_by_path.as_ref().unwrap(),
-            SortBy::Size => self.sorted_by_size.as_ref().unwrap(),
-            SortBy::ModifiedTime => self.sorted_by_modified.as_ref().unwrap(),
+
+        let base_perm = match sort_by {
+            SortBy::Name | SortBy::Score => self.base.sorted_by_name.as_ref(),
+            SortBy::Path => self.base.sorted_by_path.as_ref(),
+            SortBy::Size => self.base.sorted_by_size.as_ref(),
+            SortBy::ModifiedTime => self.base.sorted_by_modified.as_ref(),
         };
-        let n = indices.len();
-        if n == 0 {
-            return Vec::new();
+
+        // Build filtered base indices (skip deleted_ids)
+        let active_base: Vec<u32> = if let Some(perm) = base_perm {
+            if delta_deleted.is_empty() {
+                perm.clone()
+            } else {
+                perm.iter().copied().filter(|idx| {
+                    let (vol, file_idx) = &self.base.matched[*idx as usize];
+                    let vol_name = &vol_names[*vol as usize];
+                    if let Some(m) = volumes.get(vol_name) {
+                        if let Some(f) = m.files.get(*file_idx as usize) {
+                            return !delta_deleted.contains(&f.file_id);
+                        }
+                    }
+                    true
+                }).collect()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Build sorted delta entries directly from delta_files
+        // No index indirection - sort (index, key) tuples directly
+        let query = if self.query.trim().is_empty() { None } else {
+            Some(crate::search::query::SearchQuery::parse(&self.query))
+        };
+        let needs_path = query.as_ref().map_or(false, |q| q.path_filter.is_some());
+        let df_len = delta_files.len();
+        let mut delta_entries: Vec<(usize, &str, u64, i32, CompactString)> = Vec::new();
+        for i in 0..df_len {
+            let (_vol, f) = &delta_files[i];
+            if delta_deleted.contains(&f.file_id) { continue; }
+            if let Some(ref q) = query {
+                let vol_name = &vol_names[*_vol as usize];
+                if let Some(m) = volumes.get(vol_name) {
+                    let full_path = if needs_path {
+                        m.path_table.resolve_file_path(f.path_id, &f.name)
+                    } else { CompactString::new("") };
+                    if !crate::search::query::SearchQuery::matches_entry(q, f, &full_path) { continue; }
+                }
+            }
+            if self.files_only && f.is_directory { continue; }
+            if self.directories_only && !f.is_directory { continue; }
+            let path = if needs_path {
+                let vol_name = &vol_names[*_vol as usize];
+                volumes.get(vol_name).map(|m| m.path_table.resolve_file_path(f.path_id, &f.name)).unwrap_or_default()
+            } else { CompactString::new("") };
+            delta_entries.push((i, f.name.as_str(), f.size, f.modified_time, path));
         }
 
-        let (range_start, range_end) = match sort_direction {
-            SortDirection::Ascending => (start.min(n), end.min(n)),
+        match sort_by {
+            SortBy::Name | SortBy::Score => {
+                delta_entries.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
+            }
+            SortBy::Path => {
+                delta_entries.sort_by(|a, b| a.4.cmp(&b.4).then(a.1.cmp(b.1)).then(a.0.cmp(&b.0)));
+            }
+            SortBy::Size => {
+                delta_entries.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)));
+            }
+            SortBy::ModifiedTime => {
+                delta_entries.sort_by(|a, b| a.3.cmp(&b.3).then(a.0.cmp(&b.0)));
+            }
+        }
+
+        let base_n = active_base.len();
+        let delta_n = delta_entries.len();
+        let total_n = base_n + delta_n;
+        if total_n == 0 { return Vec::new(); }
+
+        let (eff_start, eff_end) = match sort_direction {
+            SortDirection::Ascending => (start.min(total_n), end.min(total_n)),
             SortDirection::Descending => {
-                let s = n.saturating_sub(end.max(start)).min(n);
-                let e = n.saturating_sub(start);
+                let s = total_n.saturating_sub(end.max(start)).min(total_n);
+                let e = total_n.saturating_sub(start);
                 (s, e.max(s))
             }
         };
+        if eff_start >= eff_end || eff_start >= total_n { return Vec::new(); }
 
-        if range_start >= range_end || range_start >= n {
-            return Vec::new();
+        // Two-pointer merge
+        match sort_direction {
+            SortDirection::Ascending => {
+                let mut results = Vec::with_capacity(eff_end - eff_start);
+                let (mut bi, mut di, mut pos) = (0usize, 0usize, 0usize);
+                while pos < eff_end && (bi < base_n || di < delta_n) {
+                    let pick_base = if di >= delta_n { true }
+                    else if bi >= base_n { false }
+                    else {
+                        let a = &self.base.matched[active_base[bi] as usize];
+                        let vol_a = &vol_names[a.0 as usize];
+                        let Some(ma) = volumes.get(vol_a) else {
+                            return results;
+                        };
+                        let fa = &ma.files[a.1 as usize];
+                        let (sort_name, sort_size, sort_modified, sort_path) = if let Some(&(mv, ref mf)) = delta_modified.get(&fa.file_id) {
+                            let mvol_name = &vol_names[mv as usize];
+                            match volumes.get(mvol_name) {
+                                None => (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name)),
+                                Some(mb) => (mf.name.as_str(), mf.size, mf.modified_time, mb.path_table.resolve_file_path(mf.path_id, &mf.name)),
+                            }
+                        } else {
+                            (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name))
+                        };
+                        let b = &delta_files[delta_entries[di].0].1;
+                        let vol_b_name = &vol_names[delta_files[delta_entries[di].0].0 as usize];
+                        let Some(mb) = volumes.get(vol_b_name) else {
+                            return results;
+                        };
+                        let pb = mb.path_table.resolve_file_path(b.path_id, &b.name);
+                        let ord = match sort_by {
+                            SortBy::Name | SortBy::Score => sort_name.cmp(&b.name),
+                            SortBy::Path => sort_path.cmp(&pb),
+                            SortBy::Size => sort_size.cmp(&b.size),
+                            SortBy::ModifiedTime => sort_modified.cmp(&b.modified_time),
+                        };
+                        ord != std::cmp::Ordering::Greater
+                    };
+                    if pos >= eff_start {
+                        if pick_base {
+                            let &(vol, file_idx) = &self.base.matched[active_base[bi] as usize];
+                            let vol_name = &vol_names[vol as usize];
+                            if let Some(m) = volumes.get(vol_name) {
+                                if let Some(f) = m.files.get(file_idx as usize) {
+                                    if let Some(&(mv, ref mf)) = delta_modified.get(&f.file_id) {
+                                        let mvol_name = &vol_names[mv as usize];
+                                        if let Some(mm) = volumes.get(mvol_name) {
+                                            let full_path = mm.path_table.resolve_file_path(mf.path_id, &mf.name);
+                                            results.push(mf.to_search_result(full_path));
+                                        }
+                                    } else {
+                                        let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
+                                        results.push(f.to_search_result(full_path));
+                                    }
+                                }
+                            }
+                        } else {
+                            let de = &delta_entries[di];
+                            let &(vol, ref f) = &delta_files[de.0];
+                            let vol_name = &vol_names[vol as usize];
+                            if let Some(m) = volumes.get(vol_name) {
+                                let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
+                                results.push(f.to_search_result(full_path));
+                            }
+                        }
+                    }
+                    if pick_base { bi += 1; } else { di += 1; }
+                    pos += 1;
+                }
+                results
+            }
+            SortDirection::Descending => {
+                let mut results = Vec::with_capacity(eff_end - eff_start);
+                let (mut bi, mut di, mut pos) = (base_n, delta_n, total_n);
+                while pos > eff_start && (bi > 0 || di > 0) {
+                    pos -= 1;
+                    let pick_base = if di == 0 { true }
+                    else if bi == 0 { false }
+                    else {
+                        let a = &self.base.matched[active_base[bi - 1] as usize];
+                        let vol_a = &vol_names[a.0 as usize];
+                        let Some(ma) = volumes.get(vol_a) else {
+                            return results;
+                        };
+                        let fa = &ma.files[a.1 as usize];
+                        let (sort_name, sort_size, sort_modified, sort_path) = if let Some(&(mv, ref mf)) = delta_modified.get(&fa.file_id) {
+                            let mvol_name = &vol_names[mv as usize];
+                            match volumes.get(mvol_name) {
+                                None => (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name)),
+                                Some(mb) => (mf.name.as_str(), mf.size, mf.modified_time, mb.path_table.resolve_file_path(mf.path_id, &mf.name)),
+                            }
+                        } else {
+                            (fa.name.as_str(), fa.size, fa.modified_time, ma.path_table.resolve_file_path(fa.path_id, &fa.name))
+                        };
+                        let b = &delta_files[delta_entries[di - 1].0].1;
+                        let vol_b_name = &vol_names[delta_files[delta_entries[di - 1].0].0 as usize];
+                        let Some(mb) = volumes.get(vol_b_name) else {
+                            return results;
+                        };
+                        let pb = mb.path_table.resolve_file_path(b.path_id, &b.name);
+                        let ord = match sort_by {
+                            SortBy::Name | SortBy::Score => sort_name.cmp(&b.name),
+                            SortBy::Path => sort_path.cmp(&pb),
+                            SortBy::Size => sort_size.cmp(&b.size),
+                            SortBy::ModifiedTime => sort_modified.cmp(&b.modified_time),
+                        };
+                        ord != std::cmp::Ordering::Less
+                    };
+                    if pos < eff_end {
+                        if pick_base {
+                            bi -= 1;
+                            let &(vol, file_idx) = &self.base.matched[active_base[bi] as usize];
+                            let vol_name = &vol_names[vol as usize];
+                            if let Some(m) = volumes.get(vol_name) {
+                                if let Some(f) = m.files.get(file_idx as usize) {
+                                    if let Some(&(mv, ref mf)) = delta_modified.get(&f.file_id) {
+                                        let mvol_name = &vol_names[mv as usize];
+                                        if let Some(mm) = volumes.get(mvol_name) {
+                                            let full_path = mm.path_table.resolve_file_path(mf.path_id, &mf.name);
+                                            results.push(mf.to_search_result(full_path));
+                                        }
+                                    } else {
+                                        let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
+                                        results.push(f.to_search_result(full_path));
+                                    }
+                                }
+                            }
+                        } else {
+                            di -= 1;
+                            let de = &delta_entries[di];
+                            let &(vol, ref f) = &delta_files[de.0];
+                            let vol_name = &vol_names[vol as usize];
+                            if let Some(m) = volumes.get(vol_name) {
+                                let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
+                                results.push(f.to_search_result(full_path));
+                            }
+                        }
+                    } else {
+                        if pick_base { bi -= 1; } else { di -= 1; }
+                    }
+                }
+                results
+            }
         }
-
-        let iter: Box<dyn Iterator<Item = &u32>> = match sort_direction {
-            SortDirection::Ascending => Box::new(indices[range_start..range_end].iter()),
-            SortDirection::Descending => Box::new(indices[range_start..range_end].iter().rev()),
-        };
-
-        iter.filter_map(|idx| {
-            let (vol, file_idx) = &matched[*idx as usize];
-            let vol_name = &vol_names[*vol as usize];
-            // 将内部 FileEntry 转换为对外的 SearchResult
-            // 通过 path_table 解析完整路径（FileEntry 不存储完整路径字符串）
-            volumes.get(vol_name).and_then(|m| {
-                m.files.get(*file_idx as usize).map(|f| {
-                    // 文件路径 = 父目录路径 + "\" + 文件名
-                    let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
-                    f.to_search_result(full_path)
-                })
-            })
-        }).collect()
     }
 }
 
@@ -214,6 +486,11 @@ fn build_sort_permutation(matched: &[(u8, u32)], volumes: &HashMap<String, Volum
         .collect();
 
     let mut v: Vec<u32> = (0..n as u32).collect();
+    // Filter out entries referencing empty volumes (volume was cleared/removed)
+    v.retain(|&i| {
+        let (vol, _idx) = matched[i as usize];
+        !vol_files[vol as usize].is_empty()
+    });
     // 所有排序分支都添加原始索引作为二级排序键
     // 原因：par_sort_unstable_by 是不稳定排序，相同 key 的元素顺序不确定
     // 当 LRU 淘汰排序缓存后重新构建时，相同 key 的文件顺序会变化，导致"多次排序后结果错乱"
@@ -331,6 +608,7 @@ impl VolumeManager {
     }
 
     pub fn take_monitor(&mut self, drive_letter: &str) -> Option<VolumeMonitor> {
+        self.search_cache = None;
         self.volumes.remove(drive_letter)
     }
 
@@ -352,11 +630,6 @@ impl VolumeManager {
     pub fn search_with_options(&mut self, query: &str, options: &SearchOptions) -> (Vec<SearchResult>, usize) {
         let t0 = Instant::now();
 
-        // === Cache 复用优化 ===
-        // 计算 cache_key：(query, files_only, directories_only) 三元组 hash
-        // 如果与旧 cache 相同，说明 matched 内容必然相同（files Vec 未变），
-        // 直接复用旧 matched 和已有 perm，**避免每次 sort 都重建整个 search_cache**。
-        // 这把"切换排序字段"的耗时从 ~2s（重建 perm）降至 ~50ms（仅 path 解析 first_batch）
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
@@ -365,192 +638,95 @@ impl VolumeManager {
         options.directories_only.hash(&mut hasher);
         let new_cache_key = hasher.finish();
 
-        // 检查是否可复用旧 cache
-        let can_reuse_cache = if let Some(old) = self.search_cache.as_ref() {
-            old.is_valid() && old.cache_key == new_cache_key
-        } else {
-            false
-        };
-
-        // === 取出旧 cache：分离 matched 和 sort perm ===
-        // 当 can_reuse_cache 时，matched 和 perm 都有效（matched 向量相同）。
-        // 当 can_reuse_cache=false 时，matched 向量已变，旧 perm 索引越界不可复用，
-        // 必须丢弃并在下面重建。否则 release 模式下 panic=abort 会直接终止进程。
-        let (matched, total, old_perms) = if can_reuse_cache {
-            log::info!("search_with_options: reusing cache (key={})", new_cache_key);
-            let old = self.search_cache.take().unwrap();
-            let m = old.matched;
-            let t = old.total;
-            // 保留旧排序排列（matched 相同，perm 索引仍然有效）
-            let perms = SearchCache {
-                cache_key: old.cache_key,
-                query: old.query,
-                files_only: old.files_only,
-                directories_only: old.directories_only,
-                total: old.total,
-                created_at: old.created_at,
-                matched: Vec::new(),
-                sorted_by_name: old.sorted_by_name,
-                sorted_by_path: old.sorted_by_path,
-                sorted_by_size: old.sorted_by_size,
-                sorted_by_modified: old.sorted_by_modified,
-                sort_access_order: old.sort_access_order,
-            };
-            (m, t, Some(perms))
-        } else {
-            // 丢弃旧 cache（其 perm 索引的是旧 matched，不可复用）
-            self.search_cache = None;
-            // 正常搜索流程
-            let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
-            // 使用 Mutex 保护 Vec，允许多线程并发 push
-            // 预估容量 1/4 命中率，过小时 rayon 会按需扩展
-            let matched_lock = std::sync::Mutex::new(Vec::with_capacity(total_files / 4));
-            let is_empty_query = query.trim().is_empty();
-            let parsed_query = if is_empty_query {
-                None
-            } else {
-                Some(crate::search::query::SearchQuery::parse(query))
-            };
-            let query_controls_dir = parsed_query.as_ref().map_or(false, |q| q.path_filter_dir_only);
-            // 仅当查询含 path_filter 时才需要解析完整路径，避免无谓的字符串分配
-            let needs_path = parsed_query.as_ref().map_or(false, |q| q.path_filter.is_some());
-            let files_only = options.files_only;
-            let directories_only = options.directories_only;
-
-            // 并行遍历所有卷的文件
-            // 关键优化：把单线程的 221万次 matches_entry 调用分摊到所有 CPU 核心
-            // 预期收益：8 核 CPU 上搜索阶段耗时从 ~700ms 降至 ~150ms
-            self.volumes.par_iter().for_each(|(vol_key, monitor)| {
-                let vol_idx = self.volume_index[vol_key];
-                if is_empty_query {
-                    // 空查询路径：仅按 files_only/directories_only 过滤
-                    let local: Vec<(u8, u32)> = monitor.files.par_iter().enumerate()
-                        .filter_map(|(idx, file)| {
-                            if files_only && file.is_directory { return None; }
-                            if directories_only && !file.is_directory { return None; }
-                            Some((vol_idx, idx as u32))
-                        })
-                        .collect();
-                    matched_lock.lock().unwrap().extend(local);
-                } else {
-                    let pq = parsed_query.as_ref().unwrap();
-                    // 非空查询：调用 matches_entry 匹配
-                    // 分块并行：每个 rayon worker 独立处理一段文件，最后一次性 extend 减少锁竞争
-                    let local: Vec<(u8, u32)> = monitor.files.par_iter().enumerate()
-                        .filter_map(|(idx, file)| {
-                            // 对于有 path_filter 的查询，需要解析完整路径用于匹配
-                            // 对于无 path_filter 的查询，传空字符串以跳过路径检查，避免内存分配
-                            let full_path = if needs_path {
-                                monitor.path_table.resolve_file_path(file.path_id, &file.name)
-                            } else {
-                                CompactString::new("")
-                            };
-                            if !crate::search::query::SearchQuery::matches_entry(pq, file, &full_path) { return None; }
-                            if !query_controls_dir && files_only && file.is_directory { return None; }
-                            if directories_only && !file.is_directory { return None; }
-                            Some((vol_idx, idx as u32))
-                        })
-                        .collect();
-                    matched_lock.lock().unwrap().extend(local);
-                }
-            });
-
-            let m = matched_lock.into_inner().unwrap();
-            let t = m.len();
-            log::info!("search_with_options: matched {} files, {:?}", t, t0.elapsed());
-            (m, t, None)
-        };
-
-        // 为当前 sort_by 准备 perm：复用旧 perm 或重新构建
-        // 注意：当前 sort_by 的 perm 在 build_sort_permutation 中会构建，
-        // 但其他 sort_by 的 perm 会被保留（来自 old_perms）
-        let needs_build_current = match options.sort_by {
-            SortBy::Name | SortBy::Score => old_perms.as_ref().map_or(true, |p| p.sorted_by_name.is_none()),
-            SortBy::Path => old_perms.as_ref().map_or(true, |p| p.sorted_by_path.is_none()),
-            SortBy::Size => old_perms.as_ref().map_or(true, |p| p.sorted_by_size.is_none()),
-            SortBy::ModifiedTime => old_perms.as_ref().map_or(true, |p| p.sorted_by_modified.is_none()),
-        };
-
-        // 预计算当前排序字段的排列（如果需要）
-        let default_perm = if needs_build_current {
-            build_sort_permutation(&matched, &self.volumes, &self.vol_names, options.sort_by)
-        } else {
-            // 复用旧 perm
-            match options.sort_by {
-                SortBy::Name | SortBy::Score => old_perms.as_ref().unwrap().sorted_by_name.clone().unwrap(),
-                SortBy::Path => old_perms.as_ref().unwrap().sorted_by_path.clone().unwrap(),
-                SortBy::Size => old_perms.as_ref().unwrap().sorted_by_size.clone().unwrap(),
-                SortBy::ModifiedTime => old_perms.as_ref().unwrap().sorted_by_modified.clone().unwrap(),
+        // Check cache reuse
+        if let Some(old) = self.search_cache.as_mut() {
+            if old.is_valid() && old.cache_key == new_cache_key {
+                log::info!("search_with_options: reusing cache (key={})", new_cache_key);
+                old.refresh();
+                let total = old.total_matched();
+                let first_batch = old.get_sorted_slice(&self.volumes, &self.vol_names, options.sort_by, options.sort_direction, 0, 50);
+                log::info!("search_with_options total: {:?}", t0.elapsed());
+                return (first_batch, total);
             }
-        };
-
-        // first_batch 需从 FileEntry 转换为 SearchResult 以兼容前端接口
-        // 注意：必须使用 default_perm（排序后顺序）而非 matched（MFT 顺序），
-        // 否则前端首次显示的是 MFT 顺序的结果，与后续 get_records_range 返回的排序结果不一致，
-        // 造成"排序后窗口前面的行残留上次排序的结果"的视觉问题。
-        // sort_direction 处理：升序取前50，降序取后50的逆序（与 get_sorted_slice 逻辑一致）
-        let first_indices: Vec<u32> = match options.sort_direction {
-            SortDirection::Ascending => default_perm.iter().take(50).copied().collect(),
-            SortDirection::Descending => default_perm.iter().rev().take(50).copied().collect(),
-        };
-        let first_batch: Vec<SearchResult> = first_indices.iter()
-            .filter_map(|&perm_idx| {
-                let (vol, idx) = &matched[perm_idx as usize];
-                let vol_name = &self.vol_names[*vol as usize];
-                self.volumes.get(vol_name).and_then(|m| {
-                    m.files.get(*idx as usize).map(|f| {
-                        let full_path = m.path_table.resolve_file_path(f.path_id, &f.name);
-                        f.to_search_result(full_path)
-                    })
-                })
-            })
-            .collect();
-
-        // === 重建 SearchCache，保留旧 perm 缓存 ===
-        // 关键：复用 old_perms 中已有的 4 个 sorted_by_* 字段，
-        // 仅覆盖当前 sort_by 的字段为新构建/复用的 perm
-        let (mut sn, mut sp, mut ss, mut sm) = match options.sort_by {
-            SortBy::Name | SortBy::Score => (Some(default_perm), old_perms.as_ref().and_then(|p| p.sorted_by_path.clone()), old_perms.as_ref().and_then(|p| p.sorted_by_size.clone()), old_perms.as_ref().and_then(|p| p.sorted_by_modified.clone())),
-            SortBy::Path => (old_perms.as_ref().and_then(|p| p.sorted_by_name.clone()), Some(default_perm), old_perms.as_ref().and_then(|p| p.sorted_by_size.clone()), old_perms.as_ref().and_then(|p| p.sorted_by_modified.clone())),
-            SortBy::Size => (old_perms.as_ref().and_then(|p| p.sorted_by_name.clone()), old_perms.as_ref().and_then(|p| p.sorted_by_path.clone()), Some(default_perm), old_perms.as_ref().and_then(|p| p.sorted_by_modified.clone())),
-            SortBy::ModifiedTime => (old_perms.as_ref().and_then(|p| p.sorted_by_name.clone()), old_perms.as_ref().and_then(|p| p.sorted_by_path.clone()), old_perms.as_ref().and_then(|p| p.sorted_by_size.clone()), Some(default_perm)),
-        };
-
-        // 重建 sort_access_order：保留旧顺序，更新当前 sort_by 到末尾
-        let mut sort_access_order = old_perms.as_ref()
-            .map(|p| p.sort_access_order.clone())
-            .unwrap_or_default();
-        sort_access_order.retain(|&s| s != options.sort_by);
-        sort_access_order.push(options.sort_by);
-
-        // LRU 淘汰：如果 sort_access_order 超过容量，淘汰最旧的并清空其 perm
-        while sort_access_order.len() > MAX_SORT_PERMUTATIONS {
-            let lru = sort_access_order.remove(0);
-            match lru {
-                SortBy::Name | SortBy::Score => { sn = None; }
-                SortBy::Path => { sp = None; }
-                SortBy::Size => { ss = None; }
-                SortBy::ModifiedTime => { sm = None; }
-            }
-            log::info!("Evicted LRU sort permutation: {:?}", lru);
         }
+
+        // New search: build base matched from all volumes
+        self.search_cache = None;
+        let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
+        let matched_lock = std::sync::Mutex::new(Vec::with_capacity(total_files / 4));
+        let is_empty_query = query.trim().is_empty();
+        let parsed_query = if is_empty_query { None } else { Some(crate::search::query::SearchQuery::parse(query)) };
+        let query_controls_dir = parsed_query.as_ref().map_or(false, |q| q.path_filter_dir_only);
+        let needs_path = parsed_query.as_ref().map_or(false, |q| q.path_filter.is_some());
+        let files_only = options.files_only;
+        let directories_only = options.directories_only;
+
+        self.volumes.par_iter().for_each(|(vol_key, monitor)| {
+            let vol_idx = self.volume_index[vol_key];
+            if is_empty_query {
+                let local: Vec<(u8, u32)> = monitor.files.par_iter().enumerate()
+                    .filter_map(|(idx, file)| {
+                        if files_only && file.is_directory { return None; }
+                        if directories_only && !file.is_directory { return None; }
+                        Some((vol_idx, idx as u32))
+                    }).collect();
+                matched_lock.lock().unwrap().extend(local);
+            } else {
+                let pq = parsed_query.as_ref().unwrap();
+                let local: Vec<(u8, u32)> = monitor.files.par_iter().enumerate()
+                    .filter_map(|(idx, file)| {
+                        let full_path = if needs_path {
+                            monitor.path_table.resolve_file_path(file.path_id, &file.name)
+                        } else {
+                            CompactString::new("")
+                        };
+                        if !crate::search::query::SearchQuery::matches_entry(pq, file, &full_path) { return None; }
+                        if !query_controls_dir && files_only && file.is_directory { return None; }
+                        if directories_only && !file.is_directory { return None; }
+                        Some((vol_idx, idx as u32))
+                    }).collect();
+                matched_lock.lock().unwrap().extend(local);
+            }
+        });
+
+        let all_matched = matched_lock.into_inner().unwrap();
+        let total = all_matched.len();
+        log::info!("search_with_options: matched {} files, {:?}", total, t0.elapsed());
+
+        // Build all 4 base permutations
+        let sn = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::Name));
+        let sp = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::Path));
+        let ss = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::Size));
+        let sm = Some(build_sort_permutation(&all_matched, &self.volumes, &self.vol_names, SortBy::ModifiedTime));
 
         self.search_cache = Some(SearchCache {
             cache_key: new_cache_key,
             query: query.to_string(),
             files_only: options.files_only,
             directories_only: options.directories_only,
-            matched,
-            total,
             created_at: Instant::now(),
-            sorted_by_name: sn,
-            sorted_by_path: sp,
-            sorted_by_size: ss,
-            sorted_by_modified: sm,
-            sort_access_order,
+            base: BaseCache {
+                matched: all_matched,
+                sorted_by_name: sn,
+                sorted_by_path: sp,
+                sorted_by_size: ss,
+                sorted_by_modified: sm,
+            },
+            delta: DeltaCache {
+                new_files: Vec::new(),
+                file_id_index: HashMap::new(),
+                deleted_ids: HashSet::new(),
+                modified: HashMap::new(),
+                matched: Vec::new(),
+            },
         });
-        log::info!("search_with_options total: {:?}", t0.elapsed());
 
+        // Use get_sorted_slice for first_batch (handles base+delta merge)
+        let first_batch = self.search_cache.as_mut().unwrap().get_sorted_slice(
+            &self.volumes, &self.vol_names, options.sort_by, options.sort_direction, 0, 50,
+        );
+        let total = self.search_cache.as_ref().unwrap().total_matched();
+        log::info!("search_with_options total: {:?}", t0.elapsed());
         (first_batch, total)
     }
 
@@ -586,7 +762,7 @@ impl VolumeManager {
             return None;
         }
         cache.refresh();
-        let total = cache.total;
+        let total = cache.total_matched();
         if total == 0 {
             return Some((Vec::new(), 0));
         }
@@ -634,6 +810,10 @@ impl VolumeManager {
     /// - 通过 path_table.intern 注册路径得到 path_id
     /// - modified_time 从 i64 截断为 i32（FileEntry 内部存储）
     /// - 删除标记改为 path_id = PathTable::deleted_id()（u32::MAX）
+    /// Apply incremental USN changes. base.files is NOT modified (no compaction).
+    /// - Updates: modify base.files in-place (index stays valid)
+    /// - Deletions: record in delta.deleted_ids
+    /// - Additions: append to delta.new_files (append-only, no swap_remove!)
     pub fn apply_incremental_usn(
         &mut self,
         drive_letter: &str,
@@ -645,119 +825,110 @@ impl VolumeManager {
             Some(i) => i,
             None => return,
         };
-
         let has_cache = self.search_cache.is_some();
-        let added_count = added.len();
-        let updated_count = updated.len();
 
-        // === 阶段 1：修改 monitor.files（持有可变借用）===
-        let (removed_count, index_map, new_file_indices) = {
-            let monitor = match self.volumes.get_mut(drive_letter) {
-                Some(m) => m,
-                None => return,
-            };
+        let monitor = match self.volumes.get_mut(drive_letter) {
+            Some(m) => m,
+            None => return,
+        };
+        if monitor.fid_index.is_none() {
+            log::warn!("[USN] No fid_index for {}, skipping", drive_letter);
+            return;
+        }
 
-            if monitor.fid_index.is_none() {
-                log::warn!("[USN] No fid_index for {}, skipping incremental update", drive_letter);
-                return;
-            }
-
-            // 处理更新
-            for (fid, new_result) in updated {
-                let fid_u32 = fid as u32;
-                if let Some(idx) = monitor.fid_index.as_ref().and_then(|fi| fi.iter().find(|(id, _)| *id == fid_u32).map(|(_, idx)| *idx)) {
-                    if (idx as usize) < monitor.files.len() {
-                        let parent_path = parent_dir_of(&new_result.path);
-                        let path_id = monitor.path_table.intern(parent_path);
-                        if new_result.is_directory {
-                            monitor.path_table.intern(&new_result.path);
-                        }
-                        monitor.files[idx as usize] = FileEntry::new(
-                            new_result.name, path_id, new_result.size,
-                            new_result.modified_time, new_result.file_id, new_result.is_directory,
-                        );
-                    }
+        // Phase 1: Updates - store in delta.modified, NOT in base.files
+        let fid_index = monitor.fid_index.as_ref().unwrap();
+        for (fid, new_result) in &updated {
+            let fid_u32 = *fid as u32;
+            if fid_index.binary_search_by_key(&fid_u32, |(id, _)| *id).is_ok() {
+                let parent_path = parent_dir_of(&new_result.path);
+                let path_id = monitor.path_table.intern(parent_path);
+                if new_result.is_directory {
+                    monitor.path_table.intern(&new_result.path);
+                }
+                let modified_entry = FileEntry::new(
+                    new_result.name.clone(), path_id, new_result.size,
+                    new_result.modified_time, new_result.file_id, new_result.is_directory,
+                );
+                if let Some(cache) = self.search_cache.as_mut() {
+                    cache.delta.modified.insert(fid_u32, (vol_idx, modified_entry));
                 }
             }
+        }
 
-            // 处理删除
-            let fid_index = monitor.fid_index.as_ref().unwrap();
-            let indices_to_remove: Vec<usize> = removed
-                .iter()
-                .filter_map(|fid| {
-                    let fid_u32 = *fid as u32;
-                    fid_index.iter().find(|(id, _)| *id == fid_u32).map(|(_, idx)| *idx as usize)
-                })
-                .collect();
-            let removed_count = indices_to_remove.len();
-            for idx in indices_to_remove {
-                if idx < monitor.files.len() {
-                    monitor.files[idx].path_id = PathTable::deleted_id();
+        // Phase 2: Deletions - record IDs only
+        if has_cache {
+            let cache = self.search_cache.as_mut().unwrap();
+            for fid in &removed {
+                let fid_u32 = *fid as u32;
+                if fid_index.binary_search_by_key(&fid_u32, |(id, _)| *id).is_ok() {
+                    cache.delta.deleted_ids.insert(fid_u32);
+                } else if cache.delta.file_id_index.contains_key(&fid_u32) {
+                    cache.delta.deleted_ids.insert(fid_u32);
                 }
             }
+        }
 
-            // 处理新增
-            let old_file_count = monitor.files.len();
+        // Phase 3: Additions - intern paths, collect entries
+        let mut added_entries: Vec<(u8, FileEntry)> = Vec::new();
+        {
+            let monitor = self.volumes.get_mut(drive_letter).unwrap();
             for search_result in added {
                 let parent_path = parent_dir_of(&search_result.path);
                 let path_id = monitor.path_table.intern(parent_path);
                 if search_result.is_directory {
                     monitor.path_table.intern(&search_result.path);
                 }
-                monitor.files.push(FileEntry::new(
+                added_entries.push((vol_idx, FileEntry::new(
                     search_result.name, path_id, search_result.size,
                     search_result.modified_time, search_result.file_id, search_result.is_directory,
-                ));
+                )));
             }
-
-            // 构建 index_map（compaction 前）
-            let index_map: Vec<Option<usize>> = if has_cache {
-                let mut map = Vec::with_capacity(monitor.files.len());
-                let mut new_idx = 0usize;
-                for i in 0..monitor.files.len() {
-                    if PathTable::is_deleted(monitor.files[i].path_id) {
-                        map.push(None);
-                    } else {
-                        map.push(Some(new_idx));
-                        new_idx += 1;
-                    }
-                }
-                map
-            } else {
-                Vec::new()
-            };
-
-            let new_file_indices: Vec<usize> = if has_cache && added_count > 0 {
-                (old_file_count..monitor.files.len())
-                    .filter_map(|i| index_map.get(i).and_then(|&idx| idx))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-            // 压缩
-            monitor.compact_files();
-
-            (removed_count, index_map, new_file_indices)
-        }; // monitor 的可变借用在此释放
-
-        // === 阶段 2：增量更新缓存（只持有不可变借用）===
-        if has_cache {
-            let result = crate::index::monitor::IncrementalResult {
-                added: added_count,
-                updated: updated_count,
-                removed: removed_count,
-                total: self.volumes.get(drive_letter).map(|v| v.files.len()).unwrap_or(0),
-                index_map,
-                new_file_indices,
-            };
-            let mut cache = self.search_cache.take().unwrap();
-            let vol_names = self.vol_names.clone();
-            apply_incremental_to_cache(&mut cache, &self.volumes, &vol_names, None, vol_idx, &result);
-            self.search_cache = Some(cache);
-        } else {
-            self.search_cache = None;
         }
+
+        // Phase 4: Update cache
+        if has_cache {
+            let cache = self.search_cache.as_mut().unwrap();
+            // Add new files to delta (append-only)
+            for entry in added_entries {
+                let file_idx = cache.delta.new_files.len();
+                // If this file_id was previously deleted or modified, clear the stale entries
+                cache.delta.deleted_ids.remove(&entry.1.file_id);
+                cache.delta.modified.remove(&entry.1.file_id);
+                cache.delta.file_id_index.insert(entry.1.file_id, file_idx);
+                cache.delta.new_files.push(entry);
+            }
+            // Rebuild delta.matched from delta.new_files
+            let mut new_delta_matched: Vec<(u8, u32)> = Vec::new();
+            for (i, (v, f)) in cache.delta.new_files.iter().enumerate() {
+                if cache.delta.deleted_ids.contains(&f.file_id) { continue; }
+                new_delta_matched.push((*v, i as u32));
+            }
+            cache.delta.matched = new_delta_matched;
+            // Invalidate base permutations if base.files was modified
+            if !cache.delta.modified.is_empty() {
+                cache.base.sorted_by_name = None;
+                cache.base.sorted_by_path = None;
+                cache.base.sorted_by_size = None;
+                cache.base.sorted_by_modified = None;
+            }
+        }
+    }
+
+    pub fn merge_if_needed(&mut self) {
+        let should_merge = self.search_cache.as_ref().map_or(false, |c| {
+            c.delta.new_files.len() + c.delta.deleted_ids.len() + c.delta.modified.len() > 10_000
+        });
+        if should_merge {
+            let cache = self.search_cache.as_mut().unwrap();
+            log::info!("Merging delta: {} new, {} deleted, {} modified",
+                cache.delta.new_files.len(), cache.delta.deleted_ids.len(), cache.delta.modified.len());
+            cache.merge_delta_to_base(&mut self.volumes, &self.vol_names);
+        }
+    }
+
+    pub fn delta_count(&self) -> usize {
+        self.search_cache.as_ref().map_or(0, |c| c.delta.new_files.len())
     }
 
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
@@ -777,10 +948,7 @@ impl VolumeManager {
     }
 }
 
-/// 增量更新缓存（自由函数，避免借用冲突）
-///
-/// 适配 FileEntry：通过 volumes 获取对应卷的 path_table，
-/// 用于在含 path_filter 的查询下解析完整路径
+/// 增量更新缓存（walkdir 路径）
 fn apply_incremental_to_cache(
     cache: &mut SearchCache,
     volumes: &HashMap<String, VolumeMonitor>,
@@ -789,51 +957,35 @@ fn apply_incremental_to_cache(
     vol_idx: u8,
     result: &IncrementalResult,
 ) -> usize {
-    // 快速路径：如果没有新增文件，且 index_map 是恒等映射（无删除、无重排），
-    // 则 matched 向量无需重建，直接跳过以避免 221万次 drain+push
     let is_identity = result.new_file_indices.is_empty()
         && result.index_map.iter().enumerate().all(|(i, m)| *m == Some(i));
     if is_identity {
-        return cache.matched.len();
+        return cache.base.matched.len();
     }
 
-    let mut new_matched: Vec<(u8, u32)> = Vec::with_capacity(cache.matched.len());
-    let mut removed_count = 0usize;
+    let mut new_matched: Vec<(u8, u32)> = Vec::with_capacity(cache.base.matched.len());
 
-    for (vol, idx) in cache.matched.drain(..) {
+    for (vol, idx) in cache.base.matched.drain(..) {
         if vol != vol_idx {
             new_matched.push((vol, idx));
         } else if (idx as usize) < result.index_map.len() {
             if let Some(new_idx) = result.index_map[idx as usize] {
                 new_matched.push((vol, new_idx as u32));
-            } else {
-                removed_count += 1;
             }
-        } else {
-            removed_count += 1;
         }
     }
 
     let added_count_before = new_matched.len();
     if !result.new_file_indices.is_empty() {
         if let Some(files) = volume_files {
-            let query = if cache.query.trim().is_empty() {
-                None
-            } else {
-                Some(crate::search::query::SearchQuery::parse(&cache.query))
-            };
-
-            // 仅当查询含 path_filter 时才需要解析完整路径
+            let query = if cache.query.trim().is_empty() { None } else { Some(crate::search::query::SearchQuery::parse(&cache.query)) };
             let needs_path = query.as_ref().map_or(false, |q| q.path_filter.is_some());
-            // 通过 vol_idx 找到对应的 VolumeMonitor，获取其 path_table
             let path_table = volumes.get(&vol_names[vol_idx as usize]).map(|m| &m.path_table);
 
             for &new_idx in &result.new_file_indices {
                 if new_idx >= files.len() { continue; }
                 let file = &files[new_idx];
-
                 if let Some(ref q) = query {
-                    // 解析完整路径（仅在需要时）
                     let full_path = if needs_path {
                         path_table.map(|pt| pt.resolve_file_path(file.path_id, &file.name)).unwrap_or_default()
                     } else {
@@ -843,24 +995,19 @@ fn apply_incremental_to_cache(
                 }
                 if cache.files_only && file.is_directory { continue; }
                 if cache.directories_only && !file.is_directory { continue; }
-
                 new_matched.push((vol_idx, new_idx as u32));
             }
         }
     }
-    let added_count = new_matched.len() - added_count_before;
+    let _added_count = new_matched.len() - added_count_before;
 
-    cache.matched = new_matched;
-    cache.total = cache.matched.len();
+    cache.base.matched = new_matched;
+    cache.base.sorted_by_name = None;
+    cache.base.sorted_by_path = None;
+    cache.base.sorted_by_size = None;
+    cache.base.sorted_by_modified = None;
 
-    if removed_count > 0 || added_count > 0 {
-        cache.sorted_by_name = None;
-        cache.sorted_by_path = None;
-        cache.sorted_by_size = None;
-        cache.sorted_by_modified = None;
-    }
-
-    cache.total
+    cache.base.matched.len()
 }
 
 impl VolumeMonitor {
