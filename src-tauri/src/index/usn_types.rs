@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // 引入 FileEntry 和 PathTable 用于全量扫描结果传输
-use crate::search::FileEntry;
 use crate::index::path_table::PathTable;
+use crate::search::FileEntry;
 
 /// Command sent to the USN worker thread
 #[derive(Debug)]
@@ -43,8 +43,9 @@ pub enum UsnResponse {
         drive_letter: char,
         /// SearchResults for new files
         added: Vec<crate::search::SearchResult>,
-        /// fids of deleted files
-        removed: Vec<u64>,
+        /// (fid, path) of deleted/renamed-away files
+        /// path 用于 fid 与 base 不匹配时按路径兜底定位
+        removed: Vec<(u64, String)>,
         /// (file_id, new SearchResult) for updated files - fid-based to avoid index drift
         updated: Vec<(u64, crate::search::SearchResult)>,
         #[allow(dead_code)]
@@ -106,7 +107,7 @@ impl UsnState {
     }
 
     fn state_path_inner() -> Option<std::path::PathBuf> {
-        let appdata = dirs::data_dir().or_else(|| dirs::home_dir())?;
+        let appdata = dirs::data_dir().or_else(dirs::home_dir)?;
         Some(appdata.join("Everything").join("usn_state.json"))
     }
 
@@ -148,12 +149,9 @@ mod tests {
         let suffix = "save_load";
         let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
         let mut state = UsnState::default();
-        state.volumes.insert(
-            "C".to_string(),
-            VolumeState {
-                last_usn: 67890,
-            },
-        );
+        state
+            .volumes
+            .insert("C".to_string(), VolumeState { last_usn: 67890 });
         state.save_test(suffix);
         let loaded = UsnState::load_test(suffix);
         assert_eq!(loaded.volumes["C"].last_usn, 67890);
@@ -165,18 +163,12 @@ mod tests {
         let suffix = "multi_vol";
         let _ = std::fs::remove_file(UsnState::test_state_path(suffix));
         let mut state = UsnState::default();
-        state.volumes.insert(
-            "C".to_string(),
-            VolumeState {
-                last_usn: 200,
-            },
-        );
-        state.volumes.insert(
-            "D".to_string(),
-            VolumeState {
-                last_usn: 400,
-            },
-        );
+        state
+            .volumes
+            .insert("C".to_string(), VolumeState { last_usn: 200 });
+        state
+            .volumes
+            .insert("D".to_string(), VolumeState { last_usn: 400 });
         state.save_test(suffix);
         let loaded = UsnState::load_test(suffix);
         assert_eq!(loaded.volumes.len(), 2);

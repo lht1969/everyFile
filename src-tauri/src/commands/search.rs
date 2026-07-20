@@ -93,7 +93,9 @@ pub async fn get_search_suggestions(
     query: String,
     limit: usize,
 ) -> Result<Vec<String>, String> {
-    let results = state.index_manager.search(&query, limit, 0)
+    let results = state
+        .index_manager
+        .search(&query, limit, 0)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -122,9 +124,25 @@ pub async fn get_records_range(
     sort_by: String,
     sort_direction: String,
 ) -> Result<RecordsRangeResponse, String> {
+    let t0 = std::time::Instant::now();
     let mut vm = state.volume_manager.lock().await;
 
-    if let Some((results, total)) = vm.get_cached_slice(parse_sort_by(&sort_by), parse_sort_direction(&sort_direction), start, end) {
+    if let Some((results, total)) = vm.get_cached_slice(
+        parse_sort_by(&sort_by),
+        parse_sort_direction(&sort_direction),
+        start,
+        end,
+    ) {
+        log::info!(
+            "[CMD] range start={} end={} sort={}/{} total={} results={} elapsed={:?}",
+            start,
+            end,
+            sort_by,
+            sort_direction,
+            total,
+            results.len(),
+            t0.elapsed()
+        );
         Ok(RecordsRangeResponse {
             results,
             total,
@@ -132,6 +150,13 @@ pub async fn get_records_range(
             end,
         })
     } else {
+        log::warn!(
+            "[CMD] range start={} end={} sort={}/{} cache expired",
+            start,
+            end,
+            sort_by,
+            sort_direction
+        );
         Err("Cache expired or empty. Please search again.".to_string())
     }
 }
@@ -146,7 +171,12 @@ pub async fn get_sorted_range(
 ) -> Result<RecordsRangeResponse, String> {
     let mut vm = state.volume_manager.lock().await;
 
-    if let Some((results, total)) = vm.get_cached_slice(parse_sort_by(&sort_by), parse_sort_direction(&sort_direction), start, end) {
+    if let Some((results, total)) = vm.get_cached_slice(
+        parse_sort_by(&sort_by),
+        parse_sort_direction(&sort_direction),
+        start,
+        end,
+    ) {
         Ok(RecordsRangeResponse {
             results,
             total,

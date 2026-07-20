@@ -27,7 +27,8 @@ pub async fn export_csv(results: Vec<SearchResult>, path: String) -> Result<(), 
                 r.size,
                 csv_escape(&SearchResult::format_time_static(r.modified_time)),
                 r.is_directory
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         }
         Ok::<(), String>(())
     })
@@ -42,7 +43,16 @@ pub async fn export_txt(results: Vec<SearchResult>, path: String) -> Result<(), 
     tokio::task::spawn_blocking(move || {
         let mut file = File::create(&path).map_err(|e| e.to_string())?;
         for r in results {
-            writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size(), r.formatted_modified_time(), r.is_directory).map_err(|e| e.to_string())?;
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{}\t{}",
+                r.name,
+                r.path,
+                r.formatted_size(),
+                r.formatted_modified_time(),
+                r.is_directory
+            )
+            .map_err(|e| e.to_string())?;
         }
         Ok::<(), String>(())
     })
@@ -73,13 +83,20 @@ pub async fn export_all_results(
     format: String,
     path: String,
 ) -> Result<(), String> {
-    log::info!("Exporting all results: query={}, format={}, path={}", query, format, path);
+    log::info!(
+        "Exporting all results: query={}, format={}, path={}",
+        query,
+        format,
+        path
+    );
 
     let export_results = {
         let mut vm = state.volume_manager.lock().await;
-        let mut options = crate::search::SearchOptions::default();
-        options.files_only = files_only;
-        options.directories_only = directories_only;
+        let options = crate::search::SearchOptions {
+            files_only,
+            directories_only,
+            ..Default::default()
+        };
         let (results, _total) = vm.search_with_options(&query, &options);
         results
     };
@@ -91,20 +108,39 @@ pub async fn export_all_results(
                 let mut file = File::create(&path).map_err(|e| e.to_string())?;
                 writeln!(file, "Name,Path,Size,Modified,IsDirectory").map_err(|e| e.to_string())?;
                 for r in &export_results {
-                    writeln!(file, "{},{},{},{},{}", csv_escape(&r.name), csv_escape(&r.path), r.size, csv_escape(&SearchResult::format_time_static(r.modified_time)), r.is_directory).map_err(|e| e.to_string())?;
+                    writeln!(
+                        file,
+                        "{},{},{},{},{}",
+                        csv_escape(&r.name),
+                        csv_escape(&r.path),
+                        r.size,
+                        csv_escape(&SearchResult::format_time_static(r.modified_time)),
+                        r.is_directory
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
-            },
+            }
             "txt" => {
                 let mut file = File::create(&path).map_err(|e| e.to_string())?;
                 for r in &export_results {
-                    writeln!(file, "{}\t{}\t{}\t{}\t{}", r.name, r.path, r.formatted_size(), r.formatted_modified_time(), r.is_directory).map_err(|e| e.to_string())?;
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}",
+                        r.name,
+                        r.path,
+                        r.formatted_size(),
+                        r.formatted_modified_time(),
+                        r.is_directory
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
-            },
+            }
             "json" => {
-                let json = serde_json::to_string_pretty(&export_results).map_err(|e| e.to_string())?;
+                let json =
+                    serde_json::to_string_pretty(&export_results).map_err(|e| e.to_string())?;
                 let mut file = File::create(&path).map_err(|e| e.to_string())?;
                 file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
-            },
+            }
             _ => return Err("Invalid format".to_string()),
         }
         Ok::<(), String>(())

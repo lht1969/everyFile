@@ -6,14 +6,14 @@ use tauri::State;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
-use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::search::AppState;
 
 static CTX_MENU_CMD: AtomicI32 = AtomicI32::new(0);
-static mut CTX_MENU_ICM3: usize = 0;
+static mut CTX_MENU_ICM2: usize = 0;
 
 /// Show Windows native Shell context menu at specified screen coordinates
 #[tauri::command]
@@ -24,7 +24,12 @@ pub fn show_context_menu(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
-    log::info!("Showing context menu for '{}' at ({}, {})", path, screen_x, screen_y);
+    log::info!(
+        "Showing context menu for '{}' at ({}, {})",
+        path,
+        screen_x,
+        screen_y
+    );
 
     if !Path::new(&path).exists() {
         return Err(format!("Path does not exist: {}", path));
@@ -48,7 +53,14 @@ pub fn show_context_menu(
     let mut parent_pidl: *mut ITEMIDLIST = std::ptr::null_mut();
     unsafe {
         desktop
-            .ParseDisplayName(None, None, PCWSTR(parent_wide.as_ptr()), None, &mut parent_pidl, std::ptr::null_mut())
+            .ParseDisplayName(
+                None,
+                None,
+                PCWSTR(parent_wide.as_ptr()),
+                None,
+                &mut parent_pidl,
+                std::ptr::null_mut(),
+            )
             .map_err(|e| format!("Failed to parse parent path: {}", e))?
     };
 
@@ -63,7 +75,9 @@ pub fn show_context_menu(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
-            unsafe { CoTaskMemFree(Some(parent_pidl as *const _)); }
+            unsafe {
+                CoTaskMemFree(Some(parent_pidl as *const _));
+            }
             format!("Invalid file name: {}", path)
         })?;
     let file_wide = to_wide(file_name);
@@ -71,7 +85,14 @@ pub fn show_context_menu(
     let mut child_pidl: *mut ITEMIDLIST = std::ptr::null_mut();
     unsafe {
         parent_folder
-            .ParseDisplayName(None, None, PCWSTR(file_wide.as_ptr()), None, &mut child_pidl, std::ptr::null_mut())
+            .ParseDisplayName(
+                None,
+                None,
+                PCWSTR(file_wide.as_ptr()),
+                None,
+                &mut child_pidl,
+                std::ptr::null_mut(),
+            )
             .map_err(|e| {
                 CoTaskMemFree(Some(parent_pidl as *const _));
                 format!("Failed to parse file name: {}", e)
@@ -79,11 +100,13 @@ pub fn show_context_menu(
     };
 
     let context_menu: IContextMenu = unsafe {
-        parent_folder.GetUIObjectOf(None, &[child_pidl], None).map_err(|e| {
-            CoTaskMemFree(Some(parent_pidl as *const _));
-            CoTaskMemFree(Some(child_pidl as *const _));
-            format!("Failed to get IContextMenu: {}", e)
-        })?
+        parent_folder
+            .GetUIObjectOf(None, &[child_pidl], None)
+            .map_err(|e| {
+                CoTaskMemFree(Some(parent_pidl as *const _));
+                CoTaskMemFree(Some(child_pidl as *const _));
+                format!("Failed to get IContextMenu: {}", e)
+            })?
     };
 
     // Free PIDLs — shell copied them, we don't need them anymore
@@ -92,21 +115,22 @@ pub fn show_context_menu(
         CoTaskMemFree(Some(child_pidl as *const _));
     }
 
-    let context_menu_3: IContextMenu3 = context_menu.cast().map_err(|e| format!("Failed to get IContextMenu3: {}", e))?;
+    let context_menu_2: IContextMenu2 = context_menu
+        .cast()
+        .map_err(|e| format!("Failed to get IContextMenu2: {}", e))?;
 
-    let hmenu = unsafe {
-        CreatePopupMenu().map_err(|e| format!("Failed to create popup menu: {}", e))?
-    };
+    let hmenu =
+        unsafe { CreatePopupMenu().map_err(|e| format!("Failed to create popup menu: {}", e))? };
 
     unsafe {
-        context_menu_3
+        context_menu_2
             .QueryContextMenu(hmenu, 0, 1, 0x7FFF, CMF_NORMAL)
             .map_err(|e| format!("Failed to query context menu: {}", e))?
     };
 
     // ---- Subclass the Tauri window to track menu selection ----
     CTX_MENU_CMD.store(0, Ordering::SeqCst);
-    unsafe { CTX_MENU_ICM3 = &context_menu_3 as *const IContextMenu3 as usize };
+    unsafe { CTX_MENU_ICM2 = &context_menu_2 as *const IContextMenu2 as usize };
 
     unsafe {
         SetWindowSubclass(hwnd, Some(ctx_menu_subclass_proc), 1, 0);
@@ -120,7 +144,7 @@ pub fn show_context_menu(
 
     unsafe {
         RemoveWindowSubclass(hwnd, Some(ctx_menu_subclass_proc), 1);
-        CTX_MENU_ICM3 = 0;
+        CTX_MENU_ICM2 = 0;
     }
 
     let cmd_id = CTX_MENU_CMD.swap(0, Ordering::SeqCst);
@@ -134,7 +158,11 @@ pub fn show_context_menu(
         let offset = (cmd_id - 1) as u32;
         let verb_ptr = PCSTR(offset as usize as *const u8);
 
-        log::info!("[CTX_MENU] Invoking command: absolute_id={}, offset={}", cmd_id, offset);
+        log::info!(
+            "[CTX_MENU] Invoking command: absolute_id={}, offset={}",
+            cmd_id,
+            offset
+        );
 
         let mut invoke_info: CMINVOKECOMMANDINFO = unsafe { std::mem::zeroed() };
         invoke_info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32;
@@ -143,18 +171,23 @@ pub fn show_context_menu(
         invoke_info.nShow = SW_SHOWDEFAULT.0;
 
         unsafe {
-            context_menu_3
-                .InvokeCommand(&mut invoke_info)
+            context_menu_2
+                .InvokeCommand(&invoke_info)
                 .map_err(|e| format!("Failed to invoke command: {}", e))?
         };
         log::info!("Context menu command {} executed successfully", cmd_id);
     }
 
-    unsafe { let _ = DestroyMenu(hmenu); }
+    unsafe {
+        let _ = DestroyMenu(hmenu);
+    }
 
     // 检查文件是否被删除（如"删除"命令），如果是则立即更新索引并通知前端刷新
     if !Path::new(&path).exists() {
-        log::info!("File '{}' no longer exists after context menu action, updating index", path);
+        log::info!(
+            "File '{}' no longer exists after context menu action, updating index",
+            path
+        );
         let vm = state.volume_manager.clone();
         let path_clone = path.clone();
         let app_clone = app.clone();
@@ -162,14 +195,17 @@ pub fn show_context_menu(
             let mut vm = vm.lock().await;
             vm.remove_file(&path_clone);
             drop(vm);
-            let _ = app_clone.emit("index-updated", serde_json::json!({
-                "volume": "",
-                "added": 0,
-                "updated": 0,
-                "removed": 1,
-                "total": 0,
-                "cache_total": 0
-            }));
+            let _ = app_clone.emit(
+                "index-updated",
+                serde_json::json!({
+                    "volume": "",
+                    "added": 0,
+                    "updated": 0,
+                    "removed": 1,
+                    "total": 0,
+                    "cache_total": 0
+                }),
+            );
         });
     }
 
@@ -177,7 +213,7 @@ pub fn show_context_menu(
 }
 
 /// Window subclass — tracks WM_MENUSELECT to remember which item is highlighted,
-/// and handles IContextMenu3 messages for submenus/owner-draw.
+/// and handles IContextMenu2 messages for submenus/owner-draw.
 unsafe extern "system" fn ctx_menu_subclass_proc(
     hwnd: HWND,
     umsg: u32,
@@ -195,7 +231,11 @@ unsafe extern "system" fn ctx_menu_subclass_proc(
 
             // If this is a top-level item (not a submenu) and not a separator/close
             if (flags & MF_POPUP.0 as usize) == 0 && raw_id != 0xFFFF && raw_id <= 0x7FFF {
-                log::info!("[CTX_MENU] WM_MENUSELECT: id={}, flags=0x{:X}", raw_id, flags);
+                log::info!(
+                    "[CTX_MENU] WM_MENUSELECT: id={}, flags=0x{:X}",
+                    raw_id,
+                    flags
+                );
                 CTX_MENU_CMD.store(raw_id as i32, Ordering::SeqCst);
             }
         }
@@ -203,20 +243,19 @@ unsafe extern "system" fn ctx_menu_subclass_proc(
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
             log::info!("[CTX_MENU] WM_COMMAND: id={}", id);
-            if id >= 1 && id <= 0x7FFF {
+            if (1..=0x7FFF).contains(&id) {
                 CTX_MENU_CMD.store(id, Ordering::SeqCst);
             }
             return LRESULT(0);
         }
-        // Forward owner-draw and submenu messages to IContextMenu3
+        // Forward owner-draw and submenu messages to IContextMenu2
         WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR => {
-            let ptr = CTX_MENU_ICM3;
+            let ptr = CTX_MENU_ICM2;
             if ptr != 0 {
-                let icm3 = &*(ptr as *const IContextMenu3);
-                let mut lresult = LRESULT(0);
-                let _ = icm3.HandleMenuMsg2(umsg, wparam, lparam, Some(&mut lresult));
+                let icm2 = &*(ptr as *const IContextMenu2);
+                let _ = icm2.HandleMenuMsg(umsg, wparam, lparam);
                 if umsg == WM_MENUCHAR {
-                    return lresult;
+                    return LRESULT(0);
                 }
                 return LRESULT(0);
             }
@@ -230,7 +269,12 @@ fn get_main_window_hwnd(app: &tauri::AppHandle) -> std::result::Result<HWND, Str
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Failed to get main window".to_string())?;
-    let hwnd = HWND(window.hwnd().map_err(|e| format!("Failed to get HWND: {}", e))?.0 as _);
+    let hwnd = HWND(
+        window
+            .hwnd()
+            .map_err(|e| format!("Failed to get HWND: {}", e))?
+            .0 as _,
+    );
     log::info!("Got main window HWND: {:?}", hwnd);
     Ok(hwnd)
 }
@@ -249,7 +293,9 @@ impl ComGuard {
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
-        unsafe { CoUninitialize(); }
+        unsafe {
+            CoUninitialize();
+        }
     }
 }
 

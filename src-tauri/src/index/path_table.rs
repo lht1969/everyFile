@@ -222,13 +222,13 @@ impl PathTable {
         let mut sorted_indices: Vec<u32> = (1..self.entries.len() as u32).collect();
 
         // 解析所有 entry 的完整路径字符串，用于字典序排序
-        let resolved: Vec<CompactString> = sorted_indices.iter()
+        let resolved: Vec<CompactString> = sorted_indices
+            .iter()
             .map(|&id| self.resolve_path(id))
             .collect();
 
-        sorted_indices.sort_by(|&a, &b| {
-            resolved[(a - 1) as usize].cmp(&resolved[(b - 1) as usize])
-        });
+        sorted_indices
+            .sort_by(|&a, &b| resolved[(a - 1) as usize].cmp(&resolved[(b - 1) as usize]));
 
         for (i, &id) in sorted_indices.iter().enumerate() {
             self.entries[id as usize].ordinal = (i + 1) as u32;

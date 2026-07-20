@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use log;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -44,7 +43,7 @@ impl Default for IndexSettings {
             enable_usn_journal: true,
             include_hidden_files: false,
             include_system_files: false,
-            update_interval: 2,
+            update_interval: 5,
         }
     }
 }
@@ -55,7 +54,19 @@ impl Config {
 
         if config_path.exists() {
             let content = fs::read_to_string(config_path)?;
-            let config: Config = toml::from_str(&content)?;
+            let mut config: Config = toml::from_str(&content)?;
+            // 迁移：旧配置中的 update_interval 如果不是 5 秒，自动修正为 5 秒并保存
+            // 这避免了用户之前保存的 2 秒轮询继续导致频繁刷新
+            if config.index_settings.update_interval != 5 {
+                log::info!(
+                    "Config migration: update_interval {} -> 5",
+                    config.index_settings.update_interval
+                );
+                config.index_settings.update_interval = 5;
+                if let Err(e) = config.save() {
+                    log::warn!("Failed to save migrated config: {}", e);
+                }
+            }
             Ok(config)
         } else {
             Ok(Config::default())

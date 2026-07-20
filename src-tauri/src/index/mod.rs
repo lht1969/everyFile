@@ -27,17 +27,32 @@ impl IndexManager {
         })
     }
 
-    pub async fn search(&self, query: &str, limit: usize, offset: usize) -> Result<Vec<crate::search::SearchResult>> {
-        self.database.lock().await.search(query, limit, offset).await
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::search::SearchResult>> {
+        self.database
+            .lock()
+            .await
+            .search(query, limit, offset)
+            .await
     }
 }
 
-use crossbeam_channel::{Receiver, Sender};
 use crate::index::usn_types::{UsnCommand, UsnResponse};
+use crossbeam_channel::{Receiver, Sender};
 
 pub struct UsnIndexManager {
     cmd_tx: Sender<UsnCommand>,
     resp_rx: Receiver<UsnResponse>,
+}
+
+impl Default for UsnIndexManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UsnIndexManager {
@@ -48,7 +63,12 @@ impl UsnIndexManager {
         Self { cmd_tx, resp_rx }
     }
 
-    pub fn full_scan(&self, drive_letter: char, include_hidden_files: bool, include_system_files: bool) {
+    pub fn full_scan(
+        &self,
+        drive_letter: char,
+        include_hidden_files: bool,
+        include_system_files: bool,
+    ) {
         let _ = self.cmd_tx.send(UsnCommand::FullScan {
             drive_letter,
             include_hidden_files,
@@ -56,7 +76,12 @@ impl UsnIndexManager {
         });
     }
 
-    pub fn poll_changes(&self, drive_letter: char, include_hidden_files: bool, include_system_files: bool) {
+    pub fn poll_changes(
+        &self,
+        drive_letter: char,
+        include_hidden_files: bool,
+        include_system_files: bool,
+    ) {
         let _ = self.cmd_tx.send(UsnCommand::PollChanges {
             drive_letter,
             include_hidden_files,

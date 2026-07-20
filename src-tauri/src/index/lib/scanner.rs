@@ -214,10 +214,13 @@ impl MftScanner {
                         name = format!("<Record#{}>", total_records);
                     }
                 }
-                let parent_record = extract_parent_record(&record_buf, self.file_record_size as usize);
-                let size = extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
+                let parent_record =
+                    extract_parent_record(&record_buf, self.file_record_size as usize);
+                let size =
+                    extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
                 if size == 0 && !is_dir {
-                    let ext = extract_data_extension_records(&record_buf, self.file_record_size as usize);
+                    let ext =
+                        extract_data_extension_records(&record_buf, self.file_record_size as usize);
                     if !ext.is_empty() {
                         let result_idx = all_records.len();
                         pending_ext.push((result_idx, ext));
@@ -381,12 +384,15 @@ impl MftScanner {
                         name = format!("<Record#{}>", total_records);
                     }
                 }
-                let parent_record = extract_parent_record(&record_buf, self.file_record_size as usize);
-                let size = extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
+                let parent_record =
+                    extract_parent_record(&record_buf, self.file_record_size as usize);
+                let size =
+                    extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
                 // 主记录 size=0 且非目录：可能是有 $ATTRIBUTE_LIST 的大文件
                 // 收集扩展记录号，扫描结束后批量读取以获取真实 size
                 if size == 0 && !is_dir {
-                    let ext = extract_data_extension_records(&record_buf, self.file_record_size as usize);
+                    let ext =
+                        extract_data_extension_records(&record_buf, self.file_record_size as usize);
                     if !ext.is_empty() {
                         pending_ext.push((total_records, ext));
                     }
@@ -440,17 +446,20 @@ impl MftScanner {
             std::collections::HashMap::new()
         };
 
-        (ScanStats {
-            total_records,
-            files,
-            dirs,
-            skip_no_signature,
-            skip_fixup_fail,
-            skip_inactive,
-            total_ads,
-            total_hard_links,
-            no_timestamp,
-        }, pending_sizes)
+        (
+            ScanStats {
+                total_records,
+                files,
+                dirs,
+                skip_no_signature,
+                skip_fixup_fail,
+                skip_inactive,
+                total_ads,
+                total_hard_links,
+                no_timestamp,
+            },
+            pending_sizes,
+        )
     }
 }
 
@@ -814,7 +823,13 @@ pub fn extract_data_size(
             if !seen.insert(record_num) {
                 continue;
             }
-            if let Ok(ext_record) = read_record(reader, data_runs, file_record_size, cluster_size, record_num) {
+            if let Ok(ext_record) = read_record(
+                reader,
+                data_runs,
+                file_record_size,
+                cluster_size,
+                record_num,
+            ) {
                 let size = extract_data_size_from_bytes(&ext_record, ext_record.len());
                 if size > 0 {
                     return size;
@@ -840,7 +855,12 @@ fn extract_data_extension_records(record: &[u8], record_size: usize) -> Vec<u64>
 }
 
 /// Compute disk byte offset for a given MFT record number
-fn record_disk_offset(data_runs: &[DataRun], file_record_size: u64, cluster_size: u64, target_record: u64) -> Option<u64> {
+fn record_disk_offset(
+    data_runs: &[DataRun],
+    file_record_size: u64,
+    cluster_size: u64,
+    target_record: u64,
+) -> Option<u64> {
     let mut record_number: u64 = 0;
     for run in data_runs {
         let records_in_run = (run.length * cluster_size) / file_record_size;
@@ -874,10 +894,11 @@ fn resolve_pending_sizes_streaming(
     // 收集所有扩展记录的磁盘偏移，按偏移排序以实现顺序 I/O
     let mut offsets: Vec<(u64, u64)> = Vec::new(); // (disk_offset, ext_record_number)
     let mut total_ext_records = 0usize;
-    for &(_, ref ext_records) in pending {
+    for (_, ext_records) in pending {
         total_ext_records += ext_records.len();
         for &rn in ext_records {
-            if let Some(offset) = record_disk_offset(data_runs, file_record_size, cluster_size, rn) {
+            if let Some(offset) = record_disk_offset(data_runs, file_record_size, cluster_size, rn)
+            {
                 offsets.push((offset, rn));
             }
         }
@@ -937,7 +958,8 @@ fn resolve_pending_sizes_streaming(
 
     log::info!(
         "resolve_pending_sizes_streaming: resolved {} real sizes from {} pending entries",
-        result.len(), pending.len()
+        result.len(),
+        pending.len()
     );
 
     result
@@ -956,7 +978,8 @@ fn resolve_pending_sizes(
     let mut offsets: Vec<(u64, u64)> = Vec::new();
     for (_, record_nums) in pending {
         for &rn in record_nums {
-            if let Some(offset) = record_disk_offset(data_runs, file_record_size, cluster_size, rn) {
+            if let Some(offset) = record_disk_offset(data_runs, file_record_size, cluster_size, rn)
+            {
                 offsets.push((offset, rn));
             }
         }
@@ -983,8 +1006,8 @@ fn resolve_pending_sizes(
 
     for (result_idx, record_nums) in pending {
         for &rn in record_nums {
-            if let Some(&size) = sizes.get(&rn){
-                if size > 0 {   
+            if let Some(&size) = sizes.get(&rn) {
+                if size > 0 {
                     results[*result_idx].size = size;
                     break;
                 }
@@ -1116,16 +1139,36 @@ fn extract_attributes(record: &[u8], record_size: usize) -> u32 {
 
 pub fn format_attributes(attrs: u32) -> String {
     let mut flags = Vec::new();
-    if attrs & FILE_ATTRIBUTE_READONLY != 0 { flags.push("R"); }
-    if attrs & FILE_ATTRIBUTE_HIDDEN != 0 { flags.push("H"); }
-    if attrs & FILE_ATTRIBUTE_SYSTEM != 0 { flags.push("S"); }
-    if attrs & FILE_ATTRIBUTE_ARCHIVE != 0 { flags.push("A"); }
-    if attrs & FILE_ATTRIBUTE_NORMAL != 0 { flags.push("N"); }
-    if attrs & FILE_ATTRIBUTE_TEMPORARY != 0 { flags.push("T"); }
-    if attrs & FILE_ATTRIBUTE_SPARSE != 0 { flags.push("P"); }
-    if attrs & FILE_ATTRIBUTE_REPARSE != 0 { flags.push("L"); }
-    if attrs & FILE_ATTRIBUTE_COMPRESSED != 0 { flags.push("C"); }
-    if attrs & FILE_ATTRIBUTE_ENCRYPTED != 0 { flags.push("E"); }
+    if attrs & FILE_ATTRIBUTE_READONLY != 0 {
+        flags.push("R");
+    }
+    if attrs & FILE_ATTRIBUTE_HIDDEN != 0 {
+        flags.push("H");
+    }
+    if attrs & FILE_ATTRIBUTE_SYSTEM != 0 {
+        flags.push("S");
+    }
+    if attrs & FILE_ATTRIBUTE_ARCHIVE != 0 {
+        flags.push("A");
+    }
+    if attrs & FILE_ATTRIBUTE_NORMAL != 0 {
+        flags.push("N");
+    }
+    if attrs & FILE_ATTRIBUTE_TEMPORARY != 0 {
+        flags.push("T");
+    }
+    if attrs & FILE_ATTRIBUTE_SPARSE != 0 {
+        flags.push("P");
+    }
+    if attrs & FILE_ATTRIBUTE_REPARSE != 0 {
+        flags.push("L");
+    }
+    if attrs & FILE_ATTRIBUTE_COMPRESSED != 0 {
+        flags.push("C");
+    }
+    if attrs & FILE_ATTRIBUTE_ENCRYPTED != 0 {
+        flags.push("E");
+    }
     if flags.is_empty() {
         "-".to_string()
     } else {
@@ -1320,9 +1363,7 @@ mod tests {
 
     #[test]
     fn parse_data_runs_multiple() {
-        let data = [
-            0x21, 0x04, 0x08, 0x00, 0x11, 0x02, 0x03, 0x00,
-        ];
+        let data = [0x21, 0x04, 0x08, 0x00, 0x11, 0x02, 0x03, 0x00];
         let runs = parse_data_runs(&data);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].lcn, 8);
@@ -1390,15 +1431,15 @@ mod tests {
         let si_len: u32 = 96; // enough room
         record[si_off + 4..si_off + 8].copy_from_slice(&si_len.to_le_bytes()); // length
         record[si_off + 8] = 0; // non-resident = 0
-        // value_offset at attr+20 = 0x18 (24)
+                                // value_offset at attr+20 = 0x18 (24)
         record[si_off + 20..si_off + 22].copy_from_slice(&0x18u16.to_le_bytes());
         // value_length at attr+16 = 48 (standard SI value size)
         record[si_off + 16..si_off + 20].copy_from_slice(&48u32.to_le_bytes());
 
         let val = si_off + 0x18;
-        record[val..val + 8].copy_from_slice(&si_ctime.to_le_bytes());     // creation
+        record[val..val + 8].copy_from_slice(&si_ctime.to_le_bytes()); // creation
         record[val + 8..val + 16].copy_from_slice(&si_mtime.to_le_bytes()); // modification
-        record[val + 16..val + 24].copy_from_slice(&0u64.to_le_bytes());    // mft change
+        record[val + 16..val + 24].copy_from_slice(&0u64.to_le_bytes()); // mft change
         record[val + 24..val + 32].copy_from_slice(&si_atime.to_le_bytes()); // access
         record[val + 32..val + 36].copy_from_slice(&si_attrs.to_le_bytes()); // attributes
 
@@ -1419,7 +1460,7 @@ mod tests {
         // Name length at +64, namespace at +65
         record[fval + 64] = 4; // 4 UTF-16 chars
         record[fval + 65] = 0; // POSIX namespace
-        // Name "test" in UTF-16LE at +66
+                               // Name "test" in UTF-16LE at +66
         let name_bytes = "test".encode_utf16().collect::<Vec<u16>>();
         for (i, ch) in name_bytes.iter().enumerate() {
             record[fval + 66 + i * 2..fval + 68 + i * 2].copy_from_slice(&ch.to_le_bytes());
@@ -1484,11 +1525,16 @@ mod tests {
         let usn_offset: u16 = 0x30;
         record[4..6].copy_from_slice(&usn_offset.to_le_bytes());
         record[6..8].copy_from_slice(&3u16.to_le_bytes());
-        record[0x30] = 0x01; record[0x31] = 0x00;
-        record[0x32] = 0x01; record[0x33] = 0x00;
-        record[0x34] = 0x02; record[0x35] = 0x00;
-        record[510] = 0x01; record[511] = 0x00;
-        record[1022] = 0x01; record[1023] = 0x00;
+        record[0x30] = 0x01;
+        record[0x31] = 0x00;
+        record[0x32] = 0x01;
+        record[0x33] = 0x00;
+        record[0x34] = 0x02;
+        record[0x35] = 0x00;
+        record[510] = 0x01;
+        record[511] = 0x00;
+        record[1022] = 0x01;
+        record[1023] = 0x00;
 
         let attr_off = first_attr_offset as usize;
         record[attr_off..attr_off + 4].copy_from_slice(&ATTR_ATTRIBUTE_LIST.to_le_bytes());
@@ -1504,7 +1550,7 @@ mod tests {
         let e = val;
         record[e..e + 4].copy_from_slice(&ATTR_STANDARD_INFO.to_le_bytes());
         record[e + 4..e + 6].copy_from_slice(&32u16.to_le_bytes()); // entry_len (padded to 32)
-        // mft_reference at e+16: record 100
+                                                                    // mft_reference at e+16: record 100
         record[e + 16..e + 24].copy_from_slice(&100u64.to_le_bytes());
 
         // Entry 2: $DATA in record 200

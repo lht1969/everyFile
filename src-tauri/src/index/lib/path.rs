@@ -7,7 +7,8 @@ use super::scanner::ScanOutput;
 const ROOT_RECORD_NUMBER: u64 = 5;
 
 pub fn resolve_paths(output: &ScanOutput, display_limit: usize) -> Vec<(String, String)> {
-    let mut record_map: HashMap<u64, (u64, &str)> = HashMap::with_capacity(output.all_records.len());
+    let mut record_map: HashMap<u64, (u64, &str)> =
+        HashMap::with_capacity(output.all_records.len());
     for r in &output.all_records {
         record_map.insert(r.record_number, (r.parent_record, &r.name));
     }
@@ -94,7 +95,16 @@ pub fn format_ntfs_time(timestamp: Option<u64>) -> String {
     let month_days: [u32; 12] = [
         31,
         if is_leap_year(year) { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
 
     let mut month = 1u32;
@@ -115,7 +125,7 @@ pub fn format_ntfs_time(timestamp: Option<u64>) -> String {
 }
 
 fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 #[cfg(test)]

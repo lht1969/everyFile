@@ -14,16 +14,16 @@
 use rayon::prelude::*;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use windows::core::HSTRING;
 use windows::Win32::{
     Foundation::{FILETIME, HANDLE},
     Storage::FileSystem::{
-        CreateFileW, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileAttributesExW,
-        GetFileExInfoStandard, OPEN_EXISTING, WIN32_FILE_ATTRIBUTE_DATA,
+        CreateFileW, GetFileAttributesExW, GetFileExInfoStandard, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WIN32_FILE_ATTRIBUTE_DATA,
     },
-    System::IO::DeviceIoControl,
     System::Ioctl::{FSCTL_ENUM_USN_DATA, MFT_ENUM_DATA_V0},
+    System::IO::DeviceIoControl,
 };
-use windows::core::HSTRING;
 
 /// Open a volume handle for USN operations.
 pub(crate) fn open_volume_handle(drive_letter: char) -> Option<HANDLE> {
@@ -65,14 +65,11 @@ impl UsnMetadataReader {
     ///
     /// `fid` parameter is kept for API compatibility but not used.
     #[inline]
-    pub fn get_file_metadata(
-        &mut self,
-        _fid: u64,
-        path: &std::path::Path,
-    ) -> FileMetadata {
+    pub fn get_file_metadata(&mut self, _fid: u64, path: &std::path::Path) -> FileMetadata {
         match std::fs::metadata(path) {
             Ok(m) => {
-                let modified_time = m.modified()
+                let modified_time = m
+                    .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
@@ -98,7 +95,8 @@ impl UsnMetadataReader {
     pub fn get_file_metadata_by_str(&mut self, path_str: &str) -> FileMetadata {
         match std::fs::metadata(path_str) {
             Ok(m) => {
-                let modified_time = m.modified()
+                let modified_time = m
+                    .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
@@ -275,8 +273,8 @@ pub fn enumerate_mft_with_timestamps(
 
                 // 缓冲区首 8 字节是 next_start_fid（下次调用的 StartFileReferenceNumber）
                 let next_start = u64::from_le_bytes([
-                    buffer[0], buffer[1], buffer[2], buffer[3],
-                    buffer[4], buffer[5], buffer[6], buffer[7],
+                    buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+                    buffer[7],
                 ]);
 
                 // 解析 USN_RECORD_V2 记录（从 offset=8 开始）
@@ -288,8 +286,10 @@ pub fn enumerate_mft_with_timestamps(
                     }
 
                     let record_length = u32::from_le_bytes([
-                        buffer[offset], buffer[offset + 1],
-                        buffer[offset + 2], buffer[offset + 3],
+                        buffer[offset],
+                        buffer[offset + 1],
+                        buffer[offset + 2],
+                        buffer[offset + 3],
                     ]);
                     if record_length == 0 {
                         break;
@@ -314,7 +314,8 @@ pub fn enumerate_mft_with_timestamps(
                     // +62: FileNameOffset (u16, 从记录起始的偏移)
                     // +64: FileName (UTF-16, 零终止)
 
-                    let major_version = u16::from_le_bytes([buffer[offset + 4], buffer[offset + 5]]);
+                    let major_version =
+                        u16::from_le_bytes([buffer[offset + 4], buffer[offset + 5]]);
                     if major_version != 2 {
                         // 不支持的版本，跳过该记录
                         offset += record_length as usize;
@@ -322,31 +323,50 @@ pub fn enumerate_mft_with_timestamps(
                     }
 
                     let fid = u64::from_le_bytes([
-                        buffer[offset + 8], buffer[offset + 9], buffer[offset + 10], buffer[offset + 11],
-                        buffer[offset + 12], buffer[offset + 13], buffer[offset + 14], buffer[offset + 15],
+                        buffer[offset + 8],
+                        buffer[offset + 9],
+                        buffer[offset + 10],
+                        buffer[offset + 11],
+                        buffer[offset + 12],
+                        buffer[offset + 13],
+                        buffer[offset + 14],
+                        buffer[offset + 15],
                     ]);
                     let parent_fid = u64::from_le_bytes([
-                        buffer[offset + 16], buffer[offset + 17], buffer[offset + 18], buffer[offset + 19],
-                        buffer[offset + 20], buffer[offset + 21], buffer[offset + 22], buffer[offset + 23],
+                        buffer[offset + 16],
+                        buffer[offset + 17],
+                        buffer[offset + 18],
+                        buffer[offset + 19],
+                        buffer[offset + 20],
+                        buffer[offset + 21],
+                        buffer[offset + 22],
+                        buffer[offset + 23],
                     ]);
                     let usn_ts_100ns = i64::from_le_bytes([
-                        buffer[offset + 32], buffer[offset + 33], buffer[offset + 34], buffer[offset + 35],
-                        buffer[offset + 36], buffer[offset + 37], buffer[offset + 38], buffer[offset + 39],
+                        buffer[offset + 32],
+                        buffer[offset + 33],
+                        buffer[offset + 34],
+                        buffer[offset + 35],
+                        buffer[offset + 36],
+                        buffer[offset + 37],
+                        buffer[offset + 38],
+                        buffer[offset + 39],
                     ]);
                     let file_attributes = u32::from_le_bytes([
-                        buffer[offset + 52], buffer[offset + 53], buffer[offset + 54], buffer[offset + 55],
+                        buffer[offset + 52],
+                        buffer[offset + 53],
+                        buffer[offset + 54],
+                        buffer[offset + 55],
                     ]);
-                    let file_name_length = u16::from_le_bytes([
-                        buffer[offset + 56], buffer[offset + 57],
-                    ]) as usize;
-                    let file_name_offset = u16::from_le_bytes([
-                        buffer[offset + 58], buffer[offset + 59],
-                    ]) as usize;
+                    let file_name_length =
+                        u16::from_le_bytes([buffer[offset + 56], buffer[offset + 57]]) as usize;
+                    let file_name_offset =
+                        u16::from_le_bytes([buffer[offset + 58], buffer[offset + 59]]) as usize;
 
                     // 读取文件名（UTF-16 编码）
                     let name_start = offset + file_name_offset;
                     let name_end = name_start + file_name_length;
-                    if name_end <= bytes_returned as usize && file_name_length % 2 == 0 {
+                    if name_end <= bytes_returned as usize && file_name_length.is_multiple_of(2) {
                         let name_units: Vec<u16> = buffer[name_start..name_end]
                             .chunks_exact(2)
                             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))

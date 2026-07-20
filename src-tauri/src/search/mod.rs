@@ -32,12 +32,12 @@ pub struct SearchResult {
 /// - 节省约 74%
 #[derive(Clone)]
 pub struct FileEntry {
-    pub name: CompactString,       // 24 字节 (inline，短名称不分配)
-    pub size: u64,                 // 8 字节
-    pub path_id: u32,              // 4 字节 (PathTable 中的路径 ID)
-    pub file_id: u32,              // 4 字节 (MFT record number)
-    pub modified_time: i32,        // 4 字节 (Unix 秒)
-    pub is_directory: bool,        // 1 字节 + 3 字节 padding
+    pub name: CompactString, // 24 字节 (inline，短名称不分配)
+    pub size: u64,           // 8 字节
+    pub path_id: u32,        // 4 字节 (PathTable 中的路径 ID)
+    pub file_id: u32,        // 4 字节 (MFT record number)
+    pub modified_time: i32,  // 4 字节 (Unix 秒)
+    pub is_directory: bool,  // 1 字节 + 3 字节 padding
 }
 
 impl SearchResult {
@@ -48,7 +48,10 @@ impl SearchResult {
 
     #[inline]
     pub fn formatted_modified_time(&self) -> String {
-        let dt: DateTime<Utc> = Utc.timestamp_opt(self.modified_time, 0).single().unwrap_or_default();
+        let dt: DateTime<Utc> = Utc
+            .timestamp_opt(self.modified_time, 0)
+            .single()
+            .unwrap_or_default();
         dt.format("%Y/%m/%d %H:%M:%S").to_string()
     }
 

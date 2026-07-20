@@ -62,8 +62,8 @@ pub fn get_volume_info(drive_letter: &str) -> Result<VolumeInfo> {
         )
     };
 
-    if success.is_err() {
-        return Err(AppError::WindowsApi(success.unwrap_err().code().0 as u32));
+    if let Err(e) = success {
+        return Err(AppError::WindowsApi(e.code().0 as u32));
     }
 
     let mut free_bytes_available: u64 = 0;
@@ -79,8 +79,8 @@ pub fn get_volume_info(drive_letter: &str) -> Result<VolumeInfo> {
         )
     };
 
-    if success.is_err() {
-        return Err(AppError::WindowsApi(success.unwrap_err().code().0 as u32));
+    if let Err(e) = success {
+        return Err(AppError::WindowsApi(e.code().0 as u32));
     }
 
     let volume_name = String::from_utf16_lossy(

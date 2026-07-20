@@ -49,7 +49,10 @@ pub async fn open_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn delete_file(path: String, state: State<'_, super::search::AppState>) -> Result<(), String> {
+pub async fn delete_file(
+    path: String,
+    state: State<'_, super::search::AppState>,
+) -> Result<(), String> {
     log::info!("Deleting file: {}", path);
 
     let path_clone = path.clone();
@@ -84,7 +87,11 @@ pub async fn copy_file(source: String, destination: String) -> Result<(), String
 }
 
 #[tauri::command]
-pub async fn move_file(source: String, destination: String, state: State<'_, super::search::AppState>) -> Result<(), String> {
+pub async fn move_file(
+    source: String,
+    destination: String,
+    state: State<'_, super::search::AppState>,
+) -> Result<(), String> {
     log::info!("Moving file from {} to {}", source, destination);
 
     let source_clone = source.clone();

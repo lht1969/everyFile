@@ -66,9 +66,12 @@ pub struct SaveConfigParams {
 }
 
 #[tauri::command]
-pub async fn save_config(params: SaveConfigParams, state: tauri::State<'_, super::search::AppState>) -> Result<(), String> {
+pub async fn save_config(
+    params: SaveConfigParams,
+    state: tauri::State<'_, super::search::AppState>,
+) -> Result<(), String> {
     log::info!("Received save_config request");
-    
+
     let config = Config {
         scan_all_volumes: params.scan_all_volumes,
         default_volume: params.default_volume,
@@ -86,13 +89,17 @@ pub async fn save_config(params: SaveConfigParams, state: tauri::State<'_, super
 
     let include_hidden = config.index_settings.include_hidden_files;
     let include_system = config.index_settings.include_system_files;
-    
+
     config.save().map_err(|e| e.to_string())?;
     log::info!("Config saved successfully");
 
     // Propagate settings to live monitors
     let mut vm = state.volume_manager.lock().await;
     vm.update_all_settings(include_hidden, include_system);
-    log::info!("Updated live monitors: include_hidden={}, include_system={}", include_hidden, include_system);
+    log::info!(
+        "Updated live monitors: include_hidden={}, include_system={}",
+        include_hidden,
+        include_system
+    );
     Ok(())
 }

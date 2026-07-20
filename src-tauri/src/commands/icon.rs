@@ -46,9 +46,10 @@ pub async fn get_file_icon(file_path: String, is_directory: bool) -> Result<Stri
     }
 
     let key_clone = key.clone();
-    let icon_data = tokio::task::spawn_blocking(move || extract_icon_base64(&key_clone, is_directory))
-        .await
-        .map_err(|e| e.to_string())??;
+    let icon_data =
+        tokio::task::spawn_blocking(move || extract_icon_base64(&key_clone, is_directory))
+            .await
+            .map_err(|e| e.to_string())??;
 
     {
         let mut cache = ICON_CACHE.write().map_err(|e| e.to_string())?;
@@ -115,7 +116,8 @@ fn extract_icon_base64(key: &str, is_directory: bool) -> Result<String, String> 
         bi.bmiHeader.biCompression = BI_RGB.0;
 
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hbmp_result = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0);
+        let hbmp_result =
+            CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0);
         if hbmp_result.is_err() || bits.is_null() {
             let _ = DeleteDC(hdc);
             let _ = DestroyIcon(icon);
@@ -145,7 +147,7 @@ fn extract_icon_base64(key: &str, is_directory: bool) -> Result<String, String> 
 }
 
 fn encode_bmp(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let row_size = ((width * 32 + 31) / 32) * 4;
+    let row_size = (width * 32).div_ceil(32) * 4;
     let pixel_data_size = row_size * height;
     let header_size = 14u32 + 40u32;
     let file_size = header_size + pixel_data_size;
@@ -178,7 +180,7 @@ fn encode_bmp(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String>
         }
         data.extend_from_slice(&pixels[start..end]);
         let padding = (row_size - width * 4) as usize;
-        data.extend(std::iter::repeat(0u8).take(padding));
+        data.extend(std::iter::repeat_n(0u8, padding));
     }
 
     Ok(data)

@@ -53,7 +53,29 @@ function App() {
 
     // 增量更新后刷新当前可见范围（文件删除/修改/新增时立即更新显示）
     // 仅清除覆盖当前可见范围的缓存条目，保留其他范围的缓存避免不必要的重新拉取
-    const unlistenRefresh = listen('records-refresh', async () => {
+    const unlistenRefresh = listen<{ added?: number; updated?: number; removed?: number; total?: number }>('records-refresh', async (event) => {
+      const added = event.payload.added ?? 0;
+      const updated = event.payload.updated ?? 0;
+      const removed = event.payload.removed ?? 0;
+      // 无实质变化时不刷新，避免空轮询导致的前端开销
+      if (added === 0 && updated === 0 && removed === 0) {
+        return;
+      }
+
+      // 同步更新总数，让滚动条高度反映最新数据量
+      if (typeof event.payload.total === 'number') {
+        setTotalCount(event.payload.total);
+      }
+
+      // 拖动滑块时暂不出 delta 信息，记录 pending 待停止后刷新
+      if (isDraggingRef.current) {
+        pendingRefreshRef.current = true;
+        return;
+      }
+
+      // 清除覆盖当前可见范围的缓存，并主动触发一次 fetch，让删除/修改/新增
+      // 在静止状态下也能立即反映到窗口。拖动期间不主动 fetch，避免与用户
+      // 停止滚动后的 fetch 竞争导致乱序。
       const { start, end } = visibleRangeRef.current;
       if (start !== undefined && end !== undefined && end > start) {
         const fetchStart = Math.max(0, start - 50);
@@ -68,7 +90,8 @@ function App() {
         // 使正在进行的 fetchRecordsRange 失效，防止旧数据覆盖刷新结果
         ++fetchCounterRef.current;
         isFetchingRef.current = false;
-        fetchRecordsRangeRef.current(start, end);
+        // 立即刷新当前可见范围，确保文件被删除/重命名后窗口自动更新
+        await fetchRecordsRangeRef.current(start, 0);
       }
     });
 
@@ -145,6 +168,10 @@ function App() {
   const visibleRangeRef = useRef({ start: 0, end: 50 });
   const rangeCacheRef = useRef<Map<string, SearchResult[]>>(new Map());
   const rangeChangeTimerRef = useRef<number | null>(null);
+  // 拖动滑块状态：true 表示用户正在拖动滚动条，此时暂停 records-refresh 刷新
+  const isDraggingRef = useRef(false);
+  // 拖动期间有 pending 的 records-refresh，停止拖动后刷新前后 50 行
+  const pendingRefreshRef = useRef(false);
   const FETCH_SIZE = 500;
   const isFetchingRef = useRef(false);
 
@@ -171,6 +198,7 @@ function App() {
     const myId = fetchCounterRef.current;
     const sortSnapshot = { ...sortStateRef.current };
     const { field, direction } = sortSnapshot;
+    const reqStart = performance.now();
     try {
       const response = await invoke<RecordsRangeResponse>('get_records_range', { start: fetchStart, end: fetchEnd, sortBy: field, sortDirection: direction });
       if (myId === fetchCounterRef.current &&
@@ -186,6 +214,7 @@ function App() {
         if (response.total !== totalCount) {
           setTotalCount(response.total);
         }
+        console.log('[FETCH] start=', start, 'ms=', (performance.now() - reqStart).toFixed(0), 'first=', response.results[0]?.name, 'last=', response.results[response.results.length - 1]?.name);
       }
     } catch (e) {
       console.error('Failed to fetch records range:', e);
@@ -200,6 +229,9 @@ function App() {
   }, [totalCount]);
 
   const searchCounterRef = useRef(0);
+  // 排序操作专用计数器：仅 handleSearch 和新的 handleSortChange 会递增，
+  // records-refresh 事件不递增此计数器，避免 USN 增量更新打断用户主动排序
+  const sortCounterRef = useRef(0);
   const fetchRecordsRangeRef = useRef(fetchRecordsRange);
   fetchRecordsRangeRef.current = fetchRecordsRange;
 
@@ -208,6 +240,9 @@ function App() {
     // 同步递增 fetchCounterRef，使正在进行的 fetchRecordsRange 失效，
     // 防止旧 fetchRecordsRange 返回的旧缓存数据覆盖 handleSearch 的新结果
     ++fetchCounterRef.current;
+    // 同步递增 sortCounterRef，使正在进行的 handleSortChange 失效，
+    // 防止旧 handleSortChange 返回的结果覆盖 handleSearch 的新结果
+    ++sortCounterRef.current;
     rangeCacheRef.current.clear();
     setSearchState({ query: searchQuery, filesOnly: filesOnly ?? true, directoriesOnly: directoriesOnly ?? false });
     setScrollTrigger(prev => prev + 1);
@@ -228,13 +263,15 @@ function App() {
       });
       if (myId !== searchCounterRef.current) return;
       ++fetchCounterRef.current;
+      // search_files 完成后再次递增 sortCounterRef，使 search 期间触发的 handleSortChange 失效
+      ++sortCounterRef.current;
       setTotalCount(response.total);
       if (response.total > 0) {
         // Fetch a larger initial range to cover scroll area
         try {
           const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 500, sortBy: sortState.field, sortDirection: sortState.direction });
           if (myId === searchCounterRef.current) {
-      rangeCacheRef.current.set('0-500', range.results);
+            rangeCacheRef.current.set('0-500', range.results);
             setResultsOffset(0);
             setResults(range.results);
           }
@@ -264,7 +301,10 @@ function App() {
       clearTimeout(rangeChangeTimerRef.current);
       rangeChangeTimerRef.current = null;
     }
-    const myId = ++fetchCounterRef.current;
+    // 使用 sortCounterRef 而非 fetchCounterRef：
+    // records-refresh 事件只递增 fetchCounterRef，不会取消用户主动排序
+    // 仅 handleSearch 和新的 handleSortChange 会递增 sortCounterRef
+    const myId = ++sortCounterRef.current;
     rangeCacheRef.current.clear();
     setSortState({ field, direction });
     setScrollTrigger(prev => prev + 1);
@@ -285,7 +325,11 @@ function App() {
             sort_direction: direction
           }
         });
-        if (myId !== fetchCounterRef.current) return;
+        // 被取消时必须清除状态消息，避免"排序中"永久显示
+        if (myId !== sortCounterRef.current) {
+          setStatusMessage('');
+          return;
+        }
         setTotalCount(searchResp.total);
         if (searchResp.total === 0) {
           setResultsOffset(0);
@@ -297,7 +341,11 @@ function App() {
           start: 0, end: 500, sortBy: field, sortDirection: direction
         });
       }
-      if (myId !== fetchCounterRef.current) return;
+      // 被取消时必须清除状态消息，避免"排序中"永久显示
+      if (myId !== sortCounterRef.current) {
+        setStatusMessage('');
+        return;
+      }
       setTotalCount(range.total);
       rangeCacheRef.current.set(`0-${range.results.length}`, range.results);
       setResultsOffset(0);
@@ -312,12 +360,33 @@ function App() {
 
   const handleVisibleRangeChange = useCallback((start: number, end: number) => {
     visibleRangeRef.current = { start, end };
+    // 拖动期间标记状态，暂停 records-refresh 刷新
+    isDraggingRef.current = true;
     if (rangeChangeTimerRef.current !== null) {
       clearTimeout(rangeChangeTimerRef.current);
     }
-    rangeChangeTimerRef.current = window.setTimeout(() => {
-      fetchRecordsRange(start, end);
-    }, 30);
+    rangeChangeTimerRef.current = window.setTimeout(async () => {
+      // 拖动停止：只执行一次 fetch，等数据应用后再清 isDraggingRef。
+      // 不再主动补 refresh fetch，避免同一位置两次 fetch 因 delta 变化返回不同结果导致乱序。
+      // refresh 事件在拖动期间被暂存，此处 pending 仅用于清除缓存，让下一次正常刷新获取最新数据。
+      if (pendingRefreshRef.current) {
+        pendingRefreshRef.current = false;
+        const fetchStart = Math.max(0, start - 50);
+        const fetchEnd = start + FETCH_SIZE;
+        for (const key of rangeCacheRef.current.keys()) {
+          const [s, e] = key.split('-').map(Number);
+          if (fetchStart >= s && fetchEnd <= e) {
+            rangeCacheRef.current.delete(key);
+            break;
+          }
+        }
+        ++fetchCounterRef.current;
+        isFetchingRef.current = false;
+      }
+      await fetchRecordsRangeRef.current(start, end);
+      // fetch 完成（数据已应用到 UI）后才允许 refresh 事件立即处理
+      isDraggingRef.current = false;
+    }, 100);
   }, [fetchRecordsRange]);
 
   const handleOpenFile = async (path: string) => {

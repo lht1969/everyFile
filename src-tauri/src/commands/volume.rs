@@ -1,7 +1,7 @@
 use crate::fs::{get_ntfs_volumes, VolumeInfo};
 use serde::{Deserialize, Serialize};
-use tauri::State;
 use tauri::Emitter;
+use tauri::State;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeResponse {
@@ -48,23 +48,35 @@ pub async fn add_volume(
     volume: String,
 ) -> Result<(), String> {
     log::info!("Adding volume: {}", volume);
-    
+
     let is_admin = crate::fs::is_elevated();
     // 加载配置，获取索引设置
     let config = crate::config::Config::load().ok();
-    let include_hidden_files = config.as_ref().map(|c| c.index_settings.include_hidden_files).unwrap_or(false);
-    let include_system_files = config.as_ref().map(|c| c.index_settings.include_system_files).unwrap_or(false);
-    
+    let include_hidden_files = config
+        .as_ref()
+        .map(|c| c.index_settings.include_hidden_files)
+        .unwrap_or(false);
+    let include_system_files = config
+        .as_ref()
+        .map(|c| c.index_settings.include_system_files)
+        .unwrap_or(false);
+
     let mut vm = state.volume_manager.lock().await;
-    vm.add_volume(&volume, is_admin, include_hidden_files, include_system_files).map_err(|e| e.to_string())?;
-    
+    vm.add_volume(
+        &volume,
+        is_admin,
+        include_hidden_files,
+        include_system_files,
+    )
+    .map_err(|e| e.to_string())?;
+
     if let Some(mut monitor) = vm.take_monitor(&volume) {
         if let Err(e) = monitor.scan() {
             log::warn!("Failed to scan new volume {}: {:?}", volume, e);
         }
         vm.return_monitor(&volume, monitor);
     }
-    
+
     if let Ok(mut config) = crate::config::Config::load() {
         if !config.monitored_volumes.contains(&volume) {
             config.monitored_volumes.push(volume.clone());
@@ -73,7 +85,7 @@ pub async fn add_volume(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -83,17 +95,17 @@ pub async fn remove_volume(
     volume: String,
 ) -> Result<(), String> {
     log::info!("Removing volume: {}", volume);
-    
+
     let mut vm = state.volume_manager.lock().await;
     vm.remove_volume(&volume);
-    
+
     if let Ok(mut config) = crate::config::Config::load() {
         config.monitored_volumes.retain(|v| v != &volume);
         if let Err(e) = config.save() {
             log::warn!("Failed to save config after removing volume: {:?}", e);
         }
     }
-    
+
     Ok(())
 }
 
@@ -102,21 +114,32 @@ pub async fn refresh_volumes(
     state: State<'_, super::search::AppState>,
 ) -> Result<Vec<VolumeResponse>, String> {
     let mut vm = state.volume_manager.lock().await;
-    
+
     let volumes = get_ntfs_volumes().map_err(|e| e.to_string())?;
-    
+
     // 加载配置，获取索引设置
     let config = crate::config::Config::load().ok();
-    let include_hidden_files = config.as_ref().map(|c| c.index_settings.include_hidden_files).unwrap_or(false);
-    let include_system_files = config.as_ref().map(|c| c.index_settings.include_system_files).unwrap_or(false);
-    
+    let include_hidden_files = config
+        .as_ref()
+        .map(|c| c.index_settings.include_hidden_files)
+        .unwrap_or(false);
+    let include_system_files = config
+        .as_ref()
+        .map(|c| c.index_settings.include_system_files)
+        .unwrap_or(false);
+
     for volume in &volumes {
         if !vm.volumes().contains(&volume.drive_letter) {
             let is_admin = crate::fs::is_elevated();
-            let _ = vm.add_volume(&volume.drive_letter, is_admin, include_hidden_files, include_system_files);
+            let _ = vm.add_volume(
+                &volume.drive_letter,
+                is_admin,
+                include_hidden_files,
+                include_system_files,
+            );
         }
     }
-    
+
     Ok(volumes.into_iter().map(VolumeResponse::from).collect())
 }
 
@@ -165,7 +188,9 @@ pub async fn rebuild_index(
                 let dl_char = drive_letter.chars().next().unwrap_or('C');
                 log::info!(
                     "[USN] Rebuild: issuing full scan for drive {} (hidden={}, system={})",
-                    dl_char, include_hidden_files, include_system_files
+                    dl_char,
+                    include_hidden_files,
+                    include_system_files
                 );
                 usn.full_scan(dl_char, include_hidden_files, include_system_files);
             }
@@ -219,7 +244,7 @@ pub async fn get_monitored_volumes(
     let vm = state.volume_manager.lock().await;
     let volumes = vm.volumes();
     let mut result = Vec::new();
-    
+
     for vol in volumes {
         let count = vm.get_file_count(&vol);
         result.push(VolumeResponse {
@@ -231,6 +256,6 @@ pub async fn get_monitored_volumes(
             file_count: count,
         });
     }
-    
+
     Ok(result)
 }

@@ -12,7 +12,7 @@ pub struct IndexDatabase {
 impl IndexDatabase {
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        
+
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -59,18 +59,26 @@ impl IndexDatabase {
                  last_usn INTEGER NOT NULL DEFAULT 0,
                  journal_id INTEGER NOT NULL DEFAULT 0,
                  updated_at TEXT
-             );"
+             );",
         )?;
 
         // 兼容旧数据库：添加 file_ref 列
-        let _ = conn.execute("ALTER TABLE files ADD COLUMN file_ref INTEGER DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN file_ref INTEGER DEFAULT 0",
+            [],
+        );
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    pub async fn search(&self, query: &str, limit: usize, offset: usize) -> Result<Vec<SearchResult>> {
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>> {
         let conn = self.conn.lock().await;
 
         let mut stmt = conn.prepare(
@@ -78,35 +86,39 @@ impl IndexDatabase {
              FROM files
              WHERE name LIKE ?1 OR path LIKE ?1
              ORDER BY name
-             LIMIT ?2 OFFSET ?3"
+             LIMIT ?2 OFFSET ?3",
         )?;
 
         let search_pattern = format!("%{}%", query);
 
-        let rows = stmt.query_map(params![search_pattern, limit as i64, offset as i64], |row| {
-            let name: String = row.get(2)?;
-            let path: String = row.get(3)?;
-            let modified_str: Option<String> = row.get(5)?;
-            let modified_ts = modified_str.as_ref()
-                .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
-                .map(|dt| dt.and_utc().timestamp())
-                .unwrap_or(0);
+        let rows = stmt.query_map(
+            params![search_pattern, limit as i64, offset as i64],
+            |row| {
+                let name: String = row.get(2)?;
+                let path: String = row.get(3)?;
+                let modified_str: Option<String> = row.get(5)?;
+                let modified_ts = modified_str
+                    .as_ref()
+                    .and_then(|s| {
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+                    })
+                    .map(|dt| dt.and_utc().timestamp())
+                    .unwrap_or(0);
 
-            Ok(SearchResult {
-                file_id: row.get::<_, u32>(1)?,
-                name: name.into(),
-                path: path.into(),
-                size: row.get(4)?,
-                modified_time: modified_ts,
-                is_directory: row.get::<_, i32>(6)? != 0,
-            })
-        })?;
+                Ok(SearchResult {
+                    file_id: row.get::<_, u32>(1)?,
+                    name: name.into(),
+                    path: path.into(),
+                    size: row.get(4)?,
+                    modified_time: modified_ts,
+                    is_directory: row.get::<_, i32>(6)? != 0,
+                })
+            },
+        )?;
 
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(result) = row {
-                results.push(result);
-            }
+        for result in rows.flatten() {
+            results.push(result);
         }
 
         Ok(results)
@@ -119,9 +131,8 @@ impl IndexDatabase {
     #[allow(dead_code)]
     pub async fn load_usn_state(&self, drive_letter: &str) -> Result<(i64, u64)> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT last_usn, journal_id FROM usn_state WHERE drive_letter = ?1"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT last_usn, journal_id FROM usn_state WHERE drive_letter = ?1")?;
         let mut rows = stmt.query(params![drive_letter])?;
         if let Some(row) = rows.next()? {
             let last_usn: i64 = row.get(0)?;
@@ -137,7 +148,12 @@ impl IndexDatabase {
     /// - UPSERT 语义：已存在则更新，不存在则插入
     /// - updated_at 写入当前 UTC 时间（YYYY-MM-DD HH:MM:SS 格式）
     #[allow(dead_code)]
-    pub async fn save_usn_state(&self, drive_letter: &str, last_usn: i64, journal_id: u64) -> Result<()> {
+    pub async fn save_usn_state(
+        &self,
+        drive_letter: &str,
+        last_usn: i64,
+        journal_id: u64,
+    ) -> Result<()> {
         let conn = self.conn.lock().await;
         // 写入 UTC 时间戳（与 files 表的 modified_time 格式保持一致）
         let updated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();

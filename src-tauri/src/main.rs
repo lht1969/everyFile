@@ -14,15 +14,15 @@ mod tray;
 
 use commands::search::AppState;
 use index::monitor::VolumeManager;
-use index::UsnIndexManager;
 use index::usn_types::UsnResponse;
+use index::UsnIndexManager;
 use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
-/**
+/*
  * 主函数，程序的入口点
  *
  * 功能：
@@ -35,14 +35,18 @@ use tokio::sync::Mutex;
  * 7. 注册命令处理函数
  * 8. 运行应用
  */
+
 /// 检查单例实例，如果已有实例在运行则将其窗口置前并退出。
+///
 /// 使用 Windows 命名 Mutex 实现跨进程检测。
 fn ensure_single_instance() -> bool {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::SetLastError;
         use windows::Win32::System::Threading::CreateMutexW;
-        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
 
         unsafe {
             SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
@@ -221,10 +225,13 @@ fn main() {
                         .as_ref()
                         .map(|c| c.index_settings.include_system_files)
                         .unwrap_or(false);
-                    let scan_all_volumes = config.as_ref().map(|c| c.scan_all_volumes).unwrap_or(false);
+                    let scan_all_volumes =
+                        config.as_ref().map(|c| c.scan_all_volumes).unwrap_or(false);
                     log::info!(
                         "Config: scan_all_volumes={}, admin={}, monitored={:?}",
-                        scan_all_volumes, is_admin, monitored_from_config
+                        scan_all_volumes,
+                        is_admin,
+                        monitored_from_config
                     );
 
                     if scan_all_volumes {
@@ -237,7 +244,11 @@ fn main() {
                                     include_hidden_files,
                                     include_system_files,
                                 ) {
-                                    log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
+                                    log::warn!(
+                                        "Failed to add volume {}: {}",
+                                        volume.drive_letter,
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -263,7 +274,11 @@ fn main() {
                                     include_hidden_files,
                                     include_system_files,
                                 ) {
-                                    log::warn!("Failed to add volume {}: {}", volume.drive_letter, e);
+                                    log::warn!(
+                                        "Failed to add volume {}: {}",
+                                        volume.drive_letter,
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -341,7 +356,12 @@ fn main() {
                     };
                     for drive_letter in &volumes {
                         let dl_char = drive_letter.chars().next().unwrap_or('C');
-                        log::debug!("[USN] Issuing full scan for drive {} (hidden={}, system={})", dl_char, include_hidden_files, include_system_files);
+                        log::debug!(
+                            "[USN] Issuing full scan for drive {} (hidden={}, system={})",
+                            dl_char,
+                            include_hidden_files,
+                            include_system_files
+                        );
                         usn.full_scan(dl_char, include_hidden_files, include_system_files);
                     }
                 }
@@ -414,17 +434,31 @@ fn main() {
                                             updated.len(),
                                             removed.len()
                                         );
+                                        // 在 move 前记录变化数量，用于 records-refresh payload
+                                        let refresh_added = added.len();
+                                        let refresh_updated = updated.len();
+                                        let refresh_removed = removed.len();
+
                                         let t_handler = std::time::Instant::now();
                                         let mut vm = rt_handle.block_on(vm_for_handler.lock());
                                         let total = vm.get_file_count(&drive_string);
                                         vm.apply_incremental_usn(
-                                            &drive_string, added, removed, updated,
+                                            &drive_string,
+                                            added,
+                                            removed,
+                                            updated,
                                         );
                                         let new_total = vm.get_file_count(&drive_string);
+                                        // 通知前端刷新当前可见范围（文件已删除/修改/新增）
+                                        // payload 携带变化数量和当前搜索总条目数，便于前端同步滚动条高度
+                                        let search_total = vm.current_search_total();
                                         drop(vm);
                                         log::debug!(
                                             "[USN] Incremental {}: applied in {:?}, total {}→{}",
-                                            drive_string, t_handler.elapsed(), total, new_total
+                                            drive_string,
+                                            t_handler.elapsed(),
+                                            total,
+                                            new_total
                                         );
                                         let _ = handle_for_handler.emit(
                                             "index-updated",
@@ -437,8 +471,15 @@ fn main() {
                                                 "cache_total": new_total
                                             }),
                                         );
-                                        // 通知前端刷新当前可见范围（文件已删除/修改/新增）
-                                        let _ = handle_for_handler.emit("records-refresh", ());
+                                        let _ = handle_for_handler.emit(
+                                            "records-refresh",
+                                            serde_json::json!({
+                                                "added": refresh_added,
+                                                "updated": refresh_updated,
+                                                "removed": refresh_removed,
+                                                "total": search_total,
+                                            }),
+                                        );
                                     }
                                     Ok(UsnResponse::Error { message }) => {
                                         log::error!("[USN] Worker error: {}", message);
@@ -535,21 +576,19 @@ fn main() {
                                 vm.volumes()
                             };
 
-                            log::info!(
+                            log::debug!(
                                 "[USN] Polling {} volumes: {:?}, interval={}s",
                                 volumes_list.len(),
                                 volumes_list,
                                 interval
                             );
                             for drive_letter in &volumes_list {
-                                let dl_char =
-                                    drive_letter.chars().next().unwrap_or('C');
+                                let dl_char = drive_letter.chars().next().unwrap_or('C');
                                 log::debug!("[USN] Sending PollChanges for drive {}", dl_char);
                                 usn_clone.poll_changes(dl_char, include_hidden, include_system);
                             }
 
-                            tokio::time::sleep(tokio::time::Duration::from_secs(interval))
-                                .await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
                         }
                     });
                 }
@@ -579,7 +618,8 @@ fn main() {
                     log::info!("[Incremental] Starting incremental scan task");
 
                     loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        // 与 USN 轮询间隔保持一致，避免 walkdir 增量扫描过于频繁
+                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
 
                         let config = crate::config::Config::load().ok();
                         let interval = config
@@ -649,7 +689,11 @@ fn main() {
                                     Ok(r) if r.added > 0 || r.updated > 0 || r.removed > 0 => {
                                         log::info!(
                                             "Incremental {}: +{} ~{} -{} (total: {})",
-                                            drive_letter, r.added, r.updated, r.removed, r.total
+                                            drive_letter,
+                                            r.added,
+                                            r.updated,
+                                            r.removed,
+                                            r.total
                                         );
                                         Some(r)
                                     }
@@ -683,14 +727,25 @@ fn main() {
                                     }),
                                 );
                                 // 通知前端刷新当前可见范围（文件已删除/修改/新增）
-                                let _ = handle_clone.emit("records-refresh", ());
+                                // payload 携带变化数量，便于前端判断是否真正有可见变化
+                                let _ = handle_clone.emit(
+                                    "records-refresh",
+                                    serde_json::json!({
+                                        "added": result.added,
+                                        "updated": result.updated,
+                                        "removed": result.removed,
+                                    }),
+                                );
                             }
                             // 锁已释放，前端请求可以继续
                         }
 
                         let now_str = chrono::Local::now().format("%H:%M:%S").to_string();
                         *last_update_clone.lock().await = now_str;
-                        next_scan = Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(interval));
+                        next_scan = Some(
+                            tokio::time::Instant::now()
+                                + tokio::time::Duration::from_secs(interval),
+                        );
                     }
                 });
 
@@ -711,7 +766,10 @@ fn main() {
                         };
 
                         if delta_count > 10_000 {
-                            log::info!("[Merge] Delta has {} entries, triggering merge", delta_count);
+                            log::info!(
+                                "[Merge] Delta has {} entries, triggering merge",
+                                delta_count
+                            );
                             let mut vm = vm_clone_merge.lock().await;
                             vm.merge_if_needed();
                         }

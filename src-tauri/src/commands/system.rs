@@ -13,15 +13,14 @@ fn startup_key_path() -> &'static str {
 
 #[tauri::command]
 pub fn add_startup() -> std::result::Result<(), String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("获取程序路径失败: {}", e))?;
-    let exe_path_str = exe_path.to_str()
-        .ok_or("程序路径转换失败".to_string())?;
+    let exe_path = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {}", e))?;
+    let exe_path_str = exe_path.to_str().ok_or("程序路径转换失败".to_string())?;
     let command = format!("\"{}\" -s", exe_path_str);
     log::info!("Adding startup entry: {}", command);
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (key, _) = hkcu.create_subkey(startup_key_path())
+    let (key, _) = hkcu
+        .create_subkey(startup_key_path())
         .map_err(|e| format!("打开注册表 HKCU\\{} 失败: {}", startup_key_path(), e))?;
 
     // 设置前先读取旧值
@@ -49,7 +48,11 @@ pub fn add_startup() -> std::result::Result<(), String> {
             log::info!("Startup entry verified successfully");
         }
         Ok(val) => {
-            log::warn!("Startup entry mismatch: wrote '{}', read '{}'", command, val);
+            log::warn!(
+                "Startup entry mismatch: wrote '{}', read '{}'",
+                command,
+                val
+            );
         }
         Err(e) => {
             log::error!("Failed to verify startup entry: {}", e);
@@ -63,7 +66,8 @@ pub fn add_startup() -> std::result::Result<(), String> {
 #[tauri::command]
 pub fn remove_startup() -> std::result::Result<(), String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu.open_subkey_with_flags(startup_key_path(), KEY_WRITE)
+    let key = hkcu
+        .open_subkey_with_flags(startup_key_path(), KEY_WRITE)
         .map_err(|e| format!("打开注册表 HKCU\\{} 失败: {}", startup_key_path(), e))?;
 
     match key.delete_value("Everything Tauri") {

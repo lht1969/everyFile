@@ -14,10 +14,8 @@ use usn_journal_rs::mft::EnumOptions;
 use usn_journal_rs::path::PathResolvableEntry;
 use usn_journal_rs::volume::Volume;
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Ioctl::{FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0};
 use windows::Win32::System::IO::DeviceIoControl;
-use windows::Win32::System::Ioctl::{
-    FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0,
-};
 
 /// Convert NTFS timestamp (100ns intervals since 1601-01-01) to Unix timestamp (seconds since 1970)
 const NTFS_EPOCH_DIFF: i64 = 11_644_473_600; // seconds between 1601 and 1970
@@ -46,9 +44,15 @@ struct RawUsnRecord {
 
 /// 实现 PathResolvableEntry，使 RawUsnRecord 可用于 usn-journal-rs 的路径解析
 impl usn_journal_rs::path::PathResolvableEntry for RawUsnRecord {
-    fn fid(&self) -> u64 { self.fid }
-    fn parent_fid(&self) -> u64 { self.parent_fid }
-    fn file_name(&self) -> &OsString { &self.file_name }
+    fn fid(&self) -> u64 {
+        self.fid
+    }
+    fn parent_fid(&self) -> u64 {
+        self.parent_fid
+    }
+    fn file_name(&self) -> &OsString {
+        &self.file_name
+    }
     fn is_dir(&self) -> bool {
         // FILE_ATTRIBUTE_DIRECTORY = 0x10
         (self.file_attributes & 0x10) != 0
@@ -116,8 +120,8 @@ fn read_usn_records_direct(
                 }
 
                 let next_start_usn = i64::from_le_bytes([
-                    buffer[0], buffer[1], buffer[2], buffer[3],
-                    buffer[4], buffer[5], buffer[6], buffer[7],
+                    buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+                    buffer[7],
                 ]);
 
                 // 解析 USN_RECORD_V2 记录（从 offset=8 开始，跳过 next_start_usn 头部）
@@ -128,10 +132,15 @@ fn read_usn_records_direct(
                         break;
                     }
                     let record_length = u32::from_le_bytes([
-                        buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3],
+                        buffer[offset],
+                        buffer[offset + 1],
+                        buffer[offset + 2],
+                        buffer[offset + 3],
                     ]);
 
-                    if record_length == 0 || offset + record_length as usize > bytes_returned as usize {
+                    if record_length == 0
+                        || offset + record_length as usize > bytes_returned as usize
+                    {
                         break;
                     }
 
@@ -151,34 +160,56 @@ fn read_usn_records_direct(
                     // +58: FileNameOffset (u16, 从记录起始的偏移)
                     // +60: FileName (UTF-16, 零终止)
                     let fid = u64::from_le_bytes([
-                        buffer[offset + 8], buffer[offset + 9], buffer[offset + 10], buffer[offset + 11],
-                        buffer[offset + 12], buffer[offset + 13], buffer[offset + 14], buffer[offset + 15],
+                        buffer[offset + 8],
+                        buffer[offset + 9],
+                        buffer[offset + 10],
+                        buffer[offset + 11],
+                        buffer[offset + 12],
+                        buffer[offset + 13],
+                        buffer[offset + 14],
+                        buffer[offset + 15],
                     ]);
                     let parent_fid = u64::from_le_bytes([
-                        buffer[offset + 16], buffer[offset + 17], buffer[offset + 18], buffer[offset + 19],
-                        buffer[offset + 20], buffer[offset + 21], buffer[offset + 22], buffer[offset + 23],
+                        buffer[offset + 16],
+                        buffer[offset + 17],
+                        buffer[offset + 18],
+                        buffer[offset + 19],
+                        buffer[offset + 20],
+                        buffer[offset + 21],
+                        buffer[offset + 22],
+                        buffer[offset + 23],
                     ]);
                     let usn = i64::from_le_bytes([
-                        buffer[offset + 24], buffer[offset + 25], buffer[offset + 26], buffer[offset + 27],
-                        buffer[offset + 28], buffer[offset + 29], buffer[offset + 30], buffer[offset + 31],
+                        buffer[offset + 24],
+                        buffer[offset + 25],
+                        buffer[offset + 26],
+                        buffer[offset + 27],
+                        buffer[offset + 28],
+                        buffer[offset + 29],
+                        buffer[offset + 30],
+                        buffer[offset + 31],
                     ]);
                     let reason = u32::from_le_bytes([
-                        buffer[offset + 40], buffer[offset + 41], buffer[offset + 42], buffer[offset + 43],
+                        buffer[offset + 40],
+                        buffer[offset + 41],
+                        buffer[offset + 42],
+                        buffer[offset + 43],
                     ]);
                     let file_attributes = u32::from_le_bytes([
-                        buffer[offset + 52], buffer[offset + 53], buffer[offset + 54], buffer[offset + 55],
+                        buffer[offset + 52],
+                        buffer[offset + 53],
+                        buffer[offset + 54],
+                        buffer[offset + 55],
                     ]);
-                    let file_name_length = u16::from_le_bytes([
-                        buffer[offset + 56], buffer[offset + 57],
-                    ]) as usize;
-                    let file_name_offset = u16::from_le_bytes([
-                        buffer[offset + 58], buffer[offset + 59],
-                    ]) as usize;
+                    let file_name_length =
+                        u16::from_le_bytes([buffer[offset + 56], buffer[offset + 57]]) as usize;
+                    let file_name_offset =
+                        u16::from_le_bytes([buffer[offset + 58], buffer[offset + 59]]) as usize;
 
                     // 读取文件名（UTF-16 编码）
                     let name_start = offset + file_name_offset;
                     let name_end = name_start + file_name_length;
-                    if name_end <= bytes_returned as usize && file_name_length % 2 == 0 {
+                    if name_end <= bytes_returned as usize && file_name_length.is_multiple_of(2) {
                         let name_units: Vec<u16> = buffer[name_start..name_end]
                             .chunks_exact(2)
                             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
@@ -330,7 +361,7 @@ fn resolve_dir_path(
     // 拼接路径：C:\dir1\dir2
     let total_len: usize = components.iter().map(|c| c.len()).sum::<usize>()
         + components.len()  // 分隔符
-        + 4;                // "X:\" 前缀
+        + 4; // "X:\" 前缀
     let mut path = String::with_capacity(total_len);
     path.push(drive_letter);
     path.push(':');
@@ -344,10 +375,7 @@ fn resolve_dir_path(
     Some(CompactString::from(path))
 }
 
-pub fn spawn_usn_worker(
-    cmd_rx: Receiver<UsnCommand>,
-    resp_tx: Sender<UsnResponse>,
-) {
+pub fn spawn_usn_worker(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
     std::thread::Builder::new()
         .name("usn-worker".into())
         .spawn(move || {
@@ -363,9 +391,16 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
     let save_interval = std::time::Duration::from_secs(30);
 
     loop {
-        log::info!("[USN] Worker loop waiting for command, volumes stored: {:?}", volumes.keys().collect::<Vec<_>>());
+        log::info!(
+            "[USN] Worker loop waiting for command, volumes stored: {:?}",
+            volumes.keys().collect::<Vec<_>>()
+        );
         match cmd_rx.recv() {
-            Ok(UsnCommand::FullScan { drive_letter, include_hidden_files, include_system_files }) => {
+            Ok(UsnCommand::FullScan {
+                drive_letter,
+                include_hidden_files,
+                include_system_files,
+            }) => {
                 handle_full_scan(
                     drive_letter,
                     include_hidden_files,
@@ -375,7 +410,11 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
                     &resp_tx,
                 );
             }
-            Ok(UsnCommand::PollChanges { drive_letter, include_hidden_files, include_system_files }) => {
+            Ok(UsnCommand::PollChanges {
+                drive_letter,
+                include_hidden_files,
+                include_system_files,
+            }) => {
                 handle_poll_changes(
                     drive_letter,
                     include_hidden_files,
@@ -552,7 +591,10 @@ fn handle_full_scan(
         }
 
         // 跳过路径中包含 $-前缀组件的条目（NTFS 特殊目录）
-        if path_str.split('\\').any(|comp| comp.starts_with('$') && comp.len() > 1) {
+        if path_str
+            .split('\\')
+            .any(|comp| comp.starts_with('$') && comp.len() > 1)
+        {
             return;
         }
 
@@ -582,7 +624,8 @@ fn handle_full_scan(
         Err(e) => {
             log::warn!(
                 "[USN] MftScanner streaming failed for {}: {}, falling back to FSCTL_ENUM_USN_DATA",
-                drive_letter, e
+                drive_letter,
+                e
             );
             handle_full_scan_legacy(
                 drive_letter,
@@ -598,8 +641,12 @@ fn handle_full_scan(
 
     log::info!(
         "[USN] Phase 1: Streamed {} records ({} files, {} dirs) for {} in {:?}, deferred={}",
-        stats.total_records, stats.files, stats.dirs,
-        drive_letter, t0.elapsed(), deferred.len()
+        stats.total_records,
+        stats.files,
+        stats.dirs,
+        drive_letter,
+        t0.elapsed(),
+        deferred.len()
     );
 
     // Phase 2: 处理 deferred 条目（此时 dir_map 已包含所有目录）
@@ -608,7 +655,9 @@ fn handle_full_scan(
     for entry in deferred.drain(..) {
         // 分离 parent_path 和完整路径（与 Phase 1 callback 相同的逻辑）
         let parent_path_id: u32;
-        let path_str: CompactString = if entry.parent_record == 0 || entry.parent_record == entry.record_number {
+        let path_str: CompactString = if entry.parent_record == 0
+            || entry.parent_record == entry.record_number
+        {
             let mut root = String::with_capacity(3);
             root.push(drive_letter);
             root.push(':');
@@ -638,7 +687,10 @@ fn handle_full_scan(
         if should_skip_path(&path_str) {
             continue;
         }
-        if path_str.split('\\').any(|comp| comp.starts_with('$') && comp.len() > 1) {
+        if path_str
+            .split('\\')
+            .any(|comp| comp.starts_with('$') && comp.len() > 1)
+        {
             continue;
         }
 
@@ -660,7 +712,10 @@ fn handle_full_scan(
 
     log::info!(
         "[USN] Phase 2: Resolved {} deferred entries in {:?}, total {} files (path_table size={})",
-        deferred_count, t1.elapsed(), files.len(), path_table.len()
+        deferred_count,
+        t1.elapsed(),
+        files.len(),
+        path_table.len()
     );
 
     // Phase 3: 用 pending_sizes 更新 files 中 size=0 的 FileEntry
@@ -693,7 +748,9 @@ fn handle_full_scan(
 
     log::info!(
         "[USN] Full scan complete for drive {}: {} files, total {:?}",
-        drive_letter, files.len(), scan_start.elapsed()
+        drive_letter,
+        files.len(),
+        scan_start.elapsed()
     );
 
     // 创建或验证 USN journal（增量更新所需）
@@ -733,7 +790,10 @@ fn handle_full_scan(
                     Ok(data) => (data.journal_id, data.next_usn),
                     Err(e2) => {
                         let _ = resp_tx.send(UsnResponse::Error {
-                            message: format!("Journal create+query failed for {}: {}", drive_letter, e2),
+                            message: format!(
+                                "Journal create+query failed for {}: {}",
+                                drive_letter, e2
+                            ),
                         });
                         return;
                     }
@@ -751,10 +811,9 @@ fn handle_full_scan(
     last_usn_map.insert(drive_letter, last_usn);
 
     let mut state = UsnState::load();
-    state.volumes.insert(
-        drive_letter.to_string(),
-        VolumeState { last_usn },
-    );
+    state
+        .volumes
+        .insert(drive_letter.to_string(), VolumeState { last_usn });
     state.save();
 
     volumes.insert(drive_letter, volume);
@@ -775,7 +834,10 @@ fn handle_full_scan_legacy(
     last_usn_map: &mut HashMap<char, i64>,
     resp_tx: &Sender<UsnResponse>,
 ) {
-    log::info!("[USN] Full scan (legacy) starting for drive {}", drive_letter);
+    log::info!(
+        "[USN] Full scan (legacy) starting for drive {}",
+        drive_letter
+    );
     let scan_start = Instant::now();
 
     let volume = match Volume::from_drive_letter(drive_letter) {
@@ -829,7 +891,10 @@ fn handle_full_scan_legacy(
                     }
                 }
                 Err(e) => {
-                    log::warn!("[USN] Custom MFT enum failed ({}), falling back to usn-journal-rs", e);
+                    log::warn!(
+                        "[USN] Custom MFT enum failed ({}), falling back to usn-journal-rs",
+                        e
+                    );
                     let enum_options = EnumOptions {
                         buffer_size: 1024 * 1024,
                         ..Default::default()
@@ -837,7 +902,10 @@ fn handle_full_scan_legacy(
                     raw_entries = Vec::with_capacity(1_000_000);
                     parent_map = HashMap::with_capacity(1_000_000);
                     for result in mft.iter_with_options(enum_options) {
-                        let entry = match result { Ok(e) => e, Err(_) => continue };
+                        let entry = match result {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
                         parent_map.insert(entry.fid, entry.parent_fid);
                         raw_entries.push(RawEntry {
                             fid: entry.fid,
@@ -858,7 +926,10 @@ fn handle_full_scan_legacy(
             raw_entries = Vec::with_capacity(1_000_000);
             parent_map = HashMap::with_capacity(1_000_000);
             for result in mft.iter_with_options(enum_options) {
-                let entry = match result { Ok(e) => e, Err(_) => continue };
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
                 parent_map.insert(entry.fid, entry.parent_fid);
                 raw_entries.push(RawEntry {
                     fid: entry.fid,
@@ -872,7 +943,9 @@ fn handle_full_scan_legacy(
 
     log::info!(
         "[USN] Phase 1a: Enumerated {} MFT entries for {} in {:?}",
-        raw_entries.len(), drive_letter, t0.elapsed()
+        raw_entries.len(),
+        drive_letter,
+        t0.elapsed()
     );
 
     // Build O(1) index lookup: fid → raw_entries index (avoids cloning OsStrings)
@@ -915,7 +988,9 @@ fn handle_full_scan_legacy(
                             Some(&parent_idx) => {
                                 let parent_name = &raw_entries[parent_idx].file_name;
                                 // Skip NTFS virtual entries (. and ..) to avoid paths like C:\.\windows
-                                if parent_name.to_string_lossy() == "." || parent_name.to_string_lossy() == ".." {
+                                if parent_name.to_string_lossy() == "."
+                                    || parent_name.to_string_lossy() == ".."
+                                {
                                     continue;
                                 }
                                 parts.push(parent_name);
@@ -931,7 +1006,7 @@ fn handle_full_scan_legacy(
             // Build path string with pre-allocated capacity
             let estimated_len: usize = parts.iter().map(|p| p.len()).sum::<usize>()
                 + parts.len()  // separators
-                + 4;            // "X:\" prefix
+                + 4; // "X:\" prefix
             let path_str: CompactString = {
                 let mut path = String::with_capacity(estimated_len);
                 path.push(drive_letter);
@@ -956,7 +1031,8 @@ fn handle_full_scan_legacy(
             }
 
             // Pre-convert name to CompactString here so Phase 2 doesn't need name lookup
-            let name_str: CompactString = CompactString::from(re.file_name.to_string_lossy().as_ref());
+            let name_str: CompactString =
+                CompactString::from(re.file_name.to_string_lossy().as_ref());
             let is_dir = (re.file_attributes & 0x10) != 0;
             Some((re.fid, name_str, path_str, is_dir, re.timestamp))
         })
@@ -964,7 +1040,9 @@ fn handle_full_scan_legacy(
 
     log::info!(
         "[USN] Phase 1b: Resolved {} file paths for {} in {:?}",
-        entries.len(), drive_letter, t1.elapsed()
+        entries.len(),
+        drive_letter,
+        t1.elapsed()
     );
 
     // Free raw_entries and parent_map/fid_to_idx — no longer needed
@@ -993,8 +1071,19 @@ fn handle_full_scan_legacy(
         .map(|(i, (fid, name_str, path_str, is_dir, timestamp))| {
             let (size, fallback_modified) = sizes[i];
             // 优先使用 MFT 时间戳，回退到 GetFileAttributesExW 返回的 modified_time
-            let modified_time = if *timestamp > 0 { *timestamp } else { fallback_modified };
-            (name_str.clone(), path_str.clone(), *fid, *is_dir, size, modified_time)
+            let modified_time = if *timestamp > 0 {
+                *timestamp
+            } else {
+                fallback_modified
+            };
+            (
+                name_str.clone(),
+                path_str.clone(),
+                *fid,
+                *is_dir,
+                size,
+                modified_time,
+            )
         })
         .collect();
 
@@ -1026,7 +1115,14 @@ fn handle_full_scan_legacy(
             }
 
             // FileEntry::new 内部会将 modified_time (i64) 截断为 i32
-            FileEntry::new(name_str, parent_path_id, size, modified_time, fid as u32, is_dir)
+            FileEntry::new(
+                name_str,
+                parent_path_id,
+                size,
+                modified_time,
+                fid as u32,
+                is_dir,
+            )
         })
         .collect();
 
@@ -1036,7 +1132,9 @@ fn handle_full_scan_legacy(
     );
     log::info!(
         "[USN] Full scan complete for drive {}: {} files, total {:?}",
-        drive_letter, files.len(), scan_start.elapsed()
+        drive_letter,
+        files.len(),
+        scan_start.elapsed()
     );
 
     // Create or verify USN journal
@@ -1066,7 +1164,10 @@ fn handle_full_scan_legacy(
                     Ok(data) => (data.journal_id, data.next_usn),
                     Err(e2) => {
                         let _ = resp_tx.send(UsnResponse::Error {
-                            message: format!("Journal create+query failed for {}: {}", drive_letter, e2),
+                            message: format!(
+                                "Journal create+query failed for {}: {}",
+                                drive_letter, e2
+                            ),
                         });
                         return;
                     }
@@ -1084,10 +1185,9 @@ fn handle_full_scan_legacy(
     last_usn_map.insert(drive_letter, last_usn);
 
     let mut state = UsnState::load();
-    state.volumes.insert(
-        drive_letter.to_string(),
-        VolumeState { last_usn },
-    );
+    state
+        .volumes
+        .insert(drive_letter.to_string(), VolumeState { last_usn });
     state.save();
 
     volumes.insert(drive_letter, volume);
@@ -1100,6 +1200,7 @@ fn handle_full_scan_legacy(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_poll_changes(
     drive_letter: char,
     include_hidden_files: bool,
@@ -1110,7 +1211,10 @@ fn handle_poll_changes(
     save_interval: std::time::Duration,
     resp_tx: &Sender<UsnResponse>,
 ) {
-    log::info!("[USN] handle_poll_changes entered for drive {}", drive_letter);
+    log::info!(
+        "[USN] handle_poll_changes entered for drive {}",
+        drive_letter
+    );
     let volume = match volumes.get(&drive_letter) {
         Some(v) => v,
         None => {
@@ -1161,13 +1265,24 @@ fn handle_poll_changes(
         .max(journal_data.lowest_valid_usn)
         .min(journal_data.next_usn);
 
-    log::info!("[USN] Poll {}: start_usn={}, next_usn={}, using start={}",
-        drive_letter, effective_last_usn, journal_data.next_usn, start_usn);
-
-    // 若 start_usn >= next_usn，说明无新变更，直接返回（不发送 IncrementalResult）
+    // 无新变更时直接返回；使用 debug 级别避免每次空轮询都产生 I/O
     if start_usn >= journal_data.next_usn {
+        log::debug!(
+            "[USN] Poll {}: no new records (start_usn={} >= next_usn={})",
+            drive_letter,
+            start_usn,
+            journal_data.next_usn
+        );
         return;
     }
+
+    log::info!(
+        "[USN] Poll {}: start_usn={}, next_usn={}, using start={}",
+        drive_letter,
+        effective_last_usn,
+        journal_data.next_usn,
+        start_usn
+    );
 
     // 直接调用 FSCTL_READ_USN_JOURNAL 读取变更记录
     let vol_handle = match ntfs_mft::open_volume_handle(drive_letter) {
@@ -1180,24 +1295,25 @@ fn handle_poll_changes(
         }
     };
 
-    let (records, next_start_usn) = match read_usn_records_direct(
-        vol_handle,
-        journal_data.journal_id,
-        start_usn,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("[USN] Poll {}: read_usn_records_direct error: {}", drive_letter, e);
-            let _ = resp_tx.send(UsnResponse::Error {
-                message: format!("Failed to read journal for {}: {}", drive_letter, e),
-            });
-            return;
-        }
-    };
+    let (records, next_start_usn) =
+        match read_usn_records_direct(vol_handle, journal_data.journal_id, start_usn) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "[USN] Poll {}: read_usn_records_direct error: {}",
+                    drive_letter,
+                    e
+                );
+                let _ = resp_tx.send(UsnResponse::Error {
+                    message: format!("Failed to read journal for {}: {}", drive_letter, e),
+                });
+                return;
+            }
+        };
 
     let mut resolver = volume.path_resolver_with_cache();
     let mut added: Vec<SearchResult> = Vec::new();
-    let mut removed: Vec<u64> = Vec::new();
+    let mut removed: Vec<(u64, String)> = Vec::new();
     let mut updated: Vec<(u64, SearchResult)> = Vec::new();
     // new_last_usn 使用 API 返回的 next_start_usn，这是有效的记录边界
     let new_last_usn = next_start_usn;
@@ -1215,16 +1331,18 @@ fn handle_poll_changes(
     // Build a parent map from this batch of USN records for fallback path resolution.
     // When usn-journal-rs's resolver can't find a parent (e.g. newly created files),
     // we can walk the parent chain using this map.
-    let mut batch_parent_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    let mut batch_name_map: std::collections::HashMap<u64, &std::ffi::OsString> = std::collections::HashMap::new();
+    let mut batch_parent_map: std::collections::HashMap<u64, u64> =
+        std::collections::HashMap::new();
+    let mut batch_name_map: std::collections::HashMap<u64, &std::ffi::OsString> =
+        std::collections::HashMap::new();
     for rec in &records {
         batch_parent_map.insert(rec.fid, rec.parent_fid);
         batch_name_map.insert(rec.fid, &rec.file_name);
     }
 
     // 复用 volume handle 用于元数据查询
-    let mut mft_reader = ntfs_mft::open_volume_handle(drive_letter)
-        .map(|handle| ntfs_mft::UsnMetadataReader::new(handle));
+    let mut mft_reader =
+        ntfs_mft::open_volume_handle(drive_letter).map(ntfs_mft::UsnMetadataReader::new);
 
     let entry_count = records.len();
 
@@ -1240,7 +1358,30 @@ fn handle_poll_changes(
         // Handle deletion/renamed-away: mark old fid as removed
         if reason & USN_REASON_FILE_DELETE != 0 || reason & USN_REASON_RENAME_OLD_NAME != 0 {
             if removed_fids.insert(fid) {
-                removed.push(fid);
+                // 解析被删除/重命名旧路径的完整路径，用于 base 中 fid 不匹配时兜底定位
+                let del_path = match resolver.resolve_path(entry) {
+                    Some(p) => p.to_string_lossy().to_string(),
+                    None => {
+                        match resolve_path_from_batch(
+                            fid,
+                            &batch_parent_map,
+                            &batch_name_map,
+                            drive_letter,
+                        ) {
+                            Some(p) => p.to_string_lossy().to_string(),
+                            None => {
+                                log::warn!(
+                                    "[USN] resolve_path FAILED (removed) for fid={}, name={}, reason=0x{:x}",
+                                    fid,
+                                    entry.file_name.to_string_lossy(),
+                                    reason
+                                );
+                                String::new()
+                            }
+                        }
+                    }
+                };
+                removed.push((fid, del_path));
             }
             // Clear added_fids so that a subsequent RENAME_NEW_NAME for the same
             // fid (same file, new name) can re-add it. Without this, a new file
@@ -1261,7 +1402,12 @@ fn handle_poll_changes(
                 Some(p) => p,
                 None => {
                     // Fallback: build path from batch parent map
-                    match resolve_path_from_batch(fid, &batch_parent_map, &batch_name_map, drive_letter) {
+                    match resolve_path_from_batch(
+                        fid,
+                        &batch_parent_map,
+                        &batch_name_map,
+                        drive_letter,
+                    ) {
                         Some(p) => p,
                         None => {
                             log::warn!(
@@ -1280,16 +1426,27 @@ fn handle_poll_changes(
             let skip = path.components().any(|comp| {
                 let s = comp.as_os_str().to_string_lossy();
                 let sl = s.to_lowercase();
-                if sl == RECYCLE_BIN { return true; }
-                if !include_system_files && sl == SYSTEM_VOL_INFO { return true; }
+                if sl == RECYCLE_BIN {
+                    return true;
+                }
+                if !include_system_files && sl == SYSTEM_VOL_INFO {
+                    return true;
+                }
                 false
             });
-            if skip { continue; }
+            if skip {
+                continue;
+            }
 
-            if !include_hidden_files && entry.is_hidden() { continue; }
-            if entry.file_name.to_string_lossy().starts_with('$') { continue; }
+            if !include_hidden_files && entry.is_hidden() {
+                continue;
+            }
+            if entry.file_name.to_string_lossy().starts_with('$') {
+                continue;
+            }
 
-            let name: CompactString = CompactString::from(entry.file_name.to_string_lossy().as_ref());
+            let name: CompactString =
+                CompactString::from(entry.file_name.to_string_lossy().as_ref());
             let path_str: CompactString = CompactString::from(path.to_string_lossy().as_ref());
             let meta = mft_reader
                 .as_mut()
@@ -1310,14 +1467,17 @@ fn handle_poll_changes(
         }
 
         // Handle data/info change
-        if reason & USN_REASON_DATA_OVERWRITE != 0
-            || reason & USN_REASON_BASIC_INFO_CHANGE != 0
-        {
+        if reason & USN_REASON_DATA_OVERWRITE != 0 || reason & USN_REASON_BASIC_INFO_CHANGE != 0 {
             let path = match resolver.resolve_path(entry) {
                 Some(p) => p,
                 None => {
                     // Fallback: build path from batch parent map
-                    match resolve_path_from_batch(fid, &batch_parent_map, &batch_name_map, drive_letter) {
+                    match resolve_path_from_batch(
+                        fid,
+                        &batch_parent_map,
+                        &batch_name_map,
+                        drive_letter,
+                    ) {
                         Some(p) => p,
                         None => {
                             log::warn!(
@@ -1332,7 +1492,8 @@ fn handle_poll_changes(
                 }
             };
 
-            let name: CompactString = CompactString::from(entry.file_name.to_string_lossy().as_ref());
+            let name: CompactString =
+                CompactString::from(entry.file_name.to_string_lossy().as_ref());
             let path_str: CompactString = CompactString::from(path.to_string_lossy().as_ref());
             let meta = mft_reader
                 .as_mut()
@@ -1342,14 +1503,17 @@ fn handle_poll_changes(
                     modified_time: 0,
                     is_directory: entry.is_dir(),
                 });
-            updated.push((fid, SearchResult {
-                file_id: fid as u32,
-                name,
-                path: path_str,
-                size: meta.size,
-                modified_time: meta.modified_time,
-                is_directory: meta.is_directory,
-            }));
+            updated.push((
+                fid,
+                SearchResult {
+                    file_id: fid as u32,
+                    name,
+                    path: path_str,
+                    size: meta.size,
+                    modified_time: meta.modified_time,
+                    is_directory: meta.is_directory,
+                },
+            ));
         }
     }
 
@@ -1371,9 +1535,9 @@ fn handle_poll_changes(
         if now.duration_since(*last_save_time) >= save_interval {
             let mut state = UsnState::default();
             for (&dl, &usn) in last_usn_map.iter() {
-                state.volumes.insert(dl.to_string(), VolumeState {
-                    last_usn: usn,
-                });
+                state
+                    .volumes
+                    .insert(dl.to_string(), VolumeState { last_usn: usn });
             }
             state.save();
             *last_save_time = now;
@@ -1382,7 +1546,10 @@ fn handle_poll_changes(
 
     // 仅当有实际变更时才发送结果，避免触发无意义的缓存更新和前端刷新
     if added.is_empty() && removed.is_empty() && updated.is_empty() {
-        log::info!("[USN] Poll {}: no relevant changes after filtering, skipping notification", drive_letter);
+        log::info!(
+            "[USN] Poll {}: no relevant changes after filtering, skipping notification",
+            drive_letter
+        );
         return;
     }
 

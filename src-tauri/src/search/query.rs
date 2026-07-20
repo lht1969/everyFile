@@ -86,8 +86,7 @@ impl SearchQuery {
                 || part.starts_with("da:")
             {
                 date_filter = Self::parse_date_filter(part);
-            } else if part.starts_with("path:") {
-                let path_part = &part[5..];
+            } else if let Some(path_part) = part.strip_prefix("path:") {
                 path_filter = Some(path_part.to_string());
                 if i + 1 < parts.len() {
                     let next = parts[i + 1];
@@ -96,8 +95,8 @@ impl SearchQuery {
                         i += 1;
                     }
                 }
-            } else if part.starts_with("regex:") {
-                if let Ok(re) = Regex::new(&part[6..]) {
+            } else if let Some(regex_part) = part.strip_prefix("regex:") {
+                if let Ok(re) = Regex::new(regex_part) {
                     regex_pattern = Some(re);
                 }
             } else if part == ":folders" || part == ":folder" {
@@ -136,14 +135,21 @@ impl SearchQuery {
     pub fn matches(&self, file: &crate::search::SearchResult) -> bool {
         if !self.keywords.is_empty() {
             let name_lower = file.name.to_lowercase();
-            if !self.keywords.iter().all(|kw| name_lower.contains(&kw.to_lowercase())) {
+            if !self
+                .keywords
+                .iter()
+                .all(|kw| name_lower.contains(&kw.to_lowercase()))
+            {
                 return false;
             }
         }
-        if !self.glob_patterns.is_empty() {
-            if !self.glob_patterns.iter().all(|p| p.matches_path(std::path::Path::new(file.name.as_str()))) {
-                return false;
-            }
+        if !self.glob_patterns.is_empty()
+            && !self
+                .glob_patterns
+                .iter()
+                .all(|p| p.matches_path(std::path::Path::new(file.name.as_str())))
+        {
+            return false;
         }
         if let Some(ref size_filter) = self.size_filter {
             if !size_filter.matches(file.size) {
@@ -162,11 +168,17 @@ impl SearchQuery {
                     DateOperator::GreaterOrEqual => file_ts >= target_ts,
                     DateOperator::LessOrEqual => file_ts <= target_end_ts,
                 };
-                if !matches { return false; }
+                if !matches {
+                    return false;
+                }
             }
         }
         if let Some(ref path_filter) = self.path_filter {
-            if !file.path.to_lowercase().contains(&path_filter.to_lowercase()) {
+            if !file
+                .path
+                .to_lowercase()
+                .contains(&path_filter.to_lowercase())
+            {
                 return false;
             }
         }
@@ -200,10 +212,13 @@ impl SearchQuery {
                 return false;
             }
         }
-        if !self.glob_patterns.is_empty() {
-            if !self.glob_patterns.iter().all(|p| p.matches_path(std::path::Path::new(entry.name.as_str()))) {
-                return false;
-            }
+        if !self.glob_patterns.is_empty()
+            && !self
+                .glob_patterns
+                .iter()
+                .all(|p| p.matches_path(std::path::Path::new(entry.name.as_str())))
+        {
+            return false;
         }
         if let Some(ref size_filter) = self.size_filter {
             if !size_filter.matches(entry.size) {
@@ -222,7 +237,9 @@ impl SearchQuery {
                     DateOperator::GreaterOrEqual => file_ts >= target_ts,
                     DateOperator::LessOrEqual => file_ts <= target_end_ts,
                 };
-                if !matches { return false; }
+                if !matches {
+                    return false;
+                }
             }
         }
         // 使用预小写化的 path_filter_lower，避免 per-file to_lowercase
@@ -245,16 +262,16 @@ impl SearchQuery {
     fn parse_size_filter(part: &str) -> Option<SizeFilter> {
         let value_str = part[5..].trim();
 
-        let (operator_str, value_str) = if value_str.starts_with(">") {
-            (">", &value_str[1..])
-        } else if value_str.starts_with("<") {
-            ("<", &value_str[1..])
-        } else if value_str.starts_with(">=") {
-            (">=", &value_str[2..])
-        } else if value_str.starts_with("<=") {
-            ("<=", &value_str[2..])
-        } else if value_str.starts_with("=") {
-            ("=", &value_str[1..])
+        let (operator_str, value_str) = if let Some(rest) = value_str.strip_prefix(">=") {
+            (">=", rest)
+        } else if let Some(rest) = value_str.strip_prefix("<=") {
+            ("<=", rest)
+        } else if let Some(rest) = value_str.strip_prefix(">") {
+            (">", rest)
+        } else if let Some(rest) = value_str.strip_prefix("<") {
+            ("<", rest)
+        } else if let Some(rest) = value_str.strip_prefix("=") {
+            ("=", rest)
         } else {
             (">=", value_str)
         };
@@ -299,34 +316,34 @@ impl SearchQuery {
     }
 
     fn parse_date_filter(part: &str) -> Option<DateFilter> {
-        let (date_type_str, after_prefix) = if part.starts_with("datemodified:") {
-            (DateType::Modified, &part[13..])
-        } else if part.starts_with("dm:") {
-            (DateType::Modified, &part[3..])
-        } else if part.starts_with("datecreated:") {
-            (DateType::Created, &part[12..])
-        } else if part.starts_with("dc:") {
-            (DateType::Created, &part[3..])
-        } else if part.starts_with("dateaccessed:") {
-            (DateType::Accessed, &part[13..])
-        } else if part.starts_with("da:") {
-            (DateType::Accessed, &part[3..])
+        let (date_type, after_prefix) = if let Some(rest) = part.strip_prefix("datemodified:") {
+            (DateType::Modified, rest)
+        } else if let Some(rest) = part.strip_prefix("dm:") {
+            (DateType::Modified, rest)
+        } else if let Some(rest) = part.strip_prefix("datecreated:") {
+            (DateType::Created, rest)
+        } else if let Some(rest) = part.strip_prefix("dc:") {
+            (DateType::Created, rest)
+        } else if let Some(rest) = part.strip_prefix("dateaccessed:") {
+            (DateType::Accessed, rest)
+        } else if let Some(rest) = part.strip_prefix("da:") {
+            (DateType::Accessed, rest)
         } else {
             return None;
         };
 
         let date_str = after_prefix.trim();
 
-        let (operator_str, date_value_str) = if date_str.starts_with(">=") {
-            (">=", &date_str[2..])
-        } else if date_str.starts_with("<=") {
-            ("<=", &date_str[2..])
-        } else if date_str.starts_with(">") {
-            (">", &date_str[1..])
-        } else if date_str.starts_with("<") {
-            ("<", &date_str[1..])
-        } else if date_str.starts_with("=") {
-            ("=", &date_str[1..])
+        let (operator_str, date_value_str) = if let Some(rest) = date_str.strip_prefix(">=") {
+            (">=", rest)
+        } else if let Some(rest) = date_str.strip_prefix("<=") {
+            ("<=", rest)
+        } else if let Some(rest) = date_str.strip_prefix(">") {
+            (">", rest)
+        } else if let Some(rest) = date_str.strip_prefix("<") {
+            ("<", rest)
+        } else if let Some(rest) = date_str.strip_prefix("=") {
+            ("=", rest)
         } else {
             ("=", date_str)
         };
@@ -357,17 +374,19 @@ impl SearchQuery {
         };
 
         if let Some(date) = parsed_date {
-            let start = date.and_hms_opt(0, 0, 0)
+            let start = date
+                .and_hms_opt(0, 0, 0)
                 .unwrap()
                 .and_utc()
                 .with_timezone(&Local);
-            let end = date.and_hms_opt(23, 59, 59)
+            let end = date
+                .and_hms_opt(23, 59, 59)
                 .unwrap()
                 .and_utc()
                 .with_timezone(&Local);
 
             Some(DateFilter {
-                date_type: date_type_str,
+                date_type,
                 operator,
                 date: Some(start),
                 start: Some(start),
@@ -375,7 +394,7 @@ impl SearchQuery {
             })
         } else {
             Some(DateFilter {
-                date_type: date_type_str,
+                date_type,
                 operator,
                 date: None,
                 start: None,

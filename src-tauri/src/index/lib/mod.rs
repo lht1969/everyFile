@@ -4,7 +4,7 @@ pub mod path;
 pub mod scanner;
 
 use std::fs::File;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub use aligned_reader::AlignedReader;
 pub use error::MftError;
