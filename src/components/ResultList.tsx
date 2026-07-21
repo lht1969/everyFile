@@ -44,7 +44,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   const hoverTimeoutRef = useRef<number | null>(null);
   const resizingRef = useRef<{ colIndex: number; startX: number; startWidth: number } | null>(null);
 
-  const { startIndex, endIndex, offsetY, spacerHeight, effectiveItemHeight, scrollToIndex, resetScroll } = useVirtualScroll({
+  const { startIndex, endIndex, offsetY, spacerHeight, scrollToIndex, resetScroll } = useVirtualScroll({
     totalItems: totalCount,
     itemHeight: ROW_HEIGHT,
     overscan: 5,
@@ -95,13 +95,13 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
     } else if (e.key === 'PageDown') {
       e.preventDefault();
       if (resultBodyRef.current) {
-        const step = Math.floor(resultBodyRef.current.clientHeight / effectiveItemHeight);
+        const step = Math.floor(resultBodyRef.current.clientHeight / ROW_HEIGHT);
         const n = Math.min(selectedIndex + step, totalCount - 1); setSelectedIndex(n); scrollToIndex(n);
       }
     } else if (e.key === 'PageUp') {
       e.preventDefault();
       if (resultBodyRef.current) {
-        const step = Math.floor(resultBodyRef.current.clientHeight / effectiveItemHeight);
+        const step = Math.floor(resultBodyRef.current.clientHeight / ROW_HEIGHT);
         const n = Math.max(selectedIndex - step, 0); setSelectedIndex(n); scrollToIndex(n);
       }
     } else if (e.key === 'Enter' && selectedIndex >= 0) {
@@ -200,7 +200,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
             const renderEnd = Math.min(endIndex, dataEnd);
             const renderLen = Math.max(0, renderEnd - startIndex);
             return (
-              <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)`, height: renderLen * effectiveItemHeight }}>
+              <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)`, height: renderLen * ROW_HEIGHT }}>
                 {Array.from({ length: renderLen }, (_, i) => {
                   const globalIndex = startIndex + i;
                   const result = results[globalIndex - resultsOffset];
@@ -209,7 +209,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       <div
                         key={`placeholder-${globalIndex}`}
                         className="result-row"
-                        style={{ height: effectiveItemHeight, gridTemplateColumns: colWidths.join(' ') }}
+                        style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
                       />
                     );
                   }
@@ -221,7 +221,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       // 表现为"某些行固定不跟着排序"（其实是 DOM 节点没被替换，只是 props 改了）
                       key={`${globalIndex}-${result.path}`}
                       className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
-                      style={{ height: effectiveItemHeight, gridTemplateColumns: colWidths.join(' ') }}
+                      style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
                       onClick={() => handleRowClick(globalIndex)}
                       onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
                       onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
