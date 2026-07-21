@@ -138,6 +138,10 @@ pub struct SearchCache {
     /// base 中所有文件的 file_id 排序列表，用于 O(log n) 二分查找。
     /// 延迟构建：首次需要维护 active_base_count 时构建。
     base_file_ids: Option<Vec<u32>>,
+    /// 预计算的排序索引：SortBy → ascending sorted Vec<u32>
+    /// 在 search_with_options 构建缓存时一次性计算所有 4 个排序字段。
+    /// 列头点击时 O(1) 切换，无需重新排序。
+    sorted_indices_map: std::collections::HashMap<SortBy, std::sync::Arc<Vec<u32>>>,
 }
 
 impl SearchCache {
@@ -389,6 +393,7 @@ impl SearchCache {
         // merge 后 delta 为空，generation 已递增；排序缓存会因 base_matched_len
         // 变化而失效，此处无需额外处理。
         self.sorted_cache = None;
+        self.sorted_indices_map.clear();
 
         // Rebuild base matched from scratch
         let mut matched = Vec::new();
@@ -421,6 +426,7 @@ impl SearchCache {
             self.base.matched.len()
         );
     }
+
 
     pub fn get_sorted_slice(
         &mut self,
@@ -620,10 +626,14 @@ impl SearchCache {
             .map(|i| volumes.get(&vol_names[i]).map(|v| &v.path_table))
             .collect();
 
-        // cache_hit 检查：排序字段/方向、base.matched 长度、valid_indices 长度
-        // 均未变化时复用 sorted_base。
-        // sorted_base 保存的是未过滤的 valid_indices 全排序结果，delta 变化时
-        // 在归并阶段 lazy skip 即可（is_base_active），无需因 delta 变化而重建。
+        // 优先使用预计算的排序索引（O(1) 切换），回退到 SortedCache，最后实时排序。
+        let base_version_ok =
+            self.base.valid_indices_matched_len == self.base.matched.len();
+        let precomputed = if base_version_ok {
+            self.sorted_indices_map.get(&sort_by)
+        } else {
+            None
+        };
         let cache_hit = self.sorted_cache.as_ref().is_some_and(|sc| {
             sc.sort_by == sort_by
                 && sc.sort_direction == sort_direction
@@ -631,24 +641,26 @@ impl SearchCache {
                 && sc.valid_indices_matched_len == self.base.valid_indices_matched_len
         });
         log::info!(
-            "[SORT] cache_hit={} valid_indices_len={} delta_gen={}",
+            "[SORT] precomputed={} cache_hit={} valid_indices_len={} delta_gen={}",
+            precomputed.is_some(),
             cache_hit,
             valid_indices.len(),
             self.delta.generation
         );
 
-        let sorted_base: std::sync::Arc<Vec<u32>> = if cache_hit {
-            // Arc 克隆只增加引用计数，不分配新内存，避免大 Vec 复制。
+        let sorted_base: std::sync::Arc<Vec<u32>> = if let Some(asc_sorted) = precomputed {
+            // 快速路径：使用预计算的排序索引（始终升序）。
+            // 升序和降序都直接使用升序数组：
+            // - 升序归并从头读取（bi 从 0 开始）
+            // - 降序归并从尾读取（bi 从 len 开始），天然得到降序结果
+            asc_sorted.clone()
+        } else if cache_hit {
+            // 回退到旧的 SortedCache
             self.sorted_cache.as_ref().unwrap().sorted_base.clone()
         } else {
             // Slow path: 对 valid_indices 做全量排序并缓存。
-            // 之前使用 select_nth_unstable_by 做部分排序，导致 sorted_base 中超出
-            // 窗口的部分无序，后续 cache_hit 请求访问到这些位置时显示乱序。
             let sorted: Vec<u32> = match sort_by {
                 SortBy::Name | SortBy::Score => {
-                    // 使用 (name, file_id) 作为排序键，file_id 作为 tie-breaker
-                    // 保证与 delta_entries 的排序顺序完全一致，避免归并时相同名称
-                    // 的条目顺序跳变。
                     let mut entries: Vec<(&str, u32, u32)> = valid_indices
                         .par_iter()
                         .map(|&idx| {
@@ -677,9 +689,6 @@ impl SearchCache {
                     entries.into_iter().map(|(_, _, idx)| idx).collect()
                 }
                 SortBy::Path => {
-                    // 使用 (vol_name, path_ordinal, name, file_id) 作为排序键。
-                    // 跨卷场景下必须先把盘符纳入比较，否则不同卷的 ordinal 来自各
-                    // 自独立的 PathTable，直接比较没有意义。
                     let mut entries: Vec<(&str, u32, &str, u32, u32)> = valid_indices
                         .par_iter()
                         .map(|&idx| {
@@ -721,8 +730,6 @@ impl SearchCache {
                     entries.into_iter().map(|(_, _, _, _, idx)| idx).collect()
                 }
                 SortBy::Size => {
-                    // 使用 (size, file_id) 作为排序键，file_id 作为 tie-breaker
-                    // 与 delta_entries 的 Size 排序保持一致，避免同大小文件乱序。
                     let mut entries: Vec<(u64, u32, u32)> = valid_indices
                         .par_iter()
                         .map(|&idx| {
@@ -751,8 +758,6 @@ impl SearchCache {
                     entries.into_iter().map(|(_, _, idx)| idx).collect()
                 }
                 SortBy::ModifiedTime => {
-                    // 使用 (modified_time, file_id) 作为排序键，file_id 作为 tie-breaker
-                    // 与 delta_entries 的 ModifiedTime 排序保持一致。
                     let mut entries: Vec<(i32, u32, u32)> = valid_indices
                         .par_iter()
                         .map(|&idx| {
@@ -789,7 +794,6 @@ impl SearchCache {
                 base_matched_len: self.base.matched.len(),
                 valid_indices_matched_len: self.base.valid_indices_matched_len,
             });
-            // sorted 已移入 Arc，需从缓存重新取引用继续后续逻辑
             self.sorted_cache.as_ref().unwrap().sorted_base.clone()
         };
 
@@ -1348,9 +1352,15 @@ impl VolumeManager {
                 generation: 0,
             },
             sorted_cache: None,
-            active_base_count: None, // lazily computed on first get_sorted_slice call
-            base_file_ids: None,     // lazily built when needed for incremental tracking
+            active_base_count: None,
+            base_file_ids: None,
+            sorted_indices_map: std::collections::HashMap::new(),
         });
+
+        // 不预计算完整排序。改为在 get_sorted_slice 中按需计算。
+        // 初始显示只需前 50 条，通过 select_nth_unstable_by (O(n)) 快速获取，
+        // 而非对 221 万文件做全量排序 (O(n log n))。
+        // 完整排序在 SortedCache 中缓存，后续 get_records_range 调用复用。
 
         // Use get_sorted_slice for first_batch (handles base+delta merge)
         let (first_batch, total) = self.search_cache.as_mut().unwrap().get_sorted_slice(
@@ -1852,6 +1862,7 @@ fn apply_incremental_to_cache(
     cache.base.valid_indices = None;
     cache.base.valid_indices_matched_len = 0;
     cache.sorted_cache = None;
+    cache.sorted_indices_map.clear();
     cache.invalidate_base_count();
 
     cache.base.matched.len()
