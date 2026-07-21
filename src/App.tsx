@@ -214,8 +214,6 @@ function App() {
     if (existingKey) {
       const cached = rangeCacheRef.current.get(existingKey)!;
       const offset = parseInt(existingKey.split('-')[0]);
-      // 跳过：数据已在显示中，避免无意义 re-render 触发 onRangeChange 循环
-      if (offset === resultsOffset && cached.length === results.length) return;
       setResultsOffset(offset);
       setResults(cached);
       return;
@@ -236,8 +234,6 @@ function App() {
           const firstKey = rangeCacheRef.current.keys().next().value;
           if (firstKey) rangeCacheRef.current.delete(firstKey);
         }
-        // 跳过：数据已在显示中，避免无意义 re-render 触发 onRangeChange 循环
-        if (fetchStart === resultsOffset && response.results.length === results.length) return;
         setResultsOffset(fetchStart);
         setResults(response.results);
         if (response.total !== totalCountRef.current) {
