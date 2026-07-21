@@ -15,6 +15,7 @@ interface UseVirtualScrollReturn {
   endIndex: number;
   offsetY: number;
   spacerHeight: number;
+  effectiveItemHeight: number;
   visibleItems: number;
   scrollToIndex: (index: number) => void;
   resetScroll: () => void;
@@ -94,7 +95,8 @@ export function useVirtualScroll({
   }
   const endIndex = Math.min(startIndex + visibleCount, totalItems);
   // 取整避免 sub-pixel 定位导致行边缘抗锯齿重影
-  const offsetY = Math.round(clampedScrollTop);
+  // 用 effectiveItemHeight 保证和 spacer 槽位对齐
+  const offsetY = Math.round(clampedScrollTop - startIndex * effectiveItemHeight);
 
   const handleScroll = useCallback(() => {
     if (rafId.current !== null) {
@@ -140,11 +142,11 @@ export function useVirtualScroll({
 
   const scrollToIndex = useCallback((index: number) => {
     if (containerRef.current) {
-      containerRef.current.scrollTop = index * itemHeight;
+      containerRef.current.scrollTop = index * effectiveItemHeight;
       scrollTopRef.current = containerRef.current.scrollTop;
       setTick(t => t + 1);
     }
-  }, [containerRef, itemHeight]);
+  }, [containerRef, effectiveItemHeight]);
 
   const resetScroll = useCallback(() => {
     if (containerRef.current) {
@@ -159,6 +161,7 @@ export function useVirtualScroll({
     endIndex,
     offsetY,
     spacerHeight,
+    effectiveItemHeight,
     visibleItems: endIndex - startIndex,
     scrollToIndex,
     resetScroll,
