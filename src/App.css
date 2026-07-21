@@ -533,6 +533,7 @@ body {
   left: 0;
   right: 0;
   pointer-events: auto;
+  will-change: transform;
 }
 
 .empty-state {

@@ -87,7 +87,8 @@ export function useVirtualScroll({
     startIndex = 0;
   }
   const endIndex = Math.min(startIndex + visibleCount, totalItems);
-  const offsetY = clampedScrollTop;
+  // 取整避免 sub-pixel 定位导致行边缘抗锯齿重影
+  const offsetY = Math.round(clampedScrollTop);
 
   const handleScroll = useCallback(() => {
     if (rafId.current !== null) {
