@@ -198,7 +198,10 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
           {(() => {
             const dataEnd = resultsOffset + results.length;
             const renderEnd = Math.min(endIndex, dataEnd);
-            const renderLen = Math.max(0, renderEnd - startIndex);
+            const atBottom = endIndex >= totalCount;
+            const visibleInViewCount = endIndex - startIndex;
+            const minRenderLen = atBottom ? visibleInViewCount : 0;
+            const renderLen = Math.max(Math.max(0, renderEnd - startIndex), minRenderLen);
             return (
               <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)`, height: renderLen * ROW_HEIGHT }}>
                 {Array.from({ length: renderLen }, (_, i) => {

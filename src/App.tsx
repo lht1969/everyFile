@@ -390,7 +390,9 @@ function App() {
     if (rangeChangeTimerRef.current !== null) {
       clearTimeout(rangeChangeTimerRef.current);
     }
-    rangeChangeTimerRef.current = window.setTimeout(async () => {
+
+    const atBottom = end >= totalCountRef.current - 1;
+    const doFetch = async () => {
       // 拖动停止：只执行一次 fetch，等数据应用后再清 isDraggingRef。
       // 不再主动补 refresh fetch，避免同一位置两次 fetch 因 delta 变化返回不同结果导致乱序。
       // refresh 事件在拖动期间被暂存，此处 pending 仅用于清除缓存，让下一次正常刷新获取最新数据。
@@ -411,7 +413,19 @@ function App() {
       await fetchRecordsRangeRef.current(start, end);
       // fetch 完成（数据已应用到 UI）后才允许 refresh 事件立即处理
       isDraggingRef.current = false;
-    }, 100);
+    };
+
+    if (atBottom) {
+      // 到达底部时立即 fetch，且强制使正在进行的 fetch 失效：
+      // 拖动过程中中间位置的防抖 fetch 可能已触发后端调用（isFetchingRef=true），
+      // 此时底部的立即 fetch 会被 fetchRecordsRange 的 isFetchingRef 守卫静默跳过，
+      // 导致 results/resultsOffset 被中间位置的错误数据覆盖，底部 renderLen=0。
+      ++fetchCounterRef.current;
+      isFetchingRef.current = false;
+      doFetch();
+    } else {
+      rangeChangeTimerRef.current = window.setTimeout(doFetch, 100);
+    }
   }, [fetchRecordsRange]);
 
   const handleOpenFile = async (path: string) => {

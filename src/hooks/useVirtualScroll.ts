@@ -73,21 +73,29 @@ export function useVirtualScroll({
   // 钳制 scrollTop 到有效范围，防止浏览器滚动越界导致内容偏移
   const clampedScrollTop = Math.max(0, Math.min(scrollTop, maxScrollTop));
   const rawStartIndex = Math.floor(clampedScrollTop / effectiveItemHeight);
-  const visibleCount = Math.ceil(viewportHeight / itemHeight) + overscan;
-
-  const atBottom = totalItems > 0 && maxScrollTop > 0 && clampedScrollTop >= maxScrollTop - 1;
+  // visibleCount: 数据请求 / endIndex 范围，基于 effectiveItemHeight（滚动空间行高），
+  // 确保在缩放模式下 endIndex 能覆盖到 totalItems，否则尾部行会被截断。
+  const visibleCount = Math.ceil(viewportHeight / effectiveItemHeight) + overscan;
+  // visibleInView: 视口内实际能容纳的渲染行数（不含 overscan），基于 itemHeight
+  // （实际渲染行高 28px），用于底部 startIndex 钳制，避免溢出视口。
+  const visibleInView = Math.ceil(viewportHeight / itemHeight);
 
   // 当 totalItems 减小（文件被删除）且之前在底部时，强制保持在底部。
-  // 否则 maxScrollTop 减小后 scrollTop 被钳制，atBottom 失效，startIndex 跳变导致内容上移。
+  // 否则 maxScrollTop 减小后 scrollTop 被钳制，startIndex 跳变导致内容上移。
   const totalShrank = totalItems < prevTotalItemsRef.current;
   prevTotalItemsRef.current = totalItems;
+
+  const atBottom = totalItems > 0 && maxScrollTop > 0 && clampedScrollTop >= maxScrollTop - 1;
 
   let startIndex: number;
   if (totalItems > 0) {
     if (atBottom || (totalShrank && clampedScrollTop >= maxScrollTop - viewportHeight)) {
-      startIndex = Math.max(totalItems - visibleCount, 0);
+      // 底部时直接用 visibleInView 钳制，确保最后一行落在视口内。
+      // rawStartIndex 基于 effectiveItemHeight 可能远小于 totalItems - visibleInView（缩放模式），
+      // 不钳制的话 startIndex 过小，末尾行会溢出视口。
+      startIndex = Math.max(totalItems - visibleInView, 0);
     } else {
-      startIndex = Math.min(rawStartIndex, Math.max(totalItems - visibleCount, 0));
+      startIndex = Math.min(rawStartIndex, Math.max(totalItems - visibleInView, 0));
     }
   } else {
     startIndex = 0;
