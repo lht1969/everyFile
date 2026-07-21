@@ -64,9 +64,22 @@ function App() {
         return;
       }
 
-      // 同步更新总数，让滚动条高度反映最新数据量
-      if (typeof event.payload.total === 'number') {
-        setTotalCount(event.payload.total);
+      // 关键优化：检查变更文件是否在当前可见结果中
+      // 200万文件中只有20个可见，变更文件命中的概率极低（~0.001%），
+      // 大多数增量更新不需要刷新窗口。
+      // 必须在 setTotalCount 之前检查，否则 setTotalCount 会改变 totalItems，
+      // 导致 startIndex 偏移，触发 onRangeChange → 又一轮 fetch，形成循环。
+      const changed_fids = event.payload.changed_fids;
+      if (changed_fids && changed_fids.length > 0 && resultsRef.current.length > 0) {
+        const visibleFids = new Set(resultsRef.current.map(r => r.file_id));
+        const hasVisibleChange = changed_fids.some(fid => visibleFids.has(fid));
+        if (!hasVisibleChange) {
+          // 变更文件不在可见范围内，仅更新总数（不触发重排/重取）
+          if (typeof event.payload.total === 'number') {
+            setTotalCount(event.payload.total);
+          }
+          return;
+        }
       }
 
       // 拖动滑块时暂不出 delta 信息，记录 pending 待停止后刷新
@@ -75,17 +88,9 @@ function App() {
         return;
       }
 
-      // 关键优化：检查变更文件是否在当前可见结果中
-      // 200万文件中只有20个可见，变更文件命中的概率极低（~0.001%），
-      // 大多数增量更新不需要刷新窗口。
-      const changed_fids = event.payload.changed_fids;
-      if (changed_fids && changed_fids.length > 0 && results.length > 0) {
-        const visibleFids = new Set(results.map(r => r.file_id));
-        const hasVisibleChange = changed_fids.some(fid => visibleFids.has(fid));
-        if (!hasVisibleChange) {
-          // 变更文件不在可见范围内，跳过 fetch，仅更新总数
-          return;
-        }
+      // 同步更新总数，让滚动条高度反映最新数据量
+      if (typeof event.payload.total === 'number') {
+        setTotalCount(event.payload.total);
       }
 
       // 清除覆盖当前可见范围的缓存，并主动触发一次 fetch，让删除/修改/新增
@@ -179,7 +184,12 @@ function App() {
   const searchStateRef = useRef(searchState);
   searchStateRef.current = searchState;
 
+  const resultsRef = useRef(results);
+  resultsRef.current = results;
+
   const fetchCounterRef = useRef(0);
+  const totalCountRef = useRef(0);
+  totalCountRef.current = totalCount;
   const visibleRangeRef = useRef({ start: 0, end: 50 });
   const rangeCacheRef = useRef<Map<string, SearchResult[]>>(new Map());
   const rangeChangeTimerRef = useRef<number | null>(null);
@@ -204,6 +214,8 @@ function App() {
     if (existingKey) {
       const cached = rangeCacheRef.current.get(existingKey)!;
       const offset = parseInt(existingKey.split('-')[0]);
+      // 跳过：数据已在显示中，避免无意义 re-render 触发 onRangeChange 循环
+      if (offset === resultsOffset && cached.length === results.length) return;
       setResultsOffset(offset);
       setResults(cached);
       return;
@@ -224,9 +236,11 @@ function App() {
           const firstKey = rangeCacheRef.current.keys().next().value;
           if (firstKey) rangeCacheRef.current.delete(firstKey);
         }
+        // 跳过：数据已在显示中，避免无意义 re-render 触发 onRangeChange 循环
+        if (fetchStart === resultsOffset && response.results.length === results.length) return;
         setResultsOffset(fetchStart);
         setResults(response.results);
-        if (response.total !== totalCount) {
+        if (response.total !== totalCountRef.current) {
           setTotalCount(response.total);
         }
         console.log('[FETCH] start=', start, 'ms=', (performance.now() - reqStart).toFixed(0), 'first=', response.results[0]?.name, 'last=', response.results[response.results.length - 1]?.name);
@@ -241,7 +255,7 @@ function App() {
     } finally {
       isFetchingRef.current = false;
     }
-  }, [totalCount]);
+  }, []);
 
   const searchCounterRef = useRef(0);
   // 排序操作专用计数器：仅 handleSearch 和新的 handleSortChange 会递增，
