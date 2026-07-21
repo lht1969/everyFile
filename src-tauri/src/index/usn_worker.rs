@@ -262,7 +262,7 @@ fn read_usn_records_direct(
 fn resolve_path_from_batch(
     fid: u64,
     parent_map: &std::collections::HashMap<u64, u64>,
-    name_map: &std::collections::HashMap<u64, &std::ffi::OsString>,
+    name_map: &std::collections::HashMap<u64, std::ffi::OsString>,
     drive_letter: char,
 ) -> Option<std::path::PathBuf> {
     let mut components: Vec<&std::ffi::OsString> = Vec::with_capacity(8);
@@ -384,17 +384,34 @@ pub fn spawn_usn_worker(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnRespons
         .expect("failed to spawn USN worker thread");
 }
 
+/// 将各卷 last_usn 持久化到 SQLite
+fn save_usn_state(last_usn_map: &HashMap<char, i64>) {
+    if last_usn_map.is_empty() {
+        return;
+    }
+    let mut state = UsnState::default();
+    for (&dl, &usn) in last_usn_map.iter() {
+        state
+            .volumes
+            .insert(dl.to_string(), VolumeState { last_usn: usn });
+    }
+    state.save();
+}
+
 fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
     let mut volumes: HashMap<char, Volume> = HashMap::new();
     let mut last_usn_map: HashMap<char, i64> = HashMap::new();
     let mut last_save_time = std::time::Instant::now();
-    let save_interval = std::time::Duration::from_secs(30);
+    // last_usn 持久化间隔：1 小时。USN 进度丢失 1 小时内的变更通常可接受，
+    // 下次启动时 journal 会从头读取或回退到全量扫描。
+    let save_interval = std::time::Duration::from_secs(3600);
+    // 复用 USN batch 路径解析缓冲区，避免每次轮询都重新分配 HashMap
+    let mut batch_parent_buf: std::collections::HashMap<u64, u64> =
+        std::collections::HashMap::new();
+    let mut batch_name_buf: std::collections::HashMap<u64, std::ffi::OsString> =
+        std::collections::HashMap::new();
 
     loop {
-        log::info!(
-            "[USN] Worker loop waiting for command, volumes stored: {:?}",
-            volumes.keys().collect::<Vec<_>>()
-        );
         match cmd_rx.recv() {
             Ok(UsnCommand::FullScan {
                 drive_letter,
@@ -424,9 +441,14 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
                     &mut last_save_time,
                     save_interval,
                     &resp_tx,
+                    &mut batch_parent_buf,
+                    &mut batch_name_buf,
                 );
             }
             Ok(UsnCommand::Shutdown) | Err(_) => {
+                // 关闭前立即持久化 last_usn，避免 1 小时间隔内崩溃/退出导致进度回退
+                save_usn_state(&last_usn_map);
+                log::info!("[USN] Worker shutdown, last_usn saved");
                 break;
             }
         }
@@ -1210,8 +1232,10 @@ fn handle_poll_changes(
     last_save_time: &mut std::time::Instant,
     save_interval: std::time::Duration,
     resp_tx: &Sender<UsnResponse>,
+    batch_parent_buf: &mut std::collections::HashMap<u64, u64>,
+    batch_name_buf: &mut std::collections::HashMap<u64, std::ffi::OsString>,
 ) {
-    log::info!(
+    log::debug!(
         "[USN] handle_poll_changes entered for drive {}",
         drive_letter
     );
@@ -1276,7 +1300,7 @@ fn handle_poll_changes(
         return;
     }
 
-    log::info!(
+    log::debug!(
         "[USN] Poll {}: start_usn={}, next_usn={}, using start={}",
         drive_letter,
         effective_last_usn,
@@ -1311,12 +1335,30 @@ fn handle_poll_changes(
             }
         };
 
+    // new_last_usn 使用 API 返回的 next_start_usn，这是有效的记录边界
+    let new_last_usn = next_start_usn;
+
+    // 空轮询时无需创建 resolver/mft_reader/HashMap，直接更新 last_usn 后返回
+    if records.is_empty() {
+        if new_last_usn > effective_last_usn {
+            last_usn_map.insert(drive_letter, new_last_usn);
+            let now = std::time::Instant::now();
+            if now.duration_since(*last_save_time) >= save_interval {
+                save_usn_state(last_usn_map);
+                *last_save_time = now;
+            }
+        }
+        log::debug!(
+            "[USN] Poll {}: empty record batch, skipped processing",
+            drive_letter
+        );
+        return;
+    }
+
     let mut resolver = volume.path_resolver_with_cache();
     let mut added: Vec<SearchResult> = Vec::new();
     let mut removed: Vec<(u64, String)> = Vec::new();
     let mut updated: Vec<(u64, SearchResult)> = Vec::new();
-    // new_last_usn 使用 API 返回的 next_start_usn，这是有效的记录边界
-    let new_last_usn = next_start_usn;
 
     const USN_REASON_FILE_CREATE: u32 = 0x100;
     const USN_REASON_FILE_DELETE: u32 = 0x200;
@@ -1331,13 +1373,12 @@ fn handle_poll_changes(
     // Build a parent map from this batch of USN records for fallback path resolution.
     // When usn-journal-rs's resolver can't find a parent (e.g. newly created files),
     // we can walk the parent chain using this map.
-    let mut batch_parent_map: std::collections::HashMap<u64, u64> =
-        std::collections::HashMap::new();
-    let mut batch_name_map: std::collections::HashMap<u64, &std::ffi::OsString> =
-        std::collections::HashMap::new();
+    // 复用 worker_loop 中的缓冲区，避免每次轮询都重新分配 HashMap
+    batch_parent_buf.clear();
+    batch_name_buf.clear();
     for rec in &records {
-        batch_parent_map.insert(rec.fid, rec.parent_fid);
-        batch_name_map.insert(rec.fid, &rec.file_name);
+        batch_parent_buf.insert(rec.fid, rec.parent_fid);
+        batch_name_buf.insert(rec.fid, rec.file_name.clone());
     }
 
     // 复用 volume handle 用于元数据查询
@@ -1364,8 +1405,8 @@ fn handle_poll_changes(
                     None => {
                         match resolve_path_from_batch(
                             fid,
-                            &batch_parent_map,
-                            &batch_name_map,
+                            batch_parent_buf,
+                            batch_name_buf,
                             drive_letter,
                         ) {
                             Some(p) => p.to_string_lossy().to_string(),
@@ -1404,8 +1445,8 @@ fn handle_poll_changes(
                     // Fallback: build path from batch parent map
                     match resolve_path_from_batch(
                         fid,
-                        &batch_parent_map,
-                        &batch_name_map,
+                        batch_parent_buf,
+                        batch_name_buf,
                         drive_letter,
                     ) {
                         Some(p) => p,
@@ -1474,8 +1515,8 @@ fn handle_poll_changes(
                     // Fallback: build path from batch parent map
                     match resolve_path_from_batch(
                         fid,
-                        &batch_parent_map,
-                        &batch_name_map,
+                        batch_parent_buf,
+                        batch_name_buf,
                         drive_letter,
                     ) {
                         Some(p) => p,
@@ -1527,26 +1568,20 @@ fn handle_poll_changes(
         new_last_usn
     );
 
-    // 仅当 new_last_usn 有进展时更新持久化状态，且距上次保存超过 30 秒
+    // 仅当 new_last_usn 有进展时更新持久化状态，且距上次保存超过 1 小时
     if new_last_usn > effective_last_usn {
         last_usn_map.insert(drive_letter, new_last_usn);
 
         let now = std::time::Instant::now();
         if now.duration_since(*last_save_time) >= save_interval {
-            let mut state = UsnState::default();
-            for (&dl, &usn) in last_usn_map.iter() {
-                state
-                    .volumes
-                    .insert(dl.to_string(), VolumeState { last_usn: usn });
-            }
-            state.save();
+            save_usn_state(last_usn_map);
             *last_save_time = now;
         }
     }
 
     // 仅当有实际变更时才发送结果，避免触发无意义的缓存更新和前端刷新
     if added.is_empty() && removed.is_empty() && updated.is_empty() {
-        log::info!(
+        log::debug!(
             "[USN] Poll {}: no relevant changes after filtering, skipping notification",
             drive_letter
         );

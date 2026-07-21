@@ -287,6 +287,15 @@ impl PathTable {
     pub fn is_empty(&self) -> bool {
         self.entries.len() <= 1
     }
+
+    /// 粗略估算 PathTable 占用的内存字节数（含 entries 和 path_to_id）。
+    pub fn memory_estimate(&self) -> usize {
+        let entries_bytes = self.entries.capacity() * std::mem::size_of::<PathEntry>();
+        let path_to_id_bytes = self.path_to_id.len()
+            * (std::mem::size_of::<CompactString>() + std::mem::size_of::<u32>())
+            * 2;
+        entries_bytes + path_to_id_bytes
+    }
 }
 
 impl Default for PathTable {

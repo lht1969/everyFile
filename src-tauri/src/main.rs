@@ -434,10 +434,16 @@ fn main() {
                                             updated.len(),
                                             removed.len()
                                         );
-                                        // 在 move 前记录变化数量，用于 records-refresh payload
+                                        // 在 move 前记录变化数量和文件 ID，用于 records-refresh payload
                                         let refresh_added = added.len();
                                         let refresh_updated = updated.len();
                                         let refresh_removed = removed.len();
+                                        // 收集变更文件的 file_id，供前端判断是否在可见范围内
+                                        let changed_fids: Vec<u32> = added.iter()
+                                            .map(|r| r.file_id)
+                                            .chain(removed.iter().map(|(fid, _)| *fid as u32))
+                                            .chain(updated.iter().map(|(fid, _)| *fid as u32))
+                                            .collect();
 
                                         let t_handler = std::time::Instant::now();
                                         let mut vm = rt_handle.block_on(vm_for_handler.lock());
@@ -449,9 +455,9 @@ fn main() {
                                             updated,
                                         );
                                         let new_total = vm.get_file_count(&drive_string);
-                                        // 通知前端刷新当前可见范围（文件已删除/修改/新增）
-                                        // payload 携带变化数量和当前搜索总条目数，便于前端同步滚动条高度
-                                        let search_total = vm.current_search_total();
+                                        // 不在 records-refresh 中发送 total：current_search_total() 是 O(n) 扫描，
+                                        // 对 200 万文件耗时显著。前端保持旧 totalCount 即可，
+                                        // 少量文件增减对滚动条高度的影响不可见。
                                         drop(vm);
                                         log::debug!(
                                             "[USN] Incremental {}: applied in {:?}, total {}→{}",
@@ -477,7 +483,7 @@ fn main() {
                                                 "added": refresh_added,
                                                 "updated": refresh_updated,
                                                 "removed": refresh_removed,
-                                                "total": search_total,
+                                                "changed_fids": changed_fids,
                                             }),
                                         );
                                     }
@@ -654,11 +660,21 @@ fn main() {
                             .map(|c| c.index_settings.include_system_files)
                             .unwrap_or(false);
 
-                        // 先获取卷列表（短暂持锁）
-                        let volumes_list = {
-                            let vm = vm_clone.lock().await;
-                            vm.volumes()
+                        // 先获取卷列表（短暂持锁），并检查是否有需要 walkdir 扫描的非 USN 卷
+                        let (volumes_list, has_non_usn) = {
+                            let mut vm = vm_clone.lock().await;
+                            let volumes_list = vm.volumes();
+                            let has_non_usn = volumes_list.iter().any(|dl| {
+                                vm.get_monitor_mut(dl).map(|m| !m.use_usn).unwrap_or(false)
+                            });
+                            (volumes_list, has_non_usn)
                         };
+
+                        if !has_non_usn {
+                            // 全部为 USN 卷，由 USN 轮询任务处理；本任务长睡眠避免空转
+                            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                            continue;
+                        }
 
                         for drive_letter in volumes_list {
                             // 如果有搜索请求，跳过剩余卷的扫描
@@ -749,7 +765,7 @@ fn main() {
                     }
                 });
 
-                // 启动定期合并任务：每 10 分钟检查 delta 大小，超过 1 万条时触发 merge
+                // 启动定期合并任务：每 10 分钟检查 delta 大小，超过 1 万条或 50MB 时触发 merge
                 let vm_clone_merge = vm.clone();
                 tauri::async_runtime::spawn(async move {
                     // 等待全量扫描完成后再启动合并任务
@@ -760,19 +776,50 @@ fn main() {
                         // 首次检查前等待 10 分钟
                         tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
 
-                        let delta_count = {
+                        let (delta_count, delta_memory) = {
                             let vm = vm_clone_merge.lock().await;
-                            vm.delta_count()
+                            (vm.delta_count(), vm.delta_memory_bytes())
                         };
+                        const DELTA_MEMORY_THRESHOLD: usize = 50 * 1024 * 1024; // 50 MB
 
-                        if delta_count > 10_000 {
+                        if delta_count > 10_000 || delta_memory > DELTA_MEMORY_THRESHOLD {
                             log::info!(
-                                "[Merge] Delta has {} entries, triggering merge",
-                                delta_count
+                                "[Merge] Delta has {} entries / ~{} MB, triggering merge",
+                                delta_count,
+                                delta_memory / 1024 / 1024
                             );
                             let mut vm = vm_clone_merge.lock().await;
                             vm.merge_if_needed();
                         }
+                    }
+                });
+
+                // 启动定期内存统计任务：每 5 分钟记录一次核心数据结构占用，便于排查内存波动
+                let vm_clone_stats = vm.clone();
+                tauri::async_runtime::spawn(async move {
+                    // 等待全量扫描完成后再开始记录，避免扫描中数字剧烈变化
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    log::info!("[Memory] Periodic memory stats task started");
+
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+
+                        let (files_bytes, path_table_bytes, fid_index_bytes, delta_bytes) = {
+                            let vm = vm_clone_stats.lock().await;
+                            vm.memory_stats()
+                        };
+                        let total_mb =
+                            (files_bytes + path_table_bytes + fid_index_bytes + delta_bytes)
+                                / 1024
+                                / 1024;
+                        log::info!(
+                            "[Memory] files={} MB, path_table={} MB, fid_index={} MB, delta={} MB, total={} MB",
+                            files_bytes / 1024 / 1024,
+                            path_table_bytes / 1024 / 1024,
+                            fid_index_bytes / 1024 / 1024,
+                            delta_bytes / 1024 / 1024,
+                            total_mb
+                        );
                     }
                 });
             });

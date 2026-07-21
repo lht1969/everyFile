@@ -53,7 +53,9 @@ function App() {
 
     // 增量更新后刷新当前可见范围（文件删除/修改/新增时立即更新显示）
     // 仅清除覆盖当前可见范围的缓存条目，保留其他范围的缓存避免不必要的重新拉取
-    const unlistenRefresh = listen<{ added?: number; updated?: number; removed?: number; total?: number }>('records-refresh', async (event) => {
+    // 关键优化：检查变更文件是否在当前可见范围内，如果不在则跳过 fetch，
+    // 避免 200 万文件中极少数变更触发不必要的排序和数据传输。
+    const unlistenRefresh = listen<{ added?: number; updated?: number; removed?: number; total?: number; changed_fids?: number[] }>('records-refresh', async (event) => {
       const added = event.payload.added ?? 0;
       const updated = event.payload.updated ?? 0;
       const removed = event.payload.removed ?? 0;
@@ -71,6 +73,19 @@ function App() {
       if (isDraggingRef.current) {
         pendingRefreshRef.current = true;
         return;
+      }
+
+      // 关键优化：检查变更文件是否在当前可见结果中
+      // 200万文件中只有20个可见，变更文件命中的概率极低（~0.001%），
+      // 大多数增量更新不需要刷新窗口。
+      const changed_fids = event.payload.changed_fids;
+      if (changed_fids && changed_fids.length > 0 && results.length > 0) {
+        const visibleFids = new Set(results.map(r => r.file_id));
+        const hasVisibleChange = changed_fids.some(fid => visibleFids.has(fid));
+        if (!hasVisibleChange) {
+          // 变更文件不在可见范围内，跳过 fetch，仅更新总数
+          return;
+        }
       }
 
       // 清除覆盖当前可见范围的缓存，并主动触发一次 fetch，让删除/修改/新增
@@ -104,11 +119,11 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // 扫描中需要及时反馈进度，保持 5 秒；空闲时只需偶尔同步状态，60 秒足够
+    const intervalMs = indexStatus.status === 'scanning' ? 5000 : 60000;
     const interval = setInterval(() => {
-      if (indexStatus.status === 'scanning') {
-        loadIndexStatus();
-      }
-    }, 5000);
+      loadIndexStatus();
+    }, intervalMs);
     return () => clearInterval(interval);
   }, [indexStatus.status]);
 
@@ -172,7 +187,7 @@ function App() {
   const isDraggingRef = useRef(false);
   // 拖动期间有 pending 的 records-refresh，停止拖动后刷新前后 50 行
   const pendingRefreshRef = useRef(false);
-  const FETCH_SIZE = 500;
+  const FETCH_SIZE = 200;
   const isFetchingRef = useRef(false);
 
   const fetchRecordsRange = useCallback(async (start: number, _end: number) => {
@@ -205,7 +220,7 @@ function App() {
         sortStateRef.current.field === sortSnapshot.field &&
         sortStateRef.current.direction === sortSnapshot.direction) {
         rangeCacheRef.current.set(cacheKey, response.results);
-        if (rangeCacheRef.current.size > 5) {
+        if (rangeCacheRef.current.size > 3) {
           const firstKey = rangeCacheRef.current.keys().next().value;
           if (firstKey) rangeCacheRef.current.delete(firstKey);
         }

@@ -104,10 +104,16 @@ pub struct DeltaCache {
 ///
 /// 注意：sorted_base 中的值是 base.matched 的索引，因此必须确保
 /// 缓存创建时的 base.matched 长度与当前一致，否则索引可能越界。
+///
+/// sorted_base 仅依赖 base.matched（基础数据），不依赖 delta。
+/// delta 变化由 merge 循环的 is_base_active lazy skip 处理，
+/// 因此 sorted_base 可以跨 delta 变化复用，无需因 delta 变化而重建。
 struct SortedCache {
     sort_by: SortBy,
     sort_direction: SortDirection,
-    sorted_base: Vec<u32>,
+    /// 使用 Arc 共享排序后的 base 索引，避免每次请求都 clone 整个 Vec。
+    /// 对于 221 万文件，Vec<u32> 约 8.8MB，clone 会频繁触发内存分配与波动。
+    sorted_base: std::sync::Arc<Vec<u32>>,
     /// 缓存创建时 base.matched 的长度，用于验证缓存有效性
     /// 防止 base.matched 长度变化后缓存索引越界
     base_matched_len: usize,
@@ -125,6 +131,13 @@ pub struct SearchCache {
     pub base: BaseCache,
     pub delta: DeltaCache,
     sorted_cache: Option<SortedCache>,
+    /// 增量维护的 base 有效条目数（未被 delta.deleted_ids/modified 隐藏的条目数）。
+    /// 避免每次 get_sorted_slice 都对 221 万 valid_indices 做 O(n) 全量扫描。
+    /// None 表示需要从头计算（首次调用、merge 后、base.matched 变化后）。
+    active_base_count: Option<usize>,
+    /// base 中所有文件的 file_id 排序列表，用于 O(log n) 二分查找。
+    /// 延迟构建：首次需要维护 active_base_count 时构建。
+    base_file_ids: Option<Vec<u32>>,
 }
 
 impl SearchCache {
@@ -134,6 +147,136 @@ impl SearchCache {
 
     pub fn refresh(&mut self) {
         self.created_at = Instant::now();
+    }
+
+    /// 确保 base_file_ids 已构建。返回 true 表示可用。
+    fn ensure_base_file_ids(
+        &mut self,
+        volumes: &HashMap<String, VolumeMonitor>,
+        vol_names: &[String],
+    ) -> bool {
+        if self.base_file_ids.is_some() {
+            return true;
+        }
+        if self.base.valid_indices_matched_len != self.base.matched.len() {
+            return false;
+        }
+        let mut fids: Vec<u32> = Vec::with_capacity(self.base.matched.len());
+        for &(vol, file_idx) in &self.base.matched {
+            let vi = vol as usize;
+            if let Some(vol_name) = vol_names.get(vi) {
+                if let Some(m) = volumes.get(vol_name) {
+                    if (file_idx as usize) < m.files.len() {
+                        fids.push(m.files[file_idx as usize].file_id);
+                    }
+                }
+            }
+        }
+        fids.sort_unstable();
+        fids.dedup();
+        self.base_file_ids = Some(fids);
+        true
+    }
+
+    /// O(log n) 检查 file_id 是否在 base 中
+    fn is_fid_in_base(&self, fid: u32) -> bool {
+        self.base_file_ids
+            .as_ref()
+            .map_or(false, |ids| ids.binary_search(&fid).is_ok())
+    }
+
+    /// 计算并缓存 active_base_count（首次调用时 O(n)，后续增量维护）
+    fn ensure_active_base_count(
+        &mut self,
+        volumes: &HashMap<String, VolumeMonitor>,
+        vol_names: &[String],
+    ) {
+        if self.active_base_count.is_some() {
+            return;
+        }
+        if self.base.valid_indices_matched_len != self.base.matched.len() {
+            // valid_indices 失效，需要从 matched 直接计算
+            let count = self
+                .base
+                .matched
+                .iter()
+                .filter(|&&(vol, file_idx)| {
+                    let Some(vol_name) = vol_names.get(vol as usize) else {
+                        return false;
+                    };
+                    if let Some(m) = volumes.get(vol_name) {
+                        if let Some(f) = m.files.get(file_idx as usize) {
+                            return !self.delta.deleted_ids.contains(&f.file_id)
+                                && !self.delta.modified.contains_key(&f.file_id);
+                        }
+                    }
+                    false
+                })
+                .count();
+            self.active_base_count = Some(count);
+            return;
+        }
+        if let Some(ref valid_indices) = self.base.valid_indices {
+            let count = valid_indices
+                .iter()
+                .filter(|&&idx| {
+                    let Some(&(vol, file_idx)) = self.base.matched.get(idx as usize) else {
+                        return false;
+                    };
+                    let Some(vol_name) = vol_names.get(vol as usize) else {
+                        return false;
+                    };
+                    if let Some(m) = volumes.get(vol_name) {
+                        if let Some(f) = m.files.get(file_idx as usize) {
+                            return !self.delta.deleted_ids.contains(&f.file_id)
+                                && !self.delta.modified.contains_key(&f.file_id);
+                        }
+                    }
+                    false
+                })
+                .count();
+            self.active_base_count = Some(count);
+        } else {
+            self.active_base_count = Some(0);
+        }
+    }
+
+    /// 增量更新 active_base_count：当 fid 被添加到 delta.deleted_ids 或 delta.modified 时调用。
+    /// 如果该 fid 在 base 中且之前未被隐藏，则 active_base_count -= 1。
+    fn on_base_entry_hidden(&mut self, fid: u32) {
+        if self.active_base_count.is_none() {
+            return;
+        }
+        let in_base = self.is_fid_in_base(fid);
+        let already_hidden =
+            self.delta.deleted_ids.contains(&fid) || self.delta.modified.contains_key(&fid);
+        if in_base && !already_hidden {
+            if let Some(ref mut count) = self.active_base_count {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// 增量更新 active_base_count：当 fid 从 delta.deleted_ids 或 delta.modified 中移除时调用。
+    /// 如果该 fid 在 base 中且不再被任何 delta 隐藏，则 active_base_count += 1。
+    fn on_base_entry_unhidden(&mut self, fid: u32) {
+        if self.active_base_count.is_none() {
+            return;
+        }
+        let in_base = self.is_fid_in_base(fid);
+        let still_hidden =
+            self.delta.deleted_ids.contains(&fid) || self.delta.modified.contains_key(&fid);
+        if in_base && !still_hidden {
+            if let Some(ref mut count) = self.active_base_count {
+                *count += 1;
+            }
+        }
+    }
+
+    /// 使 active_base_count 和 base_file_ids 失效（base.matched 变化后调用）
+    fn invalidate_base_count(&mut self) {
+        self.active_base_count = None;
+        self.base_file_ids = None;
     }
 
     /// Merge delta into base. Called periodically.
@@ -243,6 +386,8 @@ impl SearchCache {
         self.delta.modified.clear();
         self.delta.matched.clear();
         self.delta.generation += 1;
+        // merge 后 delta 为空，generation 已递增；排序缓存会因 base_matched_len
+        // 变化而失效，此处无需额外处理。
         self.sorted_cache = None;
 
         // Rebuild base matched from scratch
@@ -267,6 +412,8 @@ impl SearchCache {
         // Invalidate base valid_indices (will be rebuilt lazily)
         self.base.valid_indices = None;
         self.base.valid_indices_matched_len = 0;
+        // 失效增量维护的 base count（base.matched 已重建）
+        self.invalidate_base_count();
 
         log::info!(
             "merge_delta_to_base: done in {:?}, base={} entries",
@@ -297,11 +444,11 @@ impl SearchCache {
             self.delta.modified.len()
         );
 
-        // Snapshot delta.new_files to avoid inconsistency if it's modified during this call
-        let delta_files: Vec<(u8, FileEntry)> = self.delta.new_files.clone();
-        let delta_deleted = self.delta.deleted_ids.clone();
-        let delta_renamed = self.delta.renamed_fids.clone();
-        let delta_modified = self.delta.modified.clone();
+        // Snapshot delta to avoid inconsistency if it's modified during this call.
+        // We iterate over self.delta fields directly instead of cloning,
+        // saving ~50MB+ allocation per call for large deltas.
+        // The is_base_active closure and merge loop also reference self.delta directly.
+        // This is safe because self is not mutably borrowed when they run.
 
         // Build valid_indices if needed (unsorted list of valid indices into matched)
         // 验证 valid_indices 的有效性：必须与当前 matched.len() 一致
@@ -317,6 +464,18 @@ impl SearchCache {
             self.base.valid_indices_matched_len = self.base.matched.len();
         }
 
+        // 提前计算 base_n（需要 &mut self），必须在 valid_indices 借用之前完成
+        let base_n = if self.delta.deleted_ids.is_empty() && self.delta.modified.is_empty() {
+            if self.base.valid_indices_matched_len == self.base.matched.len() {
+                self.base.valid_indices.as_ref().map_or(0, |v| v.len())
+            } else {
+                self.base.matched.len()
+            }
+        } else {
+            self.ensure_active_base_count(volumes, vol_names);
+            self.active_base_count.unwrap_or(0)
+        };
+
         // `sorted_base` 将基于未过滤的 valid_indices 构建，deleted/modified 的过滤
         // 推迟到归并阶段按需跳过，避免每次请求都扫描整个 base。
         let valid_indices = match self.base.valid_indices {
@@ -324,7 +483,7 @@ impl SearchCache {
             None => return (Vec::new(), 0),
         };
 
-        // Build sorted delta entries directly from delta_files
+        // Build sorted delta entries directly from self.delta.new_files
         // No index indirection - sort (index, key) tuples directly
         let query = if self.query.trim().is_empty() {
             None
@@ -335,8 +494,8 @@ impl SearchCache {
         // delta_entries: (&FileEntry, vol_idx, path_ordinal)
         // 直接持有 FileEntry 引用，避免中间索引转换
         let mut delta_entries: Vec<(&FileEntry, u8, u32)> = Vec::new();
-        for (vol, f) in &delta_files {
-            if delta_deleted.contains(&f.file_id) && !delta_renamed.contains(&f.file_id) {
+        for (vol, f) in &self.delta.new_files {
+            if self.delta.deleted_ids.contains(&f.file_id) && !self.delta.renamed_fids.contains(&f.file_id) {
                 continue;
             }
             // 安全访问 vol_names，越界时跳过
@@ -368,10 +527,10 @@ impl SearchCache {
             delta_entries.push((f, *vol, ordinal));
         }
         // 加入 delta.modified 的新值：modified 的旧值在 cache_hit 复用时从 base 过滤，新值在此参与排序归并
-        // 注意：必须过滤 delta_deleted，避免"先 modified 后 deleted"场景下已删除文件出现
+        // 注意：必须过滤 self.delta.deleted_ids，避免"先 modified 后 deleted"场景下已删除文件出现
         //       （apply_incremental_usn 的 Phase 2 不会从 delta.modified 移除 deleted 的 fid）
-        for (vol, f) in delta_modified.values() {
-            if delta_deleted.contains(&f.file_id) {
+        for (vol, f) in self.delta.modified.values() {
+            if self.delta.deleted_ids.contains(&f.file_id) {
                 continue;
             }
             // 安全访问 vol_names，越界时跳过
@@ -461,9 +620,10 @@ impl SearchCache {
             .map(|i| volumes.get(&vol_names[i]).map(|v| &v.path_table))
             .collect();
 
-        // cache_hit 检查：只要排序字段/方向与 base.matched 长度未变即可复用。
+        // cache_hit 检查：排序字段/方向、base.matched 长度、valid_indices 长度
+        // 均未变化时复用 sorted_base。
         // sorted_base 保存的是未过滤的 valid_indices 全排序结果，delta 变化时
-        // 在归并阶段 lazy skip 即可。
+        // 在归并阶段 lazy skip 即可（is_base_active），无需因 delta 变化而重建。
         let cache_hit = self.sorted_cache.as_ref().is_some_and(|sc| {
             sc.sort_by == sort_by
                 && sc.sort_direction == sort_direction
@@ -471,12 +631,14 @@ impl SearchCache {
                 && sc.valid_indices_matched_len == self.base.valid_indices_matched_len
         });
         log::info!(
-            "[SORT] cache_hit={} valid_indices_len={}",
+            "[SORT] cache_hit={} valid_indices_len={} delta_gen={}",
             cache_hit,
-            valid_indices.len()
+            valid_indices.len(),
+            self.delta.generation
         );
 
-        let sorted_base: Vec<u32> = if cache_hit {
+        let sorted_base: std::sync::Arc<Vec<u32>> = if cache_hit {
+            // Arc 克隆只增加引用计数，不分配新内存，避免大 Vec 复制。
             self.sorted_cache.as_ref().unwrap().sorted_base.clone()
         } else {
             // Slow path: 对 valid_indices 做全量排序并缓存。
@@ -623,11 +785,12 @@ impl SearchCache {
             self.sorted_cache = Some(SortedCache {
                 sort_by,
                 sort_direction,
-                sorted_base: sorted.clone(),
+                sorted_base: std::sync::Arc::new(sorted),
                 base_matched_len: self.base.matched.len(),
                 valid_indices_matched_len: self.base.valid_indices_matched_len,
             });
-            sorted
+            // sorted 已移入 Arc，需从缓存重新取引用继续后续逻辑
+            self.sorted_cache.as_ref().unwrap().sorted_base.clone()
         };
 
         // 判断 sorted_base 中某个 matched 索引当前是否仍然可显示（未被 delta
@@ -642,66 +805,15 @@ impl SearchCache {
             };
             if let Some(m) = volumes.get(vol_name) {
                 if let Some(f) = m.files.get(file_idx as usize) {
-                    return !delta_deleted.contains(&f.file_id)
-                        && !delta_modified.contains_key(&f.file_id);
+                    return !self.delta.deleted_ids.contains(&f.file_id)
+                        && !self.delta.modified.contains_key(&f.file_id);
                 }
             }
             false
         };
 
         // 计算实际可显示总数 total_n = base_n + delta_n。
-        // 不再缓存 total_n，避免缓存值与实际可显示条目数不一致导致滚动条高度
-        // 错误或底部空白。base_n 在 sorted_base 已缓存时可直接通过 lazy skip
-        // 统计，避免重复 O(n) 过滤。
-        let base_n = if cache_hit {
-            // sorted_base 已确认基于当前 valid_indices，直接统计其中仍有效的条目
-            sorted_base
-                .iter()
-                .filter(|&&idx| is_base_active(idx))
-                .count()
-        } else if self.base.valid_indices_matched_len == self.base.matched.len() {
-            if let Some(ref valid_indices) = self.base.valid_indices {
-                valid_indices
-                    .iter()
-                    .filter(|&&idx| {
-                        let Some(&(vol, file_idx)) = self.base.matched.get(idx as usize) else {
-                            return false;
-                        };
-                        let Some(vol_name) = vol_names.get(vol as usize) else {
-                            return false;
-                        };
-                        if let Some(m) = volumes.get(vol_name) {
-                            if let Some(f) = m.files.get(file_idx as usize) {
-                                return !delta_deleted.contains(&f.file_id)
-                                    && !delta_modified.contains_key(&f.file_id);
-                            }
-                        }
-                        false
-                    })
-                    .count()
-            } else {
-                0
-            }
-        } else {
-            // valid_indices 失效或未构建，直接从 base.matched 过滤计算
-            self.base
-                .matched
-                .iter()
-                .filter(|&&(vol, file_idx)| {
-                    let Some(vol_name) = vol_names.get(vol as usize) else {
-                        return false;
-                    };
-                    if let Some(m) = volumes.get(vol_name) {
-                        if let Some(f) = m.files.get(file_idx as usize) {
-                            return !delta_deleted.contains(&f.file_id)
-                                && !delta_modified.contains_key(&f.file_id);
-                        }
-                    }
-                    false
-                })
-                .count()
-        };
-
+        // base_n 已在 delta_entries 构建前提前计算（增量维护），避免 O(n) 全量扫描。
         let total_n = base_n + delta_n;
         log::debug!(
             "[SORT] total_n={} delta_n={} base_n={}",
@@ -1107,127 +1219,6 @@ impl VolumeManager {
     /// 当前搜索实际可显示的总条目数，用于前端同步滚动条高度。
     /// 每次调用都重新计算，避免缓存值与实际可显示条目数不一致导致滚动条
     /// 高度错误或底部空白。
-    pub fn current_search_total(&mut self) -> usize {
-        let Some(cache) = self.search_cache.as_mut() else {
-            return self.total_file_count();
-        };
-
-        // 重新计算实际可显示总数
-        let delta_deleted = cache.delta.deleted_ids.clone();
-        let delta_renamed = cache.delta.renamed_fids.clone();
-        let delta_modified = cache.delta.modified.clone();
-
-        let query = if cache.query.trim().is_empty() {
-            None
-        } else {
-            Some(crate::search::query::SearchQuery::parse(&cache.query))
-        };
-        let needs_path = query.as_ref().is_some_and(|q| q.path_filter.is_some());
-
-        // delta 中实际可显示的条目数
-        let mut delta_n: usize = 0;
-        for (vol, f) in &cache.delta.new_files {
-            if delta_deleted.contains(&f.file_id) && !delta_renamed.contains(&f.file_id) {
-                continue;
-            }
-            let Some(vol_name) = self.vol_names.get(*vol as usize) else {
-                continue;
-            };
-            if let Some(ref q) = query {
-                if let Some(m) = self.volumes.get(vol_name) {
-                    let full_path = if needs_path {
-                        m.path_table.resolve_file_path(f.path_id, &f.name)
-                    } else {
-                        CompactString::new("")
-                    };
-                    if !crate::search::query::SearchQuery::matches_entry(q, f, &full_path) {
-                        continue;
-                    }
-                }
-            }
-            if cache.files_only && f.is_directory {
-                continue;
-            }
-            if cache.directories_only && !f.is_directory {
-                continue;
-            }
-            delta_n += 1;
-        }
-        for (vol, f) in delta_modified.values() {
-            if delta_deleted.contains(&f.file_id) {
-                continue;
-            }
-            let Some(vol_name) = self.vol_names.get(*vol as usize) else {
-                continue;
-            };
-            if let Some(ref q) = query {
-                if let Some(m) = self.volumes.get(vol_name) {
-                    let full_path = if needs_path {
-                        m.path_table.resolve_file_path(f.path_id, &f.name)
-                    } else {
-                        CompactString::new("")
-                    };
-                    if !crate::search::query::SearchQuery::matches_entry(q, f, &full_path) {
-                        continue;
-                    }
-                }
-            }
-            if cache.files_only && f.is_directory {
-                continue;
-            }
-            if cache.directories_only && !f.is_directory {
-                continue;
-            }
-            delta_n += 1;
-        }
-
-        // base 中未被 delta deleted/modified 过滤的条目数
-        let base_n = if cache.base.valid_indices_matched_len == cache.base.matched.len() {
-            if let Some(ref valid_indices) = cache.base.valid_indices {
-                valid_indices
-                    .iter()
-                    .filter(|&&idx| {
-                        let Some(&(vol, file_idx)) = cache.base.matched.get(idx as usize) else {
-                            return false;
-                        };
-                        let Some(vol_name) = self.vol_names.get(vol as usize) else {
-                            return false;
-                        };
-                        if let Some(m) = self.volumes.get(vol_name) {
-                            if let Some(f) = m.files.get(file_idx as usize) {
-                                return !delta_deleted.contains(&f.file_id)
-                                    && !delta_modified.contains_key(&f.file_id);
-                            }
-                        }
-                        false
-                    })
-                    .count()
-            } else {
-                0
-            }
-        } else {
-            cache
-                .base
-                .matched
-                .iter()
-                .filter(|&&(vol, file_idx)| {
-                    let Some(vol_name) = self.vol_names.get(vol as usize) else {
-                        return false;
-                    };
-                    if let Some(m) = self.volumes.get(vol_name) {
-                        if let Some(f) = m.files.get(file_idx as usize) {
-                            return !delta_deleted.contains(&f.file_id)
-                                && !delta_modified.contains_key(&f.file_id);
-                        }
-                    }
-                    false
-                })
-                .count()
-        };
-
-        base_n + delta_n
-    }
-
     pub fn search_with_options(
         &mut self,
         query: &str,
@@ -1357,6 +1348,8 @@ impl VolumeManager {
                 generation: 0,
             },
             sorted_cache: None,
+            active_base_count: None, // lazily computed on first get_sorted_slice call
+            base_file_ids: None,     // lazily built when needed for incremental tracking
         });
 
         // Use get_sorted_slice for first_batch (handles base+delta merge)
@@ -1486,6 +1479,13 @@ impl VolumeManager {
         };
         let has_cache = self.search_cache.is_some();
 
+        // 确保 base_file_ids 已构建，供后续增量维护 active_base_count 使用
+        if has_cache {
+            if let Some(cache) = self.search_cache.as_mut() {
+                cache.ensure_base_file_ids(&self.volumes, &self.vol_names);
+            }
+        }
+
         // Phase 1: Updates - store in delta.modified, NOT in base.files
         // 同时处理"delta.new_files 中创建后又被修改"的情况：直接更新 new_files
         // 条目，避免新增 modified 造成重复或数据陈旧。
@@ -1520,6 +1520,7 @@ impl VolumeManager {
                         .is_ok()
                     {
                         // 文件在 base 中存在：用 modified 隐藏旧 base 条目
+                        cache.on_base_entry_hidden(fid_u32);
                         cache
                             .delta
                             .modified
@@ -1534,42 +1535,6 @@ impl VolumeManager {
             }
         }
 
-        // 预构建路径兜底映射与 base fid 集合：
-        // 当 USN fid 与 base file_id 不一致时，可用被删除/重命名旧路径定位实际条目。
-        let (path_to_fid, base_fid_set): (
-            std::collections::HashMap<String, u32>,
-            std::collections::HashSet<u32>,
-        ) = if has_cache && !removed.is_empty() {
-            if let Some(monitor) = self.volumes.get(drive_letter) {
-                let mut path_map = std::collections::HashMap::new();
-                for f in monitor.files.iter() {
-                    if f.path_id == PathTable::deleted_id() {
-                        continue;
-                    }
-                    let full = monitor
-                        .path_table
-                        .resolve_file_path(f.path_id, f.name.as_str());
-                    path_map.insert(full.to_string().to_lowercase(), f.file_id);
-                }
-                let base_fids: std::collections::HashSet<u32> = monitor
-                    .fid_index
-                    .as_ref()
-                    .map(|fi| fi.iter().map(|(id, _)| *id).collect())
-                    .unwrap_or_default();
-                (path_map, base_fids)
-            } else {
-                (
-                    std::collections::HashMap::new(),
-                    std::collections::HashSet::new(),
-                )
-            }
-        } else {
-            (
-                std::collections::HashMap::new(),
-                std::collections::HashSet::new(),
-            )
-        };
-
         // 记录被删除 fid 的完整路径，用于 Phase 4 区分"重命名"和"创建后删除"
         let mut removed_path_map: std::collections::HashMap<u32, String> =
             std::collections::HashMap::new();
@@ -1577,31 +1542,24 @@ impl VolumeManager {
             removed_path_map.insert(*fid as u32, removed_path.clone());
         }
 
-        // Phase 2: Deletions - record IDs (with path fallback)
+        // Phase 2: Deletions - record IDs
         if has_cache {
             let cache = self.search_cache.as_mut().unwrap();
-            for (fid, removed_path) in &removed {
+            for (fid, _removed_path) in &removed {
                 let fid_u32 = *fid as u32;
-                let in_base = base_fid_set.contains(&fid_u32);
-                let in_delta = cache.delta.file_id_index.contains_key(&fid_u32);
-                let _ = in_delta; // 保留语义，供后续扩展使用
-                                  // 始终记录 USN 删除事件中的 fid，即使当前 base/delta 中找不到。
-                                  // 若实际 base 中存在但 fid 不匹配（如 file_id 截断/解析差异），
-                                  // 会尝试按路径兜底定位。
+                // 增量维护：先检查再 insert（insert 前 fid 可能已被 modified 隐藏）
+                cache.on_base_entry_hidden(fid_u32);
                 cache.delta.deleted_ids.insert(fid_u32);
                 // 同时清理 delta.modified，避免"先修改后删除"导致已删除文件仍出现
-                cache.delta.modified.remove(&fid_u32);
+                let was_in_modified = cache.delta.modified.remove(&fid_u32).is_some();
+                // 增量维护：modified 移除后，检查 fid 是否不再被任何 delta 隐藏
+                if was_in_modified {
+                    cache.on_base_entry_unhidden(fid_u32);
+                }
                 // 清除过期的重命名标记。fid 既然被 USN 删除，就不应再被
                 // renamed_fids 保护；真正的重命名会在 Phase 4 重新设置。
                 // 否则 NTFS 复用 fid 时，旧重命名残留会导致新删除被错误保留。
                 cache.delta.renamed_fids.remove(&fid_u32);
-
-                // 路径兜底：fid 在 base 中找不到且路径非空时，按路径定位 base 条目
-                if !in_base && !removed_path.is_empty() {
-                    if let Some(&file_id) = path_to_fid.get(&removed_path.to_lowercase()) {
-                        cache.delta.deleted_ids.insert(file_id);
-                    }
-                }
             }
         }
 
@@ -1661,7 +1619,10 @@ impl VolumeManager {
                         *existing = entry.1;
                     }
                     // 更新后仍要清理可能存在的 stale modified/deleted 状态
-                    cache.delta.modified.remove(&fid);
+                    let was_in_modified = cache.delta.modified.remove(&fid).is_some();
+                    if was_in_modified {
+                        cache.on_base_entry_unhidden(fid);
+                    }
                     if cache.delta.deleted_ids.contains(&fid) {
                         cache.delta.renamed_fids.insert(fid);
                     } else {
@@ -1679,9 +1640,15 @@ impl VolumeManager {
                     cache.delta.renamed_fids.insert(entry.1.file_id);
                 } else {
                     // Pure new file: clear any stale deleted/modified state
-                    cache.delta.deleted_ids.remove(&entry.1.file_id);
+                    let was_in_deleted = cache.delta.deleted_ids.remove(&entry.1.file_id);
+                    if was_in_deleted {
+                        cache.on_base_entry_unhidden(entry.1.file_id);
+                    }
                 }
-                cache.delta.modified.remove(&entry.1.file_id);
+                let was_in_modified = cache.delta.modified.remove(&entry.1.file_id).is_some();
+                if was_in_modified {
+                    cache.on_base_entry_unhidden(entry.1.file_id);
+                }
                 cache.delta.file_id_index.insert(entry.1.file_id, file_idx);
                 cache.delta.new_files.push(entry);
             }
@@ -1700,17 +1667,53 @@ impl VolumeManager {
         }
     }
 
+    /// 估算当前 delta 缓存占用的内存字节数（粗略上限）。
+    pub fn delta_memory_bytes(&self) -> usize {
+        let Some(cache) = self.search_cache.as_ref() else {
+            return 0;
+        };
+        let new_files_bytes = cache.delta.new_files.len()
+            * (std::mem::size_of::<(u8, FileEntry)>() + std::mem::size_of::<(u32, u32)>());
+        let deleted_bytes = cache.delta.deleted_ids.len() * std::mem::size_of::<u32>() * 2;
+        let modified_bytes = cache.delta.modified.len()
+            * (std::mem::size_of::<u32>()
+                + std::mem::size_of::<(u8, FileEntry)>()
+                + std::mem::size_of::<u32>())
+            * 2;
+        let renamed_bytes = cache.delta.renamed_fids.len() * std::mem::size_of::<u32>() * 2;
+        let matched_bytes = cache.delta.matched.len() * std::mem::size_of::<(u8, u32)>();
+        new_files_bytes + deleted_bytes + modified_bytes + renamed_bytes + matched_bytes
+    }
+
     pub fn merge_if_needed(&mut self) {
+        const DELTA_MEMORY_THRESHOLD: usize = 50 * 1024 * 1024; // 50 MB
+        const DELTA_COUNT_THRESHOLD: usize = 10_000;
         let should_merge = self.search_cache.as_ref().is_some_and(|c| {
-            c.delta.new_files.len() + c.delta.deleted_ids.len() + c.delta.modified.len() > 10_000
+            let count =
+                c.delta.new_files.len() + c.delta.deleted_ids.len() + c.delta.modified.len();
+            let new_files_bytes = c.delta.new_files.len()
+                * (std::mem::size_of::<(u8, FileEntry)>() + std::mem::size_of::<(u32, u32)>());
+            let deleted_bytes = c.delta.deleted_ids.len() * std::mem::size_of::<u32>() * 2;
+            let modified_bytes = c.delta.modified.len()
+                * (std::mem::size_of::<u32>()
+                    + std::mem::size_of::<(u8, FileEntry)>()
+                    + std::mem::size_of::<u32>())
+                * 2;
+            let renamed_bytes = c.delta.renamed_fids.len() * std::mem::size_of::<u32>() * 2;
+            let matched_bytes = c.delta.matched.len() * std::mem::size_of::<(u8, u32)>();
+            let memory =
+                new_files_bytes + deleted_bytes + modified_bytes + renamed_bytes + matched_bytes;
+            count > DELTA_COUNT_THRESHOLD || memory > DELTA_MEMORY_THRESHOLD
         });
         if should_merge {
+            let memory_mb = self.delta_memory_bytes() / 1024 / 1024;
             let cache = self.search_cache.as_mut().unwrap();
             log::info!(
-                "Merging delta: {} new, {} deleted, {} modified",
+                "Merging delta: {} new, {} deleted, {} modified, ~{} MB",
                 cache.delta.new_files.len(),
                 cache.delta.deleted_ids.len(),
-                cache.delta.modified.len()
+                cache.delta.modified.len(),
+                memory_mb
             );
             cache.merge_delta_to_base(&mut self.volumes, &self.vol_names);
         }
@@ -1720,6 +1723,31 @@ impl VolumeManager {
         self.search_cache
             .as_ref()
             .map_or(0, |c| c.delta.new_files.len())
+    }
+
+    /// 返回当前索引的内存统计信息（单位：字节），用于排查内存占用。
+    pub fn memory_stats(&self) -> (usize, usize, usize, usize) {
+        let files_bytes: usize = self
+            .volumes
+            .values()
+            .map(|m| m.files.len() * std::mem::size_of::<FileEntry>())
+            .sum();
+        let path_table_bytes: usize = self
+            .volumes
+            .values()
+            .map(|m| m.path_table.memory_estimate())
+            .sum();
+        let fid_index_bytes: usize = self
+            .volumes
+            .values()
+            .map(|m| {
+                m.fid_index
+                    .as_ref()
+                    .map_or(0, |fi| fi.len() * std::mem::size_of::<(u32, u32)>() * 2)
+            })
+            .sum();
+        let delta_bytes = self.delta_memory_bytes();
+        (files_bytes, path_table_bytes, fid_index_bytes, delta_bytes)
     }
 
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
@@ -1824,6 +1852,7 @@ fn apply_incremental_to_cache(
     cache.base.valid_indices = None;
     cache.base.valid_indices_matched_len = 0;
     cache.sorted_cache = None;
+    cache.invalidate_base_count();
 
     cache.base.matched.len()
 }
@@ -2015,8 +2044,9 @@ impl VolumeMonitor {
         // 构建 (path_id, name)→index 映射
         // 由于 path_id 现在指向父目录，同一目录下的文件共享 path_id，
         // 必须用 (path_id, name) 组合作为唯一标识
+        // 预分配 50% 容量：大多数文件共享父目录，实际唯一键数远少于文件总数
         let mut path_map: HashMap<(u32, CompactString), usize> =
-            HashMap::with_capacity(self.files.len());
+            HashMap::with_capacity(self.files.len() / 2);
         for (i, f) in self.files.iter().enumerate() {
             path_map.insert((f.path_id, f.name.clone()), i);
         }
