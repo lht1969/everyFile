@@ -34,6 +34,7 @@ export function useVirtualScroll({
   const lastFiredRef = useRef<string>('');
   const onRangeChangeRef = useRef(onRangeChange);
   onRangeChangeRef.current = onRangeChange;
+  const prevTotalItemsRef = useRef(totalItems);
 
   const scrollTop = scrollTopRef.current;
   const [viewportHeight, setViewportHeight] = useState(0);
@@ -76,9 +77,14 @@ export function useVirtualScroll({
 
   const atBottom = totalItems > 0 && maxScrollTop > 0 && clampedScrollTop >= maxScrollTop - 1;
 
+  // 当 totalItems 减小（文件被删除）且之前在底部时，强制保持在底部。
+  // 否则 maxScrollTop 减小后 scrollTop 被钳制，atBottom 失效，startIndex 跳变导致内容上移。
+  const totalShrank = totalItems < prevTotalItemsRef.current;
+  prevTotalItemsRef.current = totalItems;
+
   let startIndex: number;
   if (totalItems > 0) {
-    if (atBottom) {
+    if (atBottom || (totalShrank && clampedScrollTop >= maxScrollTop - viewportHeight)) {
       startIndex = Math.max(totalItems - visibleCount, 0);
     } else {
       startIndex = Math.min(rawStartIndex, Math.max(totalItems - visibleCount, 0));
