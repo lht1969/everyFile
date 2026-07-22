@@ -6,7 +6,6 @@ use winreg::RegKey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigResponse {
-    pub scan_all_volumes: bool,
     pub default_volume: String,
     pub max_cache_items: usize,
     pub max_history_items: usize,
@@ -31,7 +30,6 @@ fn startup_registry_enabled() -> bool {
 impl From<Config> for ConfigResponse {
     fn from(c: Config) -> Self {
         Self {
-            scan_all_volumes: c.scan_all_volumes,
             default_volume: c.default_volume,
             max_cache_items: c.max_cache_items,
             max_history_items: c.max_history_items,
@@ -53,7 +51,6 @@ pub fn get_config() -> Result<ConfigResponse, String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveConfigParams {
-    pub scan_all_volumes: bool,
     pub default_volume: String,
     pub max_cache_items: usize,
     pub max_history_items: usize,
@@ -73,7 +70,6 @@ pub async fn save_config(
     log::info!("Received save_config request");
 
     let config = Config {
-        scan_all_volumes: params.scan_all_volumes,
         default_volume: params.default_volume,
         max_cache_items: params.max_cache_items,
         max_history_items: params.max_history_items,

@@ -225,34 +225,13 @@ fn main() {
                         .as_ref()
                         .map(|c| c.index_settings.include_system_files)
                         .unwrap_or(false);
-                    let scan_all_volumes =
-                        config.as_ref().map(|c| c.scan_all_volumes).unwrap_or(false);
                     log::info!(
-                        "Config: scan_all_volumes={}, admin={}, monitored={:?}",
-                        scan_all_volumes,
+                        "Config: admin={}, monitored={:?}",
                         is_admin,
                         monitored_from_config
                     );
 
-                    if scan_all_volumes {
-                        log::info!("scan_all_volumes is enabled, adding all NTFS volumes");
-                        if let Ok(volumes) = fs::get_ntfs_volumes() {
-                            for volume in &volumes {
-                                if let Err(e) = volume_manager.add_volume(
-                                    &volume.drive_letter,
-                                    is_admin,
-                                    include_hidden_files,
-                                    include_system_files,
-                                ) {
-                                    log::warn!(
-                                        "Failed to add volume {}: {}",
-                                        volume.drive_letter,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    } else if !monitored_from_config.is_empty() {
+                    if !monitored_from_config.is_empty() {
                         log::info!("Adding volumes from config: {:?}", monitored_from_config);
                         for volume in &monitored_from_config {
                             if let Err(e) = volume_manager.add_volume(

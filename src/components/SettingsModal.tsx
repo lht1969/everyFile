@@ -79,7 +79,6 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
     try {
       await invoke('save_config', {
         params: {
-          scan_all_volumes: configToSave.scan_all_volumes,
           default_volume: configToSave.default_volume,
           max_cache_items: configToSave.max_cache_items,
           max_history_items: configToSave.max_history_items,
@@ -168,14 +167,6 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
                   onChange={e => setConfig({ ...config, include_system_files: e.target.checked })}
                 />
                 包含系统文件
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={config.scan_all_volumes}
-                  onChange={e => setConfig({ ...config, scan_all_volumes: e.target.checked })}
-                />
-                扫描所有卷
               </label>
             </section>
           )}

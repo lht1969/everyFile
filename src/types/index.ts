@@ -42,7 +42,6 @@ export interface VolumeResponse {
 }
 
 export interface ConfigResponse {
-  scan_all_volumes: boolean;
   default_volume: string;
   max_cache_items: number;
   max_history_items: number;

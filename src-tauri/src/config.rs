@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub scan_all_volumes: bool,
     pub default_volume: String,
     pub max_cache_items: usize,
     pub max_history_items: usize,
@@ -26,7 +25,6 @@ pub struct IndexSettings {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            scan_all_volumes: true,
             default_volume: "D:".to_string(),
             max_cache_items: 50,
             max_history_items: 20,
