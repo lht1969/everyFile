@@ -26,6 +26,7 @@ export interface IndexStatus {
   message: string;
   volumes: string[];
   last_update: string;
+  scanning_volumes: string[];
 }
 
 export interface AppConfig {

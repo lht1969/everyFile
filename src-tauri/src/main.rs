@@ -125,6 +125,7 @@ fn main() {
     let volume_manager = Arc::new(Mutex::new(VolumeManager::new()));
     let is_searching = Arc::new(AtomicBool::new(false));
     let last_index_update = Arc::new(Mutex::new(String::new()));
+    let scanning_volumes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     // 检查管理员权限，决定是否使用 USN Journal
     let is_admin = fs::is_elevated();
@@ -179,6 +180,7 @@ fn main() {
             is_searching: is_searching.clone(),
             last_index_update: last_index_update.clone(),
             usn_manager: usn_manager.clone(),
+            scanning_volumes: scanning_volumes.clone(),
         })
         // 设置窗口事件处理
         .on_window_event(|window, event| {
@@ -195,6 +197,7 @@ fn main() {
 
             // 克隆卷管理器和应用句柄
             let vm = volume_manager.clone();
+            let sv = scanning_volumes.clone();
             let handle = app.handle().clone();
             let handle_for_tray = app.handle().clone();
 
@@ -307,6 +310,12 @@ fn main() {
                 } // lock released
 
                 // 并行扫描所有 walkdir 卷
+                // 标记 walkdir 卷为扫描中
+                {
+                    let walkdir_vols: Vec<String> = walkdir_monitors.iter().map(|(dl, _)| dl.clone()).collect();
+                    let mut scan_vols = sv.lock().await;
+                    *scan_vols = walkdir_vols;
+                }
                 let mut scan_futs = Vec::with_capacity(walkdir_monitors.len());
                 for (drive_letter, mut monitor) in walkdir_monitors {
                     let handle_clone = handle.clone();
@@ -325,6 +334,11 @@ fn main() {
                             vm.return_monitor(&drive_letter, monitor);
                             // 失效搜索缓存：新卷数据已就绪，避免 loadAllFiles() 复用旧缓存
                             vm.invalidate_search_cache();
+                        }
+                        // 从扫描中卷列表移除
+                        {
+                            let mut scan_vols = sv.lock().await;
+                            scan_vols.retain(|v| v != &drive_letter);
                         }
                         match scan_result {
                             Ok(count) => {
@@ -353,6 +367,11 @@ fn main() {
                         let vm = vm.lock().await;
                         vm.volumes()
                     };
+                    // 标记所有卷为扫描中，供前端 get_index_status 查询
+                    {
+                        let mut scan_vols = sv.lock().await;
+                        *scan_vols = volumes.clone();
+                    }
                     for drive_letter in &volumes {
                         let dl_char = drive_letter.chars().next().unwrap_or('C');
                         log::debug!(
@@ -380,6 +399,7 @@ fn main() {
                     let resp_rx = usn.resp_rx_clone();
                     let vm_for_handler = vm.clone();
                     let handle_for_handler = handle.clone();
+                    let sv_for_handler = sv.clone();
                     let rt_handle = tokio::runtime::Handle::current();
                     let scan_done_tx = full_scan_done_tx;
 
@@ -406,6 +426,11 @@ fn main() {
                                         vm.apply_full_scan(&drive_string, files, path_table);
                                         let count = vm.get_file_count(&drive_string);
                                         drop(vm);
+                                        // 从扫描中卷列表移除该卷
+                                        {
+                                            let mut scan_vols = rt_handle.block_on(sv_for_handler.lock());
+                                            scan_vols.retain(|v| v != &drive_string);
+                                        }
                                         let _ = handle_for_handler.emit(
                                             "scan-complete",
                                             serde_json::json!({

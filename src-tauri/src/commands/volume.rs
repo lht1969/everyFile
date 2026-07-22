@@ -34,6 +34,7 @@ pub struct IndexStatusResponse {
     pub message: String,
     pub volumes: Vec<String>,
     pub last_update: String,
+    pub scanning_volumes: Vec<String>,
 }
 
 #[tauri::command]
@@ -188,6 +189,11 @@ pub async fn rebuild_index(
                 let vm = state.volume_manager.lock().await;
                 vm.volumes()
             };
+            // 标记所有卷为扫描中
+            {
+                let mut sv = state.scanning_volumes.lock().await;
+                *sv = volumes.clone();
+            }
             for drive_letter in volumes {
                 let dl_char = drive_letter.chars().next().unwrap_or('C');
                 log::info!(
@@ -200,15 +206,35 @@ pub async fn rebuild_index(
             }
         } else {
             log::warn!("Admin mode but no USN manager, falling back to walkdir");
+            let volumes = {
+                let vm = state.volume_manager.lock().await;
+                vm.volumes()
+            };
+            {
+                let mut sv = state.scanning_volumes.lock().await;
+                *sv = volumes;
+            }
             let mut vm = state.volume_manager.lock().await;
             vm.scan_all_with_progress(&app_handle)
                 .map_err(|e| e.to_string())?;
+            drop(vm);
+            state.scanning_volumes.lock().await.clear();
         }
     } else {
         // 非管理员模式：使用 walkdir 扫描
+        let volumes = {
+            let vm = state.volume_manager.lock().await;
+            vm.volumes()
+        };
+        {
+            let mut sv = state.scanning_volumes.lock().await;
+            *sv = volumes;
+        }
         let mut vm = state.volume_manager.lock().await;
         vm.scan_all_with_progress(&app_handle)
             .map_err(|e| e.to_string())?;
+        drop(vm);
+        state.scanning_volumes.lock().await.clear();
     }
 
     let _ = app_handle.emit("rebuild-complete", ());
@@ -225,20 +251,24 @@ pub async fn get_index_status(
     let mut volumes = vm.volumes();
     volumes.sort();
     let last_update = state.last_index_update.lock().await.clone();
+    let scanning_volumes = state.scanning_volumes.lock().await.clone();
 
     let message = if volumes.is_empty() {
         "等待扫描...".to_string()
+    } else if !scanning_volumes.is_empty() {
+        format!("{} 加载中...", scanning_volumes[0])
     } else {
         "就绪".to_string()
     };
 
     Ok(IndexStatusResponse {
-        status: "ready".to_string(),
+        status: if scanning_volumes.is_empty() { "ready".to_string() } else { "scanning".to_string() },
         file_count,
-        progress: 1.0,
+        progress: if scanning_volumes.is_empty() { 1.0 } else { 0.0 },
         message,
         volumes,
         last_update,
+        scanning_volumes,
     })
 }
 
@@ -262,6 +292,5 @@ pub async fn get_monitored_volumes(
         });
     }
 
-    result.sort_by(|a, b| a.drive_letter.cmp(&b.drive_letter));
     Ok(result)
 }

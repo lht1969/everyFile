@@ -26,7 +26,7 @@ function StatusBar({ message, indexStatus, isAdmin, searchTime }: StatusBarProps
         )}
         <span className="index-status">
           {indexStatus.status === 'scanning' && indexStatus.progress < 1 ? (
-            <>索引中... {Math.round(indexStatus.progress * 100)}%</>
+            <>索引中...</>
           ) : (
             <>已索引 {indexStatus.file_count.toLocaleString()} 个文件</>
           )}

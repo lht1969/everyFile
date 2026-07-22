@@ -48,6 +48,7 @@ pub struct AppState {
     pub last_index_update: Arc<Mutex<String>>,
     #[allow(dead_code)]
     pub usn_manager: Option<Arc<UsnIndexManager>>,
+    pub scanning_volumes: Arc<Mutex<Vec<String>>>,
 }
 
 #[tauri::command]

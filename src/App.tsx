@@ -14,7 +14,7 @@ function App() {
   const [resultsOffset, setResultsOffset] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
-  const [indexStatus, setIndexStatus] = useState<IndexStatus>({ status: 'ready', file_count: 0, progress: 1, message: '', volumes: [], last_update: '' });
+  const [indexStatus, setIndexStatus] = useState<IndexStatus>({ status: 'ready', file_count: 0, progress: 1, message: '', volumes: [], last_update: '', scanning_volumes: [] });
   const [showSettings, setShowSettings] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [searchState, setSearchState] = useState({ query: '', filesOnly: true, directoriesOnly: false });
@@ -171,6 +171,14 @@ function App() {
     try {
       const status = await invoke<IndexStatus>('get_index_status');
       setIndexStatus(status);
+      // 全量扫描阶段：后端返回 scanning_volumes，前端据此显示加载状态
+      // （scan-progress 事件可能在前端 listener 注册前已发出，需要此兜底）
+      if (status.scanning_volumes.length > 0) {
+        setStatusMessage(`${status.scanning_volumes[0]} 加载中...`);
+      } else if (statusMessage.endsWith('加载中...')) {
+        // 扫描结束，清除加载状态消息
+        setStatusMessage('');
+      }
     } catch (e) {
       console.error('Failed to load index status:', e);
     }
