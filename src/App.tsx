@@ -34,14 +34,17 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const unlistenProgress = listen<{ volume: string; count: number }>('scan-progress', (_event) => {
-      setStatusMessage(`扫描中: ${_event.payload.volume} (${_event.payload.count.toLocaleString()} 个文件)`);
+    const unlistenProgress = listen<{ volume: string }>('scan-progress', (_event) => {
+      setStatusMessage(`${_event.payload.volume} 加载中...`);
     });
 
     const unlistenComplete = listen<{ volume: string; count: number }>('scan-complete', (_event) => {
-      loadIndexStatus();
       setStatusMessage(`扫描完成: ${_event.payload.volume} (${_event.payload.count.toLocaleString()} 个文件)`);
       loadAllFiles();
+    });
+
+    const unlistenAllComplete = listen('scan-all-complete', () => {
+      loadIndexStatus();
     });
 
     const unlistenUpdated = listen<{ volume: string; count: number; cache_total?: number }>('index-updated', async (_event) => {
@@ -140,6 +143,7 @@ function App() {
     return () => {
       unlistenProgress.then(fn => fn());
       unlistenComplete.then(fn => fn());
+      unlistenAllComplete.then(fn => fn());
       unlistenUpdated.then(fn => fn());
       unlistenRefresh.then(fn => fn());
     };
@@ -173,7 +177,6 @@ function App() {
   };
 
   const loadAllFiles = async () => {
-    setStatusMessage('加载中...');
     try {
       const response = await invoke<SearchResponse>('search_files', {
         params: { query: '', files_only: true, sort_by: sortState.field, sort_direction: sortState.direction }

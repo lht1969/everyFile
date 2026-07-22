@@ -39,7 +39,9 @@ pub struct IndexStatusResponse {
 #[tauri::command]
 pub async fn get_volumes() -> Result<Vec<VolumeResponse>, String> {
     let volumes = get_ntfs_volumes().map_err(|e| e.to_string())?;
-    Ok(volumes.into_iter().map(VolumeResponse::from).collect())
+    let mut result: Vec<VolumeResponse> = volumes.into_iter().map(VolumeResponse::from).collect();
+    result.sort_by(|a, b| a.drive_letter.cmp(&b.drive_letter));
+    Ok(result)
 }
 
 #[tauri::command]
@@ -140,7 +142,9 @@ pub async fn refresh_volumes(
         }
     }
 
-    Ok(volumes.into_iter().map(VolumeResponse::from).collect())
+    let mut result: Vec<VolumeResponse> = volumes.into_iter().map(VolumeResponse::from).collect();
+    result.sort_by(|a, b| a.drive_letter.cmp(&b.drive_letter));
+    Ok(result)
 }
 
 #[tauri::command]
@@ -218,7 +222,8 @@ pub async fn get_index_status(
 ) -> Result<IndexStatusResponse, String> {
     let vm = state.volume_manager.lock().await;
     let file_count = vm.total_file_count();
-    let volumes = vm.volumes();
+    let mut volumes = vm.volumes();
+    volumes.sort();
     let last_update = state.last_index_update.lock().await.clone();
 
     let message = if volumes.is_empty() {
@@ -257,5 +262,6 @@ pub async fn get_monitored_volumes(
         });
     }
 
+    result.sort_by(|a, b| a.drive_letter.cmp(&b.drive_letter));
     Ok(result)
 }

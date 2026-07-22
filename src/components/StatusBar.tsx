@@ -21,7 +21,7 @@ function StatusBar({ message, indexStatus, isAdmin, searchTime }: StatusBarProps
         )}
         {indexStatus.volumes.length > 0 && (
           <span className="volume-info">
-            卷: {indexStatus.volumes.join(', ')}
+            卷- {indexStatus.volumes.join(' ')}
           </span>
         )}
         <span className="index-status">

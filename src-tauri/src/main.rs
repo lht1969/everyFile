@@ -287,45 +287,65 @@ fn main() {
                     (volumes_to_scan, include_hidden_files, include_system_files)
                 }; // lock released here
 
-                // === 阶段 2：逐卷扫描（每卷只在 take/return 时短暂持锁）===
-                // walkdir 扫描在不持有 volume_manager 锁的情况下进行，
-                // 避免阻塞前端搜索和其他操作
-                for drive_letter in volumes_to_scan {
-                    // 短暂持锁：take monitor
-                    let monitor = {
-                        let mut vm = vm.lock().await;
-                        vm.take_monitor(&drive_letter)
-                    };
+                let mut walkdir_monitors: Vec<(String, crate::index::monitor::VolumeMonitor)> = Vec::new();
 
-                    if let Some(mut m) = monitor {
-                        if m.use_usn {
-                            // USN volumes are scanned via the USN worker
-                            let mut vm = vm.lock().await;
-                            vm.return_monitor(&drive_letter, m);
-                            continue;
+                // === 阶段 2：并行扫描所有 walkdir 卷 ===
+                // 一次性 take 所有 monitor，并发扫描，一次性 return，
+                // 减少 volume_manager 持锁次数，不同磁盘的卷并行 I/O 加速扫描。
+                {
+                    let mut vm = vm.lock().await;
+                    for drive_letter in &volumes_to_scan {
+                        if let Some(m) = vm.take_monitor(drive_letter) {
+                            if m.use_usn {
+                                // USN 卷跳过 walkdir，直接 return
+                                vm.return_monitor(drive_letter, m);
+                            } else {
+                                walkdir_monitors.push((drive_letter.clone(), m));
+                            }
                         }
-                        // 不持锁：执行 walkdir 扫描（耗时操作）
-                        let handle_clone = handle.clone();
-                        let scan_result = m.scan_with_progress_callback(&handle_clone);
+                    }
+                } // lock released
 
-                        // 短暂持锁：return monitor
+                // 并行扫描所有 walkdir 卷
+                let mut scan_futs = Vec::with_capacity(walkdir_monitors.len());
+                for (drive_letter, mut monitor) in walkdir_monitors {
+                    let handle_clone = handle.clone();
+                    let dl = drive_letter.clone();
+                    scan_futs.push(tokio::task::spawn_blocking(move || {
+                        let result = monitor.scan_with_progress_callback(&handle_clone);
+                        (dl, monitor, result)
+                    }));
+                }
+
+                // 等待所有扫描完成，逐个 return monitor 并发送事件
+                for fut in scan_futs {
+                    if let Ok((drive_letter, monitor, scan_result)) = fut.await {
                         {
                             let mut vm = vm.lock().await;
-                            vm.return_monitor(&drive_letter, m);
+                            vm.return_monitor(&drive_letter, monitor);
+                            // 失效搜索缓存：新卷数据已就绪，避免 loadAllFiles() 复用旧缓存
+                            vm.invalidate_search_cache();
                         }
-
-                        if let Ok(count) = scan_result {
-                            log::info!("Scanned volume {}: {} files", drive_letter, count);
-                            let _ = handle.emit(
-                                "scan-complete",
-                                serde_json::json!({
-                                    "volume": drive_letter,
-                                    "count": count
-                                }),
-                            );
+                        match scan_result {
+                            Ok(count) => {
+                                log::info!("Scanned volume {}: {} files", drive_letter, count);
+                                let _ = handle.emit(
+                                    "scan-complete",
+                                    serde_json::json!({
+                                        "volume": drive_letter,
+                                        "count": count
+                                    }),
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to scan volume {}: {}", drive_letter, e);
+                            }
                         }
                     }
                 }
+
+                // 所有 walkdir 卷扫描完成，通知前端刷新状态栏
+                let _ = handle.emit("scan-all-complete", ());
 
                 // === 阶段 3：dispatch USN full scan（短暂持锁）===
                 if let Some(ref usn) = usn_manager {
@@ -340,6 +360,10 @@ fn main() {
                             dl_char,
                             include_hidden_files,
                             include_system_files
+                        );
+                        let _ = handle.emit(
+                            "scan-progress",
+                            serde_json::json!({"volume": drive_letter}),
                         );
                         usn.full_scan(dl_char, include_hidden_files, include_system_files);
                     }
@@ -384,6 +408,13 @@ fn main() {
                                         drop(vm);
                                         let _ = handle_for_handler.emit(
                                             "scan-complete",
+                                            serde_json::json!({
+                                                "volume": drive_string,
+                                                "count": count
+                                            }),
+                                        );
+                                        let _ = handle_for_handler.emit(
+                                            "index-updated",
                                             serde_json::json!({
                                                 "volume": drive_string,
                                                 "count": count
