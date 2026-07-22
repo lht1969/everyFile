@@ -59,6 +59,7 @@ function App() {
       const added = event.payload.added ?? 0;
       const updated = event.payload.updated ?? 0;
       const removed = event.payload.removed ?? 0;
+      console.log('[REFRESH] received added=' + added + ' updated=' + updated + ' removed=' + removed + ' isFetching=' + isFetchingRef.current + ' resultsLen=' + resultsRef.current.length);
       // 无实质变化时不刷新，避免空轮询导致的前端开销
       if (added === 0 && updated === 0 && removed === 0) {
         return;
@@ -69,8 +70,11 @@ function App() {
       // 大多数增量更新不需要刷新窗口。
       // 必须在 setTotalCount 之前检查，否则 setTotalCount 会改变 totalItems，
       // 导致 startIndex 偏移，触发 onRangeChange → 又一轮 fetch，形成循环。
+      // 注意：added > 0 时不能跳过，因为新文件的 fid 不在 visibleFids 中，
+      // 但新文件可能应该出现在可见范围内（取决于排序方式）。
       const changed_fids = event.payload.changed_fids;
-      if (changed_fids && changed_fids.length > 0 && resultsRef.current.length > 0) {
+      const hasAdded = added > 0;
+      if (!hasAdded && changed_fids && changed_fids.length > 0 && resultsRef.current.length > 0) {
         const visibleFids = new Set(resultsRef.current.map(r => r.file_id));
         const hasVisibleChange = changed_fids.some(fid => visibleFids.has(fid));
         if (!hasVisibleChange) {
@@ -88,10 +92,13 @@ function App() {
         return;
       }
 
-      // 同步更新总数，让滚动条高度反映最新数据量
-      if (typeof event.payload.total === 'number') {
-        setTotalCount(event.payload.total);
-      }
+      // 注意：不在此处调用 setTotalCount。
+      // 原因：setTotalCount 会触发 useVirtualScroll 重新计算 startIndex/endIndex，
+      // 若 endIndex 改变（如 totalItems 从 8 减至 7），则 onRangeChange 被触发，
+      // handleVisibleRangeChange 在 atBottom=true 时执行 ++fetchCounterRef，
+      // 使下方 fetchRecordsRange 的 myId 失效，导致结果被丢弃，形成空白窗口。
+      // totalCount 由 fetchRecordsRange 完成后内部 setTotalCount 自然更新。
+      // 状态栏"找到 X 个结果"也在 fetchRecordsRange 完成后更新。
 
       // 清除覆盖当前可见范围的缓存，并主动触发一次 fetch，让删除/修改/新增
       // 在静止状态下也能立即反映到窗口。拖动期间不主动 fetch，避免与用户
@@ -107,11 +114,19 @@ function App() {
             break;
           }
         }
-        // 使正在进行的 fetchRecordsRange 失效，防止旧数据覆盖刷新结果
-        ++fetchCounterRef.current;
-        isFetchingRef.current = false;
-        // 立即刷新当前可见范围，确保文件被删除/重命名后窗口自动更新
-        await fetchRecordsRangeRef.current(start, 0);
+        // 仅在没有正在进行的 fetch 时才主动刷新。
+        // 不递增 fetchCounterRef，避免使正在进行的 fetchRecordsRange 失效——
+        // 否则旧 fetch 的结果被丢弃，而新 fetch 尚未返回，期间 results
+        // 可能不覆盖当前可见范围，导致 4 秒空白窗口。
+        // 如果有正在进行的 fetch，标记 pending，在 fetch 完成后自动刷新，
+        // 确保删除/新增的文件能及时反映到窗口。
+        if (!isFetchingRef.current) {
+          console.log('[REFRESH] triggering fetch start=' + start);
+          await fetchRecordsRangeRef.current(start, 0);
+        } else {
+          console.log('[REFRESH] setting pending (isFetching=true)');
+          pendingRefreshAfterFetchRef.current = true;
+        }
       }
     });
 
@@ -199,9 +214,15 @@ function App() {
   const pendingRefreshRef = useRef(false);
   const FETCH_SIZE = 200;
   const isFetchingRef = useRef(false);
+  // records-refresh 期间如果有进行中的 fetch，标记 pending，
+  // 在 fetch 完成后自动刷新当前可见范围，确保增量更新及时反映
+  const pendingRefreshAfterFetchRef = useRef(false);
 
   const fetchRecordsRange = useCallback(async (start: number, _end: number) => {
-    if (isFetchingRef.current) return;
+    if (isFetchingRef.current) {
+      console.log('[FETCH] skipped: isFetching=true start=' + start);
+      return;
+    }
     const fetchStart = Math.max(0, start - 50);
     const fetchEnd = start + FETCH_SIZE;
     const cacheKey = `${fetchStart}-${fetchEnd}`;
@@ -214,6 +235,7 @@ function App() {
     if (existingKey) {
       const cached = rangeCacheRef.current.get(existingKey)!;
       const offset = parseInt(existingKey.split('-')[0]);
+      console.log('[FETCH] cache hit start=' + start + ' offset=' + offset + ' len=' + cached.length);
       setResultsOffset(offset);
       setResults(cached);
       return;
@@ -224,8 +246,10 @@ function App() {
     const sortSnapshot = { ...sortStateRef.current };
     const { field, direction } = sortSnapshot;
     const reqStart = performance.now();
+    console.log('[FETCH] begin start=' + start + ' fetchStart=' + fetchStart + ' fetchEnd=' + fetchEnd + ' myId=' + myId);
     try {
       const response = await invoke<RecordsRangeResponse>('get_records_range', { start: fetchStart, end: fetchEnd, sortBy: field, sortDirection: direction });
+      const elapsed = (performance.now() - reqStart).toFixed(0);
       if (myId === fetchCounterRef.current &&
         sortStateRef.current.field === sortSnapshot.field &&
         sortStateRef.current.direction === sortSnapshot.direction) {
@@ -239,17 +263,49 @@ function App() {
         if (response.total !== totalCountRef.current) {
           setTotalCount(response.total);
         }
-        console.log('[FETCH] start=', start, 'ms=', (performance.now() - reqStart).toFixed(0), 'first=', response.results[0]?.name, 'last=', response.results[response.results.length - 1]?.name);
+        // 更新状态栏"找到 X 个结果"，确保删除/创建文件后状态栏数量同步更新。
+        // 注意：必须基于 response.total（后端最新值），不能用 totalCountRef.current，
+        // 因为 setTotalCount 是异步的，此时 totalCountRef.current 可能还是旧值。
+        const curQuery = searchStateRef.current.query;
+        if (curQuery.trim()) {
+          setStatusMessage(`找到 ${response.total} 个结果`);
+        }
+        console.log('[FETCH] done start=' + start + ' ms=' + elapsed + ' total=' + response.total + ' resultsLen=' + response.results.length + ' first=' + response.results[0]?.name + ' last=' + response.results[response.results.length - 1]?.name);
+      } else {
+        console.log('[FETCH] discarded start=' + start + ' ms=' + elapsed + ' myId=' + myId + ' curId=' + fetchCounterRef.current);
       }
     } catch (e) {
       console.error('Failed to fetch records range:', e);
       const errMsg = String(e);
       if (errMsg.includes('Cache expired') || errMsg.includes('cache expired')) {
+        console.log('[FETCH] cache expired, skipping start=' + start);
         return;
       }
       message(`获取数据失败: ${e}`, { title: '错误', kind: 'error' });
     } finally {
       isFetchingRef.current = false;
+      // 检查是否有 pending 的 refresh（records-refresh 期间有进行中 fetch 时设置）
+      // 如果有，在当前 fetch 完成后自动刷新当前可见范围，确保增量更新及时反映。
+      // 注意：必须先清除标志再刷新，避免刷新过程中又设置 pending 导致无限循环。
+      if (pendingRefreshAfterFetchRef.current) {
+        pendingRefreshAfterFetchRef.current = false;
+        const curStart = visibleRangeRef.current.start;
+        if (curStart !== undefined && curStart >= 0) {
+          // 删除覆盖当前可见范围的 cache，确保不会 cache hit 返回旧数据
+          // （当前 fetch 刚完成可能设置了新 cache，但该 cache 可能不含增量更新）
+          const fs = Math.max(0, curStart - 50);
+          const fe = curStart + FETCH_SIZE;
+          for (const key of rangeCacheRef.current.keys()) {
+            const [s, e] = key.split('-').map(Number);
+            if (fs >= s && fe <= e) {
+              rangeCacheRef.current.delete(key);
+              break;
+            }
+          }
+          // 执行 pending refresh（此时 isFetchingRef.current = false，可正常 fetch）
+          await fetchRecordsRangeRef.current(curStart, 0);
+        }
+      }
     }
   }, []);
 
@@ -407,21 +463,34 @@ function App() {
             break;
           }
         }
-        ++fetchCounterRef.current;
-        isFetchingRef.current = false;
+        // 不递增 fetchCounterRef，避免使正在进行的 fetch 失效。
+        // 原因：fetchRecordsRange 完成后的 setTotalCount 会触发 useVirtualScroll
+        // 重新计算，若 endIndex 改变则 onRangeChange 被触发，handleVisibleRangeChange
+        // 会被调用。如果此时 ++fetchCounterRef，会使正在进行的 fetch（records-refresh
+        // 触发的）结果被丢弃，形成空白窗口。缓存已被清除，下次 fetch 会获取最新数据。
       }
-      await fetchRecordsRangeRef.current(start, end);
+      if (isFetchingRef.current) {
+        // 有正在进行的 fetch，标记 pending，等 fetch 完成后再刷新。
+        // 不递增 fetchCounterRef，避免使正在进行的 fetch 失效。
+        // fetchRecordsRange 的 finally 块会检查 pendingRefreshAfterFetchRef，
+        // 自动执行 pending refresh 获取最新数据。
+        pendingRefreshAfterFetchRef.current = true;
+      } else {
+        await fetchRecordsRangeRef.current(start, end);
+      }
       // fetch 完成（数据已应用到 UI）后才允许 refresh 事件立即处理
       isDraggingRef.current = false;
     };
 
     if (atBottom) {
-      // 到达底部时立即 fetch，且强制使正在进行的 fetch 失效：
-      // 拖动过程中中间位置的防抖 fetch 可能已触发后端调用（isFetchingRef=true），
-      // 此时底部的立即 fetch 会被 fetchRecordsRange 的 isFetchingRef 守卫静默跳过，
-      // 导致 results/resultsOffset 被中间位置的错误数据覆盖，底部 renderLen=0。
-      ++fetchCounterRef.current;
-      isFetchingRef.current = false;
+      // 到达底部时立即 fetch。
+      // 不递增 fetchCounterRef，避免使正在进行的 fetch 失效。
+      // 原因：fetchRecordsRange 完成后的 setTotalCount 会触发 useVirtualScroll
+      // 重新计算，若 endIndex 改变则 onRangeChange 被触发，handleVisibleRangeChange
+      // 会被调用。如果此时 ++fetchCounterRef，会使正在进行的 fetch（records-refresh
+      // 触发的）结果被丢弃，形成空白窗口。
+      // 如果有正在进行的 fetch，doFetch 会标记 pendingRefreshAfterFetchRef，
+      // 等 fetch 完成后自动刷新。
       doFetch();
     } else {
       rangeChangeTimerRef.current = window.setTimeout(doFetch, 100);

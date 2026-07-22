@@ -126,6 +126,7 @@ pub async fn get_records_range(
 ) -> Result<RecordsRangeResponse, String> {
     let t0 = std::time::Instant::now();
     let mut vm = state.volume_manager.lock().await;
+    let lock_wait = t0.elapsed();
 
     if let Some((results, total)) = vm.get_cached_slice(
         parse_sort_by(&sort_by),
@@ -134,13 +135,14 @@ pub async fn get_records_range(
         end,
     ) {
         log::info!(
-            "[CMD] range start={} end={} sort={}/{} total={} results={} elapsed={:?}",
+            "[CMD] range start={} end={} sort={}/{} total={} results={} lock_wait={:?} elapsed={:?}",
             start,
             end,
             sort_by,
             sort_direction,
             total,
             results.len(),
+            lock_wait,
             t0.elapsed()
         );
         Ok(RecordsRangeResponse {

@@ -88,12 +88,21 @@ export function useVirtualScroll({
   const atBottom = totalItems > 0 && maxScrollTop > 0 && clampedScrollTop >= maxScrollTop - 1;
 
   let startIndex: number;
+  let bottomClamped = false;
   if (totalItems > 0) {
-    if (atBottom || (totalShrank && clampedScrollTop >= maxScrollTop - viewportHeight)) {
+    // 只有当内容超过视口高度时才需要底部钳制。
+    // 否则当 totalItems 很小（如 7 行）且 viewportHeight 较大（如 560px）时，
+    // spacerHeight(196) < viewportHeight(560)，maxScrollTop=0，
+    // totalShrank && clampedScrollTop(0) >= maxScrollTop(0) - viewportHeight(560) = -560
+    // 条件成立导致 bottomClamped=true，offsetY = 196 - 560 = -364（负数），
+    // virtual-content 被 translateY(-364px) 移出可视区域，显示空白窗口。
+    const needsBottomClamp = spacerHeight > viewportHeight;
+    if (needsBottomClamp && (atBottom || (totalShrank && clampedScrollTop >= maxScrollTop - viewportHeight))) {
       // 底部时直接用 visibleInView 钳制，确保最后一行落在视口内。
       // rawStartIndex 基于 effectiveItemHeight 可能远小于 totalItems - visibleInView（缩放模式），
       // 不钳制的话 startIndex 过小，末尾行会溢出视口。
       startIndex = Math.max(totalItems - visibleInView, 0);
+      bottomClamped = true;
     } else {
       startIndex = Math.min(rawStartIndex, Math.max(totalItems - visibleInView, 0));
     }
@@ -101,8 +110,13 @@ export function useVirtualScroll({
     startIndex = 0;
   }
   const endIndex = Math.min(startIndex + visibleCount, totalItems);
-  // 取整避免 sub-pixel 定位导致行边缘抗锯齿重影
-  const offsetY = Math.round(clampedScrollTop);
+  // 当 startIndex 被底部钳制时，offsetY 必须对齐到 spacerHeight - visibleInView * itemHeight，
+  // 确保 virtual-content 的底部正好等于 spacerHeight，最后一行完整可见。
+  // 否则 viewportHeight 不是 itemHeight 整数倍时，offsetY = clampedScrollTop 会导致
+  // virtual-content 底部超出可见区域，最后一行被截断只显示部分高度。
+  const offsetY = bottomClamped
+    ? Math.round(spacerHeight - visibleInView * itemHeight)
+    : Math.round(clampedScrollTop);
 
   const handleScroll = useCallback(() => {
     if (rafId.current !== null) {
@@ -137,6 +151,15 @@ export function useVirtualScroll({
     };
   }, [containerRef, handleScroll]);
 
+  // 注意：依赖数组不包含 totalItems。
+  // 原因：records-refresh 事件会调用 setTotalCount(total - 1)，
+  // 若 totalItems 在依赖数组中，则会重新触发 onRangeChange →
+  // handleVisibleRangeChange → atBottom 时 ++fetchCounterRef.current
+  // 使 records-refresh 自己触发的 fetchRecordsRange 失效，invoke 返回后
+  // 结果被丢弃；期间 results 仍是旧的，但 startIndex 已基于新的 totalItems
+  // 重新计算（底部钳制 startIndex = totalItems - visibleInView），不匹配，
+  // 渲染占位符形成 4 秒空白窗口。
+  // startIndex/endIndex 的变化本身已经能触发 useEffect，无需 totalItems。
   useEffect(() => {
     if (totalItems === 0) return;
     const key = `${startIndex}-${endIndex}`;
@@ -144,7 +167,7 @@ export function useVirtualScroll({
       lastFiredRef.current = key;
       onRangeChangeRef.current?.(startIndex, endIndex);
     }
-  }, [startIndex, endIndex, totalItems]);
+  }, [startIndex, endIndex]);
 
   const scrollToIndex = useCallback((index: number) => {
     if (containerRef.current) {

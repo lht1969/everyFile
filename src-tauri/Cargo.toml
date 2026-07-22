@@ -15,7 +15,7 @@ tauri-build = { version = "2", features = [] }
 embed-resource = "2.4" # 建议使用最新版本
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2" # Windows Toast 通知插件：开机启动时通知用户
@@ -84,6 +84,6 @@ custom-protocol = ["tauri/custom-protocol"]
 [profile.release]
 panic = "abort"
 codegen-units = 1
-lto = true
+lto = false
 opt-level = 3
 strip = true

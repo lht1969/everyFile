@@ -176,8 +176,19 @@ impl SearchCache {
                 }
             }
         }
+        // 诊断：统计去重前后的差值，检测跨卷 file_id 重复
+        let pre_dedup_len = fids.len();
         fids.sort_unstable();
         fids.dedup();
+        let dup_count = pre_dedup_len - fids.len();
+        if dup_count > 0 {
+            log::warn!(
+                "[DIAG] ensure_base_file_ids: matched_len={} unique_fids={} duplicate_fids={}",
+                pre_dedup_len,
+                fids.len(),
+                dup_count
+            );
+        }
         self.base_file_ids = Some(fids);
         true
     }
@@ -855,10 +866,13 @@ impl SearchCache {
                 let mut bi = 0usize;
                 let mut di = 0usize;
                 let mut pos = 0usize;
+                // 诊断：统计 is_base_active 返回 false 的次数
+                let mut skipped_base = 0usize;
                 while pos < eff_end && (bi < sorted_base.len() || di < delta_n) {
                     // 跳过已失效的 base 条目
                     while bi < sorted_base.len() && !is_base_active(sorted_base[bi]) {
                         bi += 1;
+                        skipped_base += 1;
                     }
 
                     let pick_base = if di >= delta_n {
@@ -950,7 +964,7 @@ impl SearchCache {
                     pos += 1;
                 }
                 log::info!(
-                    "[SORT] asc results={} total_n={} eff_start={} eff_end={} final_bi={} final_di={} final_pos={} elapsed={:?}",
+                    "[SORT] asc results={} total_n={} eff_start={} eff_end={} final_bi={} final_di={} final_pos={} delta_n={} base_n={} sorted_base_len={} skipped_base={} elapsed={:?}",
                     results.len(),
                     total_n,
                     eff_start,
@@ -958,8 +972,38 @@ impl SearchCache {
                     bi,
                     di,
                     pos,
+                    delta_n,
+                    base_n,
+                    sorted_base.len(),
+                    skipped_base,
                     t0.elapsed()
                 );
+                // 诊断：当归并提前结束时（pos < eff_end），记录详细差异
+                if pos < eff_end {
+                    let expected_skipped = sorted_base.len().saturating_sub(base_n);
+                    log::warn!(
+                        "[DIAG] asc merge ended early: pos={} eff_end={} deficit={} expected_skipped={} actual_skipped={} active_base_diff={}",
+                        pos,
+                        eff_end,
+                        eff_end - pos,
+                        expected_skipped,
+                        skipped_base,
+                        skipped_base as i64 - expected_skipped as i64
+                    );
+                    // 治标修复：active_base_count 增量维护可能因跨卷 file_id
+                    // 重复而偏大，导致 total_n 虚高。用实际归并产出修正 total_n，
+                    // 确保 UI 滚动到末尾时能看到最后一个文件。
+                    let corrected_total = pos + total_n.saturating_sub(eff_end);
+                    if corrected_total < total_n {
+                        log::warn!(
+                            "[FIX] asc correcting total_n: {} -> {} (deficit={})",
+                            total_n,
+                            corrected_total,
+                            total_n - corrected_total
+                        );
+                        return (results, corrected_total);
+                    }
+                }
                 (results, total_n)
             }
             SortDirection::Descending => {
@@ -967,12 +1011,15 @@ impl SearchCache {
                 let mut bi = sorted_base.len();
                 let mut di = delta_n;
                 let mut pos = total_n;
+                // 诊断：统计 is_base_active 返回 false 的次数
+                let mut skipped_base = 0usize;
                 while pos > eff_start && (bi > 0 || di > 0) {
                     pos -= 1;
 
                     // 跳过已失效的 base 条目（从尾部向前跳过）
                     while bi > 0 && !is_base_active(sorted_base[bi - 1]) {
                         bi -= 1;
+                        skipped_base += 1;
                     }
 
                     let pick_base = if di == 0 {
@@ -1067,7 +1114,7 @@ impl SearchCache {
                     }
                 }
                 log::info!(
-                    "[SORT] desc results={} total_n={} eff_start={} eff_end={} final_bi={} final_di={} final_pos={} elapsed={:?}",
+                    "[SORT] desc results={} total_n={} eff_start={} eff_end={} final_bi={} final_di={} final_pos={} delta_n={} base_n={} sorted_base_len={} skipped_base={} elapsed={:?}",
                     results.len(),
                     total_n,
                     eff_start,
@@ -1075,8 +1122,39 @@ impl SearchCache {
                     bi,
                     di,
                     pos,
+                    delta_n,
+                    base_n,
+                    sorted_base.len(),
+                    skipped_base,
                     t0.elapsed()
                 );
+                // 诊断：当归并提前结束时（pos > eff_start），记录详细差异
+                if pos > eff_start {
+                    let expected_skipped = sorted_base.len().saturating_sub(base_n);
+                    log::warn!(
+                        "[DIAG] desc merge ended early: pos={} eff_start={} deficit={} expected_skipped={} actual_skipped={} active_base_diff={}",
+                        pos,
+                        eff_start,
+                        pos - eff_start,
+                        expected_skipped,
+                        skipped_base,
+                        skipped_base as i64 - expected_skipped as i64
+                    );
+                    // 治标修复：active_base_count 增量维护可能因跨卷 file_id
+                    // 重复而偏大，导致 total_n 虚高。用实际归并产出修正 total_n，
+                    // 确保 UI 滚动到末尾时能看到最后一个文件。
+                    let deficit = pos - eff_start;
+                    let corrected_total = total_n.saturating_sub(deficit);
+                    if corrected_total < total_n {
+                        log::warn!(
+                            "[FIX] desc correcting total_n: {} -> {} (deficit={})",
+                            total_n,
+                            corrected_total,
+                            deficit
+                        );
+                        return (results, corrected_total);
+                    }
+                }
                 (results, total_n)
             }
         }
