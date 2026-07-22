@@ -199,8 +199,14 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
             const dataEnd = resultsOffset + results.length;
             const renderEnd = Math.min(endIndex, dataEnd);
             const atBottom = endIndex >= totalCount;
-            const visibleInViewCount = endIndex - startIndex;
-            const minRenderLen = atBottom ? visibleInViewCount : 0;
+            // 底部时确保至少渲染视口内可见行数，但不能超过当前可用数据量，
+            // 避免在结果集较小（如 7 条）且 endIndex 包含大量 overscan 时，
+            // 渲染过多空白 placeholder 行，被用户感知为"空白窗口"。
+            const bodyHeight = resultBodyRef.current?.clientHeight ?? 0;
+            const visibleInView = Math.max(1, Math.ceil(bodyHeight / ROW_HEIGHT));
+            const minRenderLen = atBottom
+              ? Math.min(visibleInView, totalCount - startIndex)
+              : 0;
             const renderLen = Math.max(Math.max(0, renderEnd - startIndex), minRenderLen);
             return (
               <div className="virtual-content" style={{ transform: `translateY(${offsetY}px)`, height: renderLen * ROW_HEIGHT }}>

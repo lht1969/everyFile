@@ -74,6 +74,25 @@ function App() {
       // 但新文件可能应该出现在可见范围内（取决于排序方式）。
       const changed_fids = event.payload.changed_fids;
       const hasAdded = added > 0;
+
+      // 当用户滚动到底部附近时，仅更新 totalCount，不触发 fetch。
+      // 原因：在大索引底部，每次 USN 增量更新（added/updated/removed）都触发 fetch
+      // 会导致后端排序 2-4 秒，期间 totalCount 继续变化，内容上下移动甚至空白。
+      // 后端 USN 日志处理几乎每次事件都报告 added > 0（索引微调），导致 !hasAdded
+      // 条件永远为 false，底部保护从未生效。因此移除 !hasAdded 条件，底部时一律跳过。
+      // 文件变动通过 setTotalCount 保持状态栏准确，用户滚动离开时自动 fetch 最新数据。
+      const currentEnd = visibleRangeRef.current.end ?? 0;
+      const isNearBottom = currentEnd > 0 && currentEnd >= totalCountRef.current - 1 - 5;
+      if (isNearBottom) {
+        console.log('[REFRESH] near bottom, skip fetch, update total=' + event.payload.total);
+        if (typeof event.payload.total === 'number') {
+          setTotalCount(event.payload.total);
+        }
+        // 标记 pending，确保用户滚动离开底部时清除缓存并 fetch 最新数据
+        pendingRefreshRef.current = true;
+        return;
+      }
+
       if (!hasAdded && changed_fids && changed_fids.length > 0 && resultsRef.current.length > 0) {
         const visibleFids = new Set(resultsRef.current.map(r => r.file_id));
         const hasVisibleChange = changed_fids.some(fid => visibleFids.has(fid));
@@ -289,21 +308,30 @@ function App() {
       // 注意：必须先清除标志再刷新，避免刷新过程中又设置 pending 导致无限循环。
       if (pendingRefreshAfterFetchRef.current) {
         pendingRefreshAfterFetchRef.current = false;
-        const curStart = visibleRangeRef.current.start;
-        if (curStart !== undefined && curStart >= 0) {
-          // 删除覆盖当前可见范围的 cache，确保不会 cache hit 返回旧数据
-          // （当前 fetch 刚完成可能设置了新 cache，但该 cache 可能不含增量更新）
-          const fs = Math.max(0, curStart - 50);
-          const fe = curStart + FETCH_SIZE;
-          for (const key of rangeCacheRef.current.keys()) {
-            const [s, e] = key.split('-').map(Number);
-            if (fs >= s && fe <= e) {
-              rangeCacheRef.current.delete(key);
-              break;
+        // 底部时跳过 pending refresh：
+        // 此次 fetch 已通过 setResults 更新了可见数据，setTotalCount 的影响
+        // 被 useVirtualScroll 的 atBottom+totalItemsChanged 守卫拦截，不会触发新 fetch。
+        // 若此处再执行 pending fetch，会再次 setTotalCount → 虽被拦截但浪费 CPU。
+        // 下一次 records-refresh 事件会自然触发新的 fetch。
+        const isAtBottom = totalCountRef.current > 0 &&
+          (visibleRangeRef.current.end ?? 0) >= totalCountRef.current - 1 - 5;
+        if (!isAtBottom) {
+          const curStart = visibleRangeRef.current.start;
+          if (curStart !== undefined && curStart >= 0) {
+            // 删除覆盖当前可见范围的 cache，确保不会 cache hit 返回旧数据
+            // （当前 fetch 刚完成可能设置了新 cache，但该 cache 可能不含增量更新）
+            const fs = Math.max(0, curStart - 50);
+            const fe = curStart + FETCH_SIZE;
+            for (const key of rangeCacheRef.current.keys()) {
+              const [s, e] = key.split('-').map(Number);
+              if (fs >= s && fe <= e) {
+                rangeCacheRef.current.delete(key);
+                break;
+              }
             }
+            // 执行 pending refresh（此时 isFetchingRef.current = false，可正常 fetch）
+            await fetchRecordsRangeRef.current(curStart, 0);
           }
-          // 执行 pending refresh（此时 isFetchingRef.current = false，可正常 fetch）
-          await fetchRecordsRangeRef.current(curStart, 0);
         }
       }
     }
