@@ -65,44 +65,32 @@ function App() {
         return;
       }
 
-      // 关键优化：检查变更文件是否在当前可见结果中
-      // 200万文件中只有20个可见，变更文件命中的概率极低（~0.001%），
-      // 大多数增量更新不需要刷新窗口。
-      // 必须在 setTotalCount 之前检查，否则 setTotalCount 会改变 totalItems，
-      // 导致 startIndex 偏移，触发 onRangeChange → 又一轮 fetch，形成循环。
-      // 注意：added > 0 时不能跳过，因为新文件的 fid 不在 visibleFids 中，
-      // 但新文件可能应该出现在可见范围内（取决于排序方式）。
       const changed_fids = event.payload.changed_fids;
-      const hasAdded = added > 0;
 
-      // 当用户滚动到底部附近时，仅更新 totalCount，不触发 fetch。
-      // 原因：在大索引底部，每次 USN 增量更新（added/updated/removed）都触发 fetch
-      // 会导致后端排序 2-4 秒，期间 totalCount 继续变化，内容上下移动甚至空白。
-      // 后端 USN 日志处理几乎每次事件都报告 added > 0（索引微调），导致 !hasAdded
-      // 条件永远为 false，底部保护从未生效。因此移除 !hasAdded 条件，底部时一律跳过。
-      // 文件变动通过 setTotalCount 保持状态栏准确，用户滚动离开时自动 fetch 最新数据。
+      // 先检查变更文件是否在当前可见结果中（必须在 setTotalCount 之前）。
+      // 200万文件中只有几十个可见，变更文件命中的概率极低，
+      // 大多数增量更新不需要刷新窗口。
+      let hasVisibleChange = false;
+      if (changed_fids && changed_fids.length > 0 && resultsRef.current.length > 0) {
+        const visibleFids = new Set(resultsRef.current.map(r => r.file_id));
+        hasVisibleChange = changed_fids.some(fid => visibleFids.has(fid));
+      }
+
+      // 当用户滚动到底部附近时，仅对不可见变更跳过 fetch。
+      // 可见文件的删除/修改/新增必须触发 fetch，否则用户看到的文件不会更新。
+      // 原因：后端 USN 日志处理几乎每次事件都报告 added > 0（索引微调），
+      // 原 !hasAdded 条件使底部保护从未生效，改为基于可见性判断。
       const currentEnd = visibleRangeRef.current.end ?? 0;
-      const isNearBottom = currentEnd > 0 && currentEnd >= totalCountRef.current - 1 - 5;
-      if (isNearBottom) {
-        console.log('[REFRESH] near bottom, skip fetch, update total=' + event.payload.total);
+      const isNearBottom = currentEnd > 0 && currentEnd >= totalCountRef.current - 1 - 5
+        && totalCountRef.current > FETCH_SIZE;
+      if (isNearBottom && !hasVisibleChange) {
+        console.log('[REFRESH] near bottom, skip fetch (no visible change), update total=' + event.payload.total);
         if (typeof event.payload.total === 'number') {
           setTotalCount(event.payload.total);
         }
         // 标记 pending，确保用户滚动离开底部时清除缓存并 fetch 最新数据
         pendingRefreshRef.current = true;
         return;
-      }
-
-      if (!hasAdded && changed_fids && changed_fids.length > 0 && resultsRef.current.length > 0) {
-        const visibleFids = new Set(resultsRef.current.map(r => r.file_id));
-        const hasVisibleChange = changed_fids.some(fid => visibleFids.has(fid));
-        if (!hasVisibleChange) {
-          // 变更文件不在可见范围内，仅更新总数（不触发重排/重取）
-          if (typeof event.payload.total === 'number') {
-            setTotalCount(event.payload.total);
-          }
-          return;
-        }
       }
 
       // 拖动滑块时暂不出 delta 信息，记录 pending 待停止后刷新
@@ -314,7 +302,8 @@ function App() {
         // 若此处再执行 pending fetch，会再次 setTotalCount → 虽被拦截但浪费 CPU。
         // 下一次 records-refresh 事件会自然触发新的 fetch。
         const isAtBottom = totalCountRef.current > 0 &&
-          (visibleRangeRef.current.end ?? 0) >= totalCountRef.current - 1 - 5;
+          (visibleRangeRef.current.end ?? 0) >= totalCountRef.current - 1 - 5
+          && totalCountRef.current > FETCH_SIZE;
         if (!isAtBottom) {
           const curStart = visibleRangeRef.current.start;
           if (curStart !== undefined && curStart >= 0) {

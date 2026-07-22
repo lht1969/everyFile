@@ -92,16 +92,16 @@ export function useVirtualScroll({
   const atBottom = totalItems > 0 && maxScrollTop > 0 && clampedScrollTop >= maxScrollTop - 1;
 
   let startIndex: number;
+  // 只有当内容超过视口高度时才需要底部钳制。
+  // 否则当 totalItems 很小（如 7 行）且 viewportHeight 较大（如 560px）时，
+  // spacerHeight(196) < viewportHeight(560)，maxScrollTop=0，
+  // totalShrank && clampedScrollTop(0) >= maxScrollTop(0) - viewportHeight(560) = -560
+  // 条件成立，startIndex = totalItems - visibleInView 可能为负数，
+  // 虽然会被 max(0) 钳制，但 offsetY 若基于 spacerHeight - visibleInView * itemHeight 会得到负数，
+  // 导致 virtual-content 被移出可视区域。此处保留 needsBottomClamp 仅用于 startIndex 计算，
+  // offsetY 统一使用 clampedScrollTop，避免循环。
+  const needsBottomClamp = spacerHeight > viewportHeight;
   if (totalItems > 0) {
-    // 只有当内容超过视口高度时才需要底部钳制。
-    // 否则当 totalItems 很小（如 7 行）且 viewportHeight 较大（如 560px）时，
-    // spacerHeight(196) < viewportHeight(560)，maxScrollTop=0，
-    // totalShrank && clampedScrollTop(0) >= maxScrollTop(0) - viewportHeight(560) = -560
-    // 条件成立，startIndex = totalItems - visibleInView 可能为负数，
-    // 虽然会被 max(0) 钳制，但 offsetY 若基于 spacerHeight - visibleInView * itemHeight 会得到负数，
-    // 导致 virtual-content 被移出可视区域。此处保留 needsBottomClamp 仅用于 startIndex 计算，
-    // offsetY 统一使用 clampedScrollTop，避免循环。
-    const needsBottomClamp = spacerHeight > viewportHeight;
     if (needsBottomClamp && (atBottom || (totalShrank && clampedScrollTop >= maxScrollTop - viewportHeight))) {
       // 底部时直接用 visibleInView 钳制，确保最后一行落在视口内。
       // rawStartIndex 基于 effectiveItemHeight 可能远小于 totalItems - visibleInView（缩放模式），
@@ -115,14 +115,15 @@ export function useVirtualScroll({
   }
   const endIndex = Math.min(startIndex + visibleCount, totalItems);
   // 使用 clampedScrollTop 作为 offsetY，确保 virtual-content 位置与浏览器 scrollTop 同步。
-  // 原因：之前 bottomClamped 时使用 spacerHeight - visibleInView * itemHeight，
-  // 当 viewportHeight 不是 itemHeight 整数倍或 totalItems 频繁变化时，
-  // offsetY 与 clampedScrollTop 的差值会不断变化，触发浏览器 scroll 调整 →
-  // handleScroll → setTick → 重渲染 → onRangeChange → fetch 的循环，
-  // 表现为最后一行持续上移/下移，CPU 占用高，最终内容移出窗口。
-  // clampedScrollTop 由浏览器真实滚动位置决定，是最稳定的基准。
-  // 底部时 clampedScrollTop ≈ maxScrollTop，最后一行自然位于视口底部。
-  const offsetY = Math.round(clampedScrollTop);
+  // 在缩放模式下 effectiveItemHeight 远小于 itemHeight，startIndex * effectiveItemHeight
+  // 会远大于 clampedScrollTop，导致 virtual-content 被推到视口下方，
+  // 第一行从视口中间开始显示、尾行溢出。
+  // 底部时使用 spacerHeight - visibleInView * itemHeight，将最后一行底部对齐视口底部，
+  // 避免最后一行因 viewportHeight 非 itemHeight 整数倍而时隐时现。
+  // programmaticScrollRef + totalItemsChanged guard 已切断反馈循环，此公式不会引起循环。
+  const offsetY = (needsBottomClamp && atBottom)
+    ? spacerHeight - visibleInView * itemHeight
+    : Math.round(clampedScrollTop);
 
   // 在底部且 maxScrollTop 变化时，强制将 scrollTop 对齐到 maxScrollTop。
   // 原因：totalItems 因 USN 增量更新变化时，浏览器会自动调整 scrollTop，
