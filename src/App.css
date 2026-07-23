@@ -9,8 +9,8 @@
   --primary-hover: #1d4ed8;
   --border-color: #e5e7eb;
   --bg-color: #f9fafb;
-  --text-color: #1f2937;
-  --text-secondary: #6b7280;
+  --text-color: #111827;
+  --text-secondary: #374151;
   --success-color: #10b981;
   --warning-color: #f59e0b;
   --danger-color: #ef4444;
@@ -444,7 +444,7 @@ body {
 }
 
 .result-row.header {
-  font-weight: 600;
+  font-weight: 400;
   background: #f9fafb;
   position: sticky;
   top: 0;
@@ -526,13 +526,13 @@ body {
   white-space: nowrap;
   text-overflow: ellipsis;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 13px;
   min-width: 0;
 }
 
 .col-size,
 .col-modified {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-secondary);
 }
 

@@ -192,7 +192,6 @@ export function useColumnWidths(
   useEffect(() => {
     const measured = measureContentWidths(results);
     contentWidthsRef.current = measured;
-    frozenColumnsRef.current.clear();
     // Trigger recalc with new content widths
     if (containerWidthRef.current > 0) {
       recalc(containerWidthRef.current);

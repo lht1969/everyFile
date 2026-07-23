@@ -35,10 +35,6 @@ export function useVirtualScroll({
   const onRangeChangeRef = useRef(onRangeChange);
   onRangeChangeRef.current = onRangeChange;
   const prevTotalItemsRef = useRef(totalItems);
-  // 专门用于 onRangeChange 的 totalItems 追踪，检测底部 totalCount 变化引起的 startIndex 偏移
-  const prevTotalItemsForOnRangeRef = useRef(totalItems);
-  // 标记程序性 scrollTop 调整（底部对齐 maxScrollTop），handleScroll 据此跳过 setTick 避免多余重渲染
-  const programmaticScrollRef = useRef(false);
 
   const scrollTop = scrollTopRef.current;
   const [viewportHeight, setViewportHeight] = useState(0);
@@ -92,16 +88,16 @@ export function useVirtualScroll({
   const atBottom = totalItems > 0 && maxScrollTop > 0 && clampedScrollTop >= maxScrollTop - 1;
 
   let startIndex: number;
-  // 只有当内容超过视口高度时才需要底部钳制。
-  // 否则当 totalItems 很小（如 7 行）且 viewportHeight 较大（如 560px）时，
-  // spacerHeight(196) < viewportHeight(560)，maxScrollTop=0，
-  // totalShrank && clampedScrollTop(0) >= maxScrollTop(0) - viewportHeight(560) = -560
-  // 条件成立，startIndex = totalItems - visibleInView 可能为负数，
-  // 虽然会被 max(0) 钳制，但 offsetY 若基于 spacerHeight - visibleInView * itemHeight 会得到负数，
-  // 导致 virtual-content 被移出可视区域。此处保留 needsBottomClamp 仅用于 startIndex 计算，
-  // offsetY 统一使用 clampedScrollTop，避免循环。
-  const needsBottomClamp = spacerHeight > viewportHeight;
   if (totalItems > 0) {
+    // 只有当内容超过视口高度时才需要底部钳制。
+    // 否则当 totalItems 很小（如 7 行）且 viewportHeight 较大（如 560px）时，
+    // spacerHeight(196) < viewportHeight(560)，maxScrollTop=0，
+    // totalShrank && clampedScrollTop(0) >= maxScrollTop(0) - viewportHeight(560) = -560
+    // 条件成立，startIndex = totalItems - visibleInView 可能为负数，
+    // 虽然会被 max(0) 钳制，但 offsetY 若基于 spacerHeight - visibleInView * itemHeight 会得到负数，
+    // 导致 virtual-content 被移出可视区域。此处保留 needsBottomClamp 仅用于 startIndex 计算，
+    // offsetY 统一使用 clampedScrollTop，避免循环。
+    const needsBottomClamp = spacerHeight > viewportHeight;
     if (needsBottomClamp && (atBottom || (totalShrank && clampedScrollTop >= maxScrollTop - viewportHeight))) {
       // 底部时直接用 visibleInView 钳制，确保最后一行落在视口内。
       // rawStartIndex 基于 effectiveItemHeight 可能远小于 totalItems - visibleInView（缩放模式），
@@ -115,15 +111,14 @@ export function useVirtualScroll({
   }
   const endIndex = Math.min(startIndex + visibleCount, totalItems);
   // 使用 clampedScrollTop 作为 offsetY，确保 virtual-content 位置与浏览器 scrollTop 同步。
-  // 在缩放模式下 effectiveItemHeight 远小于 itemHeight，startIndex * effectiveItemHeight
-  // 会远大于 clampedScrollTop，导致 virtual-content 被推到视口下方，
-  // 第一行从视口中间开始显示、尾行溢出。
-  // 底部时使用 spacerHeight - visibleInView * itemHeight，将最后一行底部对齐视口底部，
-  // 避免最后一行因 viewportHeight 非 itemHeight 整数倍而时隐时现。
-  // programmaticScrollRef + totalItemsChanged guard 已切断反馈循环，此公式不会引起循环。
-  const offsetY = (needsBottomClamp && atBottom)
-    ? spacerHeight - visibleInView * itemHeight
-    : Math.round(clampedScrollTop);
+  // 原因：之前 bottomClamped 时使用 spacerHeight - visibleInView * itemHeight，
+  // 当 viewportHeight 不是 itemHeight 整数倍或 totalItems 频繁变化时，
+  // offsetY 与 clampedScrollTop 的差值会不断变化，触发浏览器 scroll 调整 →
+  // handleScroll → setTick → 重渲染 → onRangeChange → fetch 的循环，
+  // 表现为最后一行持续上移/下移，CPU 占用高，最终内容移出窗口。
+  // clampedScrollTop 由浏览器真实滚动位置决定，是最稳定的基准。
+  // 底部时 clampedScrollTop ≈ maxScrollTop，最后一行自然位于视口底部。
+  const offsetY = Math.round(clampedScrollTop);
 
   // 在底部且 maxScrollTop 变化时，强制将 scrollTop 对齐到 maxScrollTop。
   // 原因：totalItems 因 USN 增量更新变化时，浏览器会自动调整 scrollTop，
@@ -135,7 +130,6 @@ export function useVirtualScroll({
     const container = containerRef.current;
     if (!container || !atBottom || maxScrollTop <= 0) return;
     if (Math.abs(container.scrollTop - maxScrollTop) > 0.5) {
-      programmaticScrollRef.current = true;
       scrollTopRef.current = maxScrollTop;
       container.scrollTop = maxScrollTop;
     }
@@ -147,16 +141,8 @@ export function useVirtualScroll({
     }
     rafId.current = requestAnimationFrame(() => {
       if (containerRef.current) {
-        const newScrollTop = containerRef.current.scrollTop;
-        if (programmaticScrollRef.current) {
-          programmaticScrollRef.current = false;
-          // 程序性滚动（底部对齐 maxScrollTop）：更新 ref 但不触发重渲染，
-          // 避免 scroll 事件 → setTick → 重渲染 → onRangeChange → fetch 的多余循环
-          scrollTopRef.current = newScrollTop;
-        } else {
-          scrollTopRef.current = newScrollTop;
-          setTick(t => t + 1);
-        }
+        scrollTopRef.current = containerRef.current.scrollTop;
+        setTick(t => t + 1);
       }
       rafId.current = null;
     });
@@ -195,16 +181,6 @@ export function useVirtualScroll({
     if (totalItems === 0) return;
     const key = `${startIndex}-${endIndex}`;
     if (key !== lastFiredRef.current) {
-      const totalItemsChanged = prevTotalItemsForOnRangeRef.current !== totalItems;
-      prevTotalItemsForOnRangeRef.current = totalItems;
-      // 底部时 totalItems 变化仅引起 startIndex 机械性偏移（始终显示最后N行），
-      // 跳过 onRangeChange，切断 setTotalCount → startIndex → onRangeChange → fetch 循环。
-      // 用户主动滚动时 totalItems 不变，不受影响；搜索/排序时 scrollTop 重置为 0，
-      // atBottom=false，也不受影响。文件变动通过 REFRESH → fetch → setResults 已即时更新。
-      if (totalItemsChanged && atBottom) {
-        lastFiredRef.current = key;
-        return;
-      }
       lastFiredRef.current = key;
       onRangeChangeRef.current?.(startIndex, endIndex);
     }

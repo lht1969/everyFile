@@ -191,7 +191,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
             <option value="json">JSON</option>
           </select>
         )}
-        <button type="button"  className="settings-button" onClick={onOpenSettings} title="设置">
+        <button type="button" className="settings-button" onClick={onOpenSettings} title="设置">
           ⚙
         </button>
       </form>
@@ -243,7 +243,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
       )}
       {(showHistory && filteredHistory.length > 0) && (
         <div className="suggestions">
-          <div className="suggestion-header">搜索历史</div>
+          <div className="suggestion-header">搜索历史（输入搜索条件后回车即可自动加入历史）</div>
           {filteredHistory.slice(0, 10).map((h, i) => (
             <div key={i} className="suggestion-item" onClick={() => { setQuery(h); onSearch(h); setShowHistory(false); }}>
               <span className="history-icon">🕐</span> {h}
