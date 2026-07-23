@@ -875,10 +875,10 @@ impl SearchCache {
                         skipped_base += 1;
                     }
 
-                    let pick_base = if bi >= sorted_base.len() {
-                        false
-                    } else if di >= delta_n {
+                    let pick_base = if di >= delta_n {
                         true
+                    } else if bi >= sorted_base.len() {
+                        false
                     } else {
                         let idx = sorted_base[bi];
                         let Some(&(va, fa_idx)) = self.base.matched.get(idx as usize) else {
@@ -1022,10 +1022,10 @@ impl SearchCache {
                         skipped_base += 1;
                     }
 
-                    let pick_base = if bi == 0 {
-                        false
-                    } else if di == 0 {
+                    let pick_base = if di == 0 {
                         true
+                    } else if bi == 0 {
+                        false
                     } else {
                         let idx = sorted_base[bi - 1];
                         let Some(&(va, fa_idx)) = self.base.matched.get(idx as usize) else {
@@ -1266,7 +1266,11 @@ impl VolumeManager {
     }
 
     pub fn volumes(&self) -> Vec<String> {
-        self.vol_names.clone()
+        self.vol_names.iter().filter(|n| !n.is_empty()).cloned().collect()
+    }
+
+    pub fn invalidate_search_cache(&mut self) {
+        self.search_cache = None;
     }
 
     pub fn get_monitor_mut(&mut self, drive_letter: &str) -> Option<&mut VolumeMonitor> {
@@ -1279,10 +1283,6 @@ impl VolumeManager {
 
     pub fn return_monitor(&mut self, drive_letter: &str, monitor: VolumeMonitor) {
         self.volumes.insert(drive_letter.to_string(), monitor);
-    }
-
-    pub fn invalidate_search_cache(&mut self) {
-        self.search_cache = None;
     }
 
     pub fn total_file_count(&self) -> usize {
@@ -1452,47 +1452,16 @@ impl VolumeManager {
     }
 
     pub fn scan_all_with_progress(&mut self, handle: &tauri::AppHandle) -> Result<usize> {
-        // 取出所有 monitor，并发扫描后放回，减少总扫描时间。
-        let drained: Vec<(String, VolumeMonitor)> = self
-            .volumes
-            .drain()
-            .map(|(k, v)| (k, v))
-            .collect();
-
-        let total = std::thread::scope(|s| {
-            let handles: Vec<_> = drained
-                .into_iter()
-                .map(|(drive_letter, mut monitor)| {
-                    let h = handle.clone();
-                    let dl = drive_letter.clone();
-                    s.spawn(move || {
-                        let result = monitor.scan_with_progress_callback(&h);
-                        (dl, monitor, result)
-                    })
-                })
-                .collect();
-
-            let mut total = 0usize;
-            for join_handle in handles {
-                let (drive_letter, monitor, scan_result) = join_handle.join().unwrap();
-                match scan_result {
-                    Ok(count) => {
-                        log::info!("Scanned volume {}: {} files", drive_letter, count);
-                        let _ = handle.emit(
-                            "scan-complete",
-                            serde_json::json!({"volume": drive_letter, "count": count}),
-                        );
-                        total += count;
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to scan volume {}: {}", drive_letter, e);
-                    }
-                }
-                self.volumes.insert(drive_letter, monitor);
-            }
-            total
-        });
-
+        let mut total = 0;
+        for (drive_letter, monitor) in self.volumes.iter_mut() {
+            let count = monitor.scan_with_progress_callback(handle)?;
+            log::info!("Scanned volume {}: {} files", drive_letter, count);
+            total += count;
+            let _ = handle.emit(
+                "scan-complete",
+                serde_json::json!({"volume": drive_letter, "count": count}),
+            );
+        }
         self.search_cache = None;
         Ok(total)
     }
@@ -2135,10 +2104,10 @@ impl VolumeMonitor {
         self.files.clear();
         let walker = self.build_walker();
         let drive_letter = self.drive_letter.clone();
-        let mut on_progress = |_count: usize| {
+        let mut on_progress = |count: usize| {
             let _ = handle.emit(
                 "scan-progress",
-                serde_json::json!({"volume": drive_letter}),
+                serde_json::json!({"volume": drive_letter, "count": count}),
             );
         };
         self.process_walker(walker, Some(&mut on_progress))
