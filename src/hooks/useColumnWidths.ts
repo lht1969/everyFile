@@ -70,32 +70,22 @@ function shrinkCols(deficit: number, cols: ColumnConfig[]): number[] {
   let widths = cols.map(c => c.naturalWidth);
   let remaining = deficit;
 
-  // Phase 1: compress non-fixed (name, path)
-  for (let phase = 0; phase < 2 && remaining > 0; phase++) {
-    const phaseIndices = cols
-      .map((c, i) => ({ c, i }))
-      .filter(x => !x.c.fixed && (phase === 0 ? x.c.minWidth > 0 : true))
-      .map(x => x.i);
+  // Phase 0: compress name only (highest priority non-fixed)
+  if (remaining > 0) {
+    const idx = 0; // name
+    const canShrink = Math.max(0, widths[idx] - cols[idx].minWidth);
+    const shrink = Math.min(remaining, canShrink);
+    widths[idx] -= shrink;
+    remaining -= shrink;
+  }
 
-    if (phaseIndices.length === 0) continue;
-
-    const phaseTotal = phaseIndices.reduce((s, i) => s + widths[i], 0);
-    const phaseMin = phaseIndices.reduce((s, i) => s + cols[i].minWidth, 0);
-    const phaseNeed = Math.min(remaining, Math.max(0, phaseTotal - phaseMin));
-
-    if (phaseNeed <= 0) continue;
-
-    const ratio = phaseNeed / phaseTotal;
-    let allocated = 0;
-    for (let j = 0; j < phaseIndices.length; j++) {
-      const idx = phaseIndices[j];
-      const shrink = j === phaseIndices.length - 1
-        ? phaseNeed - allocated
-        : Math.floor(widths[idx] * ratio);
-      widths[idx] = Math.max(cols[idx].minWidth, widths[idx] - shrink);
-      allocated += shrink;
-    }
-    remaining -= phaseNeed;
+  // Phase 1: compress path only
+  if (remaining > 0) {
+    const idx = 1; // path
+    const canShrink = Math.max(0, widths[idx] - cols[idx].minWidth);
+    const shrink = Math.min(remaining, canShrink);
+    widths[idx] -= shrink;
+    remaining -= shrink;
   }
 
   // Phase 2: compress fixed (size, modified) as last resort
@@ -126,32 +116,32 @@ function expandCols(surplus: number, cols: ColumnConfig[]): number[] {
   let widths = cols.map(c => c.naturalWidth);
   let remaining = surplus;
 
-  // Expand non-fixed columns that are below natural
-  const nonFixedIndices = cols.map((c, i) => ({ c, i })).filter(x => !x.c.fixed).map(x => x.i);
-
-  // First pass: distribute evenly among non-fixed columns below natural
-  if (remaining > 0 && nonFixedIndices.length > 0) {
-    const needsSpace = nonFixedIndices.filter(i => widths[i] < cols[i].naturalWidth);
-    if (needsSpace.length > 0) {
-      const totalNeed = needsSpace.reduce((s, i) => s + (cols[i].naturalWidth - widths[i]), 0);
-      const give = Math.min(remaining, totalNeed);
-      const each = give / needsSpace.length;
-      for (const i of needsSpace) {
-        widths[i] = Math.min(cols[i].naturalWidth, widths[i] + each);
-      }
+  // Phase 1: expand name to its natural width
+  if (remaining > 0) {
+    const idx = 0; // name
+    const need = cols[idx].naturalWidth - widths[idx];
+    if (need > 0) {
+      const give = Math.min(remaining, need);
+      widths[idx] += give;
       remaining -= give;
     }
   }
 
-  // Second pass: if surplus remains, give to path only
+  // Phase 2: expand path to its natural width
   if (remaining > 0) {
-    const pathIdx = nonFixedIndices.find(i => cols[i].minWidth === PATH_MIN_WIDTH);
-    if (pathIdx !== undefined && widths[pathIdx] < cols[pathIdx].naturalWidth) {
-      const need = cols[pathIdx].naturalWidth - widths[pathIdx];
+    const idx = 1; // path
+    const need = cols[idx].naturalWidth - widths[idx];
+    if (need > 0) {
       const give = Math.min(remaining, need);
-      widths[pathIdx] += give;
+      widths[idx] += give;
       remaining -= give;
     }
+  }
+
+  // Phase 3: extra surplus → path continues expanding
+  if (remaining > 0) {
+    const idx = 1; // path
+    widths[idx] += remaining;
   }
 
   return widths;
@@ -165,6 +155,7 @@ export function useColumnWidths(
   const [columnWidths, setColumnWidths] = useState<number[]>([0, 0, SIZE_NATURAL, MODIFIED_NATURAL]);
   const containerWidthRef = useRef(0);
   const frozenColumnsRef = useRef<Set<number>>(new Set());
+  const firstMeasuredRef = useRef(false);
 
   const recalc = useCallback((containerWidth: number) => {
     containerWidthRef.current = containerWidth;
@@ -176,6 +167,23 @@ export function useColumnWidths(
       const nameW = Math.floor(avail / 3);
       const pathW = avail - nameW;
       setColumnWidths([nameW, pathW, SIZE_NATURAL, MODIFIED_NATURAL]);
+      return;
+    }
+
+    // First time results measured: use current column widths as natural for name/path,
+    // so they don't jump. Only compress if current exceeds new measured natural.
+    if (!firstMeasuredRef.current && naturalWidths.name > 0) {
+      firstMeasuredRef.current = true;
+      const nameNat = Math.min(columnWidths[0], naturalWidths.name);
+      const pathNat = Math.min(columnWidths[1], naturalWidths.path);
+      const cols: ColumnConfig[] = [
+        { naturalWidth: nameNat, minWidth: NAME_MIN_WIDTH, fixed: false },
+        { naturalWidth: pathNat, minWidth: PATH_MIN_WIDTH, fixed: false },
+        { naturalWidth: SIZE_NATURAL, minWidth: SIZE_MIN, fixed: true },
+        { naturalWidth: MODIFIED_NATURAL, minWidth: MODIFIED_MIN, fixed: true },
+      ];
+      const raw = calcWidths(containerWidth, cols);
+      setColumnWidths(raw);
       return;
     }
 
@@ -202,6 +210,10 @@ export function useColumnWidths(
     setNaturalWidths(newNatural);
     // Unfreeze all columns on new results
     frozenColumnsRef.current.clear();
+    // Reset first-measured flag when results become empty
+    if (results.length === 0) {
+      firstMeasuredRef.current = false;
+    }
   }, [results]);
 
   // Recalculate when natural widths change
