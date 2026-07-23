@@ -397,8 +397,8 @@ body {
 }
 
 .col-modified {
-  text-align: right;
-  justify-self: end;
+  text-align: center;
+  justify-self: center;
   min-width: 0;
 }
 
@@ -453,11 +453,6 @@ body {
 .result-row.header .col-size {
   text-align: right;
   justify-self: end;
-}
-
-.result-row.header .col-modified {
-  text-align: center;
-  justify-self: center;
 }
 
 .result-row.header .col-name,
