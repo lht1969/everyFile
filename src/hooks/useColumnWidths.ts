@@ -91,20 +91,20 @@ function shrinkCols(available: number, current: number[], cols: ColumnConfig[]):
 
 function expandCols(available: number, current: number[], cols: ColumnConfig[]): number[] {
   let widths = [...current];
-  let remaining = available - widths.reduce((s, w) => s + w, 0);
-  if (remaining <= 0) return widths;
 
-  // Phase 1: restore fixed columns to natural
-  for (const idx of [2, 3]) {
-    const need = cols[idx].naturalWidth - widths[idx];
-    if (need > 0 && remaining > 0) {
-      const give = Math.min(remaining, need);
-      widths[idx] += give;
-      remaining -= give;
+  // Phase 0: compress columns above their natural width to free space
+  // This handles inflated widths from a previous wider layout
+  for (const idx of [0, 1, 2, 3]) {
+    const over = widths[idx] - cols[idx].naturalWidth;
+    if (over > 0) {
+      widths[idx] = cols[idx].naturalWidth;
     }
   }
 
-  // Phase 2: expand name to natural
+  let remaining = available - widths.reduce((s, w) => s + w, 0);
+  if (remaining <= 0) return widths;
+
+  // Phase 1: expand name to natural
   const nameNeed = cols[0].naturalWidth - widths[0];
   if (nameNeed > 0 && remaining > 0) {
     const give = Math.min(remaining, nameNeed);
@@ -112,7 +112,7 @@ function expandCols(available: number, current: number[], cols: ColumnConfig[]):
     remaining -= give;
   }
 
-  // Phase 3: expand path to natural
+  // Phase 2: expand path to natural
   const pathNeed = cols[1].naturalWidth - widths[1];
   if (pathNeed > 0 && remaining > 0) {
     const give = Math.min(remaining, pathNeed);
@@ -120,7 +120,7 @@ function expandCols(available: number, current: number[], cols: ColumnConfig[]):
     remaining -= give;
   }
 
-  // Phase 4: extra surplus → path continues expanding
+  // Phase 3: extra surplus → path continues expanding
   if (remaining > 0) {
     widths[1] += remaining;
   }
