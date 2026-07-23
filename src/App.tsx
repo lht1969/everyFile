@@ -40,7 +40,7 @@ function App() {
       if (e.key !== 'Escape') return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      getCurrentWindow().close();
+      try { getCurrentWindow().close(); } catch (err) { console.error('[ESC] close failed:', err); }
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
