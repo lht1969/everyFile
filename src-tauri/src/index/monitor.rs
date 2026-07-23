@@ -1251,6 +1251,7 @@ impl VolumeManager {
             include_system_files,
         );
         self.volumes.insert(drive_letter.to_string(), monitor);
+        self.search_cache = None;
         Ok(())
     }
 
