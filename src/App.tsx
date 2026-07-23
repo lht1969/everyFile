@@ -83,10 +83,12 @@ function App() {
       // 可见文件的删除/修改/新增必须触发 fetch，否则用户看到的文件不会更新。
       // 原因：后端 USN 日志处理几乎每次事件都报告 added > 0（索引微调），
       // 原 !hasAdded 条件使底部保护从未生效，改为基于可见性判断。
+      // 注意：当 changed_fids 未提供时（如右键菜单删除/剪切），
+      // 必须触发 fetch 以确保删除的文件从显示结果中移除。
       const currentEnd = visibleRangeRef.current.end ?? 0;
       const isNearBottom = currentEnd > 0 && currentEnd >= totalCountRef.current - 1 - 5
         && totalCountRef.current > FETCH_SIZE;
-      if (isNearBottom && !hasVisibleChange) {
+      if (isNearBottom && changed_fids && !hasVisibleChange) {
         console.log('[REFRESH] near bottom, skip fetch (no visible change), update total=' + event.payload.total);
         if (typeof event.payload.total === 'number') {
           setTotalCount(event.payload.total);
@@ -140,12 +142,37 @@ function App() {
       }
     });
 
+    // 右键菜单操作后触发刷新（删除、剪切+粘贴、重命名等）
+    // 独立于 records-refresh，不受空变化过滤拦截
+    const unlistenRefreshVisible = listen('refresh-visible', async () => {
+      console.log('[REFRESH-VISIBLE] received, triggering fetch');
+      const { start } = visibleRangeRef.current;
+      if (start !== undefined && start >= 0) {
+        if (isFetchingRef.current) {
+          pendingRefreshAfterFetchRef.current = true;
+        } else {
+          // 清除覆盖当前可见范围的缓存，确保获取最新数据
+          const fetchStart = Math.max(0, start - 50);
+          const fetchEnd = start + FETCH_SIZE;
+          for (const key of rangeCacheRef.current.keys()) {
+            const [s, e] = key.split('-').map(Number);
+            if (fetchStart >= s && fetchEnd <= e) {
+              rangeCacheRef.current.delete(key);
+              break;
+            }
+          }
+          await fetchRecordsRangeRef.current(start, 0);
+        }
+      }
+    });
+
     return () => {
       unlistenProgress.then(fn => fn());
       unlistenComplete.then(fn => fn());
       unlistenAllComplete.then(fn => fn());
       unlistenUpdated.then(fn => fn());
       unlistenRefresh.then(fn => fn());
+      unlistenRefreshVisible.then(fn => fn());
     };
   }, []);
 

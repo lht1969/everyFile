@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use tauri::Emitter;
 use tauri::State;
 
 #[tauri::command]
@@ -52,6 +53,7 @@ pub async fn open_folder(path: String) -> Result<(), String> {
 pub async fn delete_file(
     path: String,
     state: State<'_, super::search::AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     log::info!("Deleting file: {}", path);
 
@@ -70,6 +72,17 @@ pub async fn delete_file(
 
     let mut vm = state.volume_manager.lock().await;
     vm.remove_file(&path);
+    drop(vm);
+
+    // 通知前端刷新当前可见范围，确保删除的文件立即从显示结果中移除
+    let _ = app.emit(
+        "records-refresh",
+        serde_json::json!({
+            "added": 0,
+            "updated": 0,
+            "removed": 1,
+        }),
+    );
 
     Ok(())
 }
@@ -91,6 +104,7 @@ pub async fn move_file(
     source: String,
     destination: String,
     state: State<'_, super::search::AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     log::info!("Moving file from {} to {}", source, destination);
 
@@ -104,6 +118,17 @@ pub async fn move_file(
 
     let mut vm = state.volume_manager.lock().await;
     vm.remove_file(&source);
+    drop(vm);
+
+    // 通知前端刷新当前可见范围，确保移动的文件立即从显示结果中移除
+    let _ = app.emit(
+        "records-refresh",
+        serde_json::json!({
+            "added": 0,
+            "updated": 0,
+            "removed": 1,
+        }),
+    );
 
     Ok(())
 }

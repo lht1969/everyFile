@@ -182,7 +182,7 @@ pub fn show_context_menu(
         let _ = DestroyMenu(hmenu);
     }
 
-    // 检查文件是否被删除（如"删除"命令），如果是则立即更新索引并通知前端刷新
+    // 检查文件是否被删除（如"删除"命令），如果是则立即更新索引
     if !Path::new(&path).exists() {
         log::info!(
             "File '{}' no longer exists after context menu action, updating index",
@@ -206,6 +206,21 @@ pub fn show_context_menu(
                     "cache_total": 0
                 }),
             );
+        });
+    }
+
+    // 每次右键菜单操作后都通知前端刷新当前可见范围。
+    // 覆盖所有场景：
+    //   - 删除：文件已不存在，前端重新获取后自然移除
+    //   - 剪切+粘贴：粘贴发生在另一个 show_context_menu 调用中，
+    //     该调用的 path 是目标文件夹（仍存在），但源文件已被移走，
+    //     刷新后前端重新获取数据，被移走的文件不再出现
+    //   - 其他操作（打开/属性等）：无害的轻微开销
+    {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            // 使用独立事件名，避免被 records-refresh 的空变化过滤拦截
+            let _ = app_clone.emit("refresh-visible", ());
         });
     }
 

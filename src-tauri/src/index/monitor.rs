@@ -1199,6 +1199,10 @@ pub struct VolumeManager {
     volume_index: HashMap<String, u8>,
     vol_names: Vec<String>,
     pub search_cache: Option<SearchCache>,
+    /// 上次搜索的查询字符串，用于在文件删除后重建缓存
+    last_search_query: String,
+    /// 上次搜索的选项，用于在文件删除后重建缓存
+    last_search_options: Option<SearchOptions>,
 }
 
 pub struct VolumeMonitor {
@@ -1232,6 +1236,8 @@ impl VolumeManager {
             volume_index: HashMap::new(),
             vol_names: Vec::new(),
             search_cache: None,
+            last_search_query: String::new(),
+            last_search_options: None,
         }
     }
 
@@ -1306,6 +1312,10 @@ impl VolumeManager {
         options: &SearchOptions,
     ) -> (Vec<SearchResult>, usize) {
         let t0 = Instant::now();
+
+        // 保存搜索参数，用于文件删除后重建缓存
+        self.last_search_query = query.to_string();
+        self.last_search_options = Some(options.clone());
 
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -1472,6 +1482,12 @@ impl VolumeManager {
             monitor.remove_file(file_path);
         }
         self.search_cache = None;
+        
+        // 文件删除后重建搜索缓存，确保前端能立即获取最新结果
+        if let Some(options) = self.last_search_options.clone() {
+            let query = self.last_search_query.clone();
+            self.search_with_options(&query, &options);
+        }
     }
 
     /// Update settings on all live monitors.
