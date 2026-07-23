@@ -73,11 +73,33 @@ pub async fn add_volume(
     )
     .map_err(|e| e.to_string())?;
 
-    if let Some(mut monitor) = vm.take_monitor(&volume) {
-        if let Err(e) = monitor.scan() {
-            log::warn!("Failed to scan new volume {}: {:?}", volume, e);
+    if is_admin {
+        // 管理员模式：标记 USN 并通过 USN worker 全量扫描（与启动流程一致）
+        if let Some(monitor) = vm.get_monitor_mut(&volume) {
+            monitor.use_usn = true;
         }
-        vm.return_monitor(&volume, monitor);
+        if let Some(ref usn) = state.usn_manager {
+            let dl_char = volume.chars().next().unwrap_or('C');
+            drop(vm);
+            log::info!("[USN] Adding volume: dispatching full scan for {}", dl_char);
+            usn.full_scan(dl_char, include_hidden_files, include_system_files);
+        } else {
+            // fallback: walkdir 扫描
+            if let Some(mut monitor) = vm.take_monitor(&volume) {
+                if let Err(e) = monitor.scan() {
+                    log::warn!("Failed to scan new volume {}: {:?}", volume, e);
+                }
+                vm.return_monitor(&volume, monitor);
+            }
+        }
+    } else {
+        // 非管理员模式：使用 walkdir 扫描
+        if let Some(mut monitor) = vm.take_monitor(&volume) {
+            if let Err(e) = monitor.scan() {
+                log::warn!("Failed to scan new volume {}: {:?}", volume, e);
+            }
+            vm.return_monitor(&volume, monitor);
+        }
     }
 
     if let Ok(mut config) = crate::config::Config::load() {
