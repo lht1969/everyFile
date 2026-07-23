@@ -431,6 +431,7 @@ body {
   background: #9ca3af;
   border-radius: 1px;
   pointer-events: none;
+  z-index: 2;
 }
 
 .result-row.header {
