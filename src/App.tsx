@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { save, message } from '@tauri-apps/plugin-dialog';
 import SearchPanel from './components/SearchPanel';
 import ResultList from './components/ResultList';
@@ -31,6 +32,18 @@ function App() {
     loadIndexStatus();
     checkAdmin();
     loadAllFiles();
+  }, []);
+
+  // 全局 ESC 键关闭窗口（焦点不在输入框时）
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      getCurrentWindow().close();
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
   }, []);
 
   useEffect(() => {
