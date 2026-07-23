@@ -424,11 +424,12 @@ body {
 .result-row.header>div:not(:last-child)::after {
   content: '';
   position: absolute;
-  right: 0;
+  right: -1px;
   top: 6px;
   bottom: 6px;
-  width: 1px;
-  background: #d1d5db;
+  width: 2px;
+  background: #9ca3af;
+  border-radius: 1px;
   pointer-events: none;
 }
 
