@@ -25,7 +25,7 @@ function measureTextWidth(text: string, className: string): number {
   return w;
 }
 
-function measureNaturalWidths(results: SearchResult[]): { name: number; path: number } {
+function measureContentWidths(results: SearchResult[]): { name: number; path: number } {
   if (results.length === 0) return { name: 0, path: 0 };
 
   let maxNameW = 0;
@@ -48,9 +48,15 @@ function measureNaturalWidths(results: SearchResult[]): { name: number; path: nu
   }
 
   return {
-    name: Math.max(120, Math.min(maxNameW + NAME_ICON_WIDTH + 16, 600)),
-    path: Math.max(80, Math.min(maxPathW + 16, 800)),
+    name: maxNameW + NAME_ICON_WIDTH + 16,
+    path: maxPathW + 16,
   };
+}
+
+function getProportionalWidths(containerWidth: number): { name: number; path: number } {
+  const fixedTotal = SIZE_NATURAL + MODIFIED_NATURAL;
+  const avail = Math.max(0, containerWidth - fixedTotal);
+  return { name: Math.floor(avail / 3), path: avail - Math.floor(avail / 3) };
 }
 
 function shrinkCols(available: number, current: number[], cols: ColumnConfig[]): number[] {
@@ -123,67 +129,67 @@ function expandCols(available: number, current: number[], cols: ColumnConfig[]):
 }
 
 function calcWidths(available: number, current: number[], cols: ColumnConfig[]): number[] {
-  const totalNatural = cols.reduce((s, c) => s + c.naturalWidth, 0);
-  if (available >= totalNatural) {
-    return expandCols(available, current, cols);
-  } else {
+  const totalCurrent = current.reduce((s, w) => s + w, 0);
+  // If current widths already exceed available space, must shrink from current
+  if (totalCurrent > available) {
     return shrinkCols(available, current, cols);
   }
+  // Otherwise expand from current toward natural targets
+  return expandCols(available, current, cols);
 }
 
 export function useColumnWidths(
   results: SearchResult[],
   containerRef: React.RefObject<HTMLDivElement | null>
 ) {
-  const [naturalWidths, setNaturalWidths] = useState<{ name: number; path: number }>({ name: 0, path: 0 });
   const [columnWidths, setColumnWidths] = useState<number[]>([0, 0, SIZE_NATURAL, MODIFIED_NATURAL]);
   const containerWidthRef = useRef(0);
   const frozenColumnsRef = useRef<Set<number>>(new Set());
+  const contentWidthsRef = useRef<{ name: number; path: number }>({ name: 0, path: 0 });
 
   const recalc = useCallback((containerWidth: number) => {
     containerWidthRef.current = containerWidth;
 
     // Before data loads: use 1fr/2fr proportions
-    if (naturalWidths.name === 0 && naturalWidths.path === 0 && containerWidth > 0) {
-      const fixedTotal = SIZE_NATURAL + MODIFIED_NATURAL;
-      const avail = Math.max(0, containerWidth - fixedTotal);
-      const nameW = Math.floor(avail / 3);
-      const pathW = avail - nameW;
-      setColumnWidths([nameW, pathW, SIZE_NATURAL, MODIFIED_NATURAL]);
+    if (contentWidthsRef.current.name === 0 && contentWidthsRef.current.path === 0 && containerWidth > 0) {
+      const prop = getProportionalWidths(containerWidth);
+      setColumnWidths([prop.name, prop.path, SIZE_NATURAL, MODIFIED_NATURAL]);
       return;
     }
 
-    // After data loads: use measured naturals for targets, but start from CURRENT widths
+    // Natural width = max(measured content, proportional) so columns follow window proportions
+    const prop = getProportionalWidths(containerWidth);
+    const effectiveNatural = {
+      name: Math.max(contentWidthsRef.current.name, prop.name),
+      path: Math.max(contentWidthsRef.current.path, prop.path),
+    };
+
     const cols: ColumnConfig[] = [
-      { naturalWidth: naturalWidths.name, minWidth: NAME_MIN_WIDTH },
-      { naturalWidth: naturalWidths.path, minWidth: PATH_MIN_WIDTH },
+      { naturalWidth: effectiveNatural.name, minWidth: NAME_MIN_WIDTH },
+      { naturalWidth: effectiveNatural.path, minWidth: PATH_MIN_WIDTH },
       { naturalWidth: SIZE_NATURAL, minWidth: SIZE_MIN },
       { naturalWidth: MODIFIED_NATURAL, minWidth: MODIFIED_MIN },
     ];
 
     const raw = calcWidths(containerWidth, columnWidths, cols);
 
-    // Respect frozen columns
     const result = raw.map((w, i) =>
       frozenColumnsRef.current.has(i) ? columnWidths[i] : w
     );
 
     setColumnWidths(result);
-  }, [naturalWidths, columnWidths]);
+  }, [columnWidths]);
 
-  // Measure natural widths when results change
+  // Store measured content widths when results change
   useEffect(() => {
-    const newNatural = measureNaturalWidths(results);
-    setNaturalWidths(newNatural);
+    const measured = measureContentWidths(results);
+    contentWidthsRef.current = measured;
     frozenColumnsRef.current.clear();
-  }, [results]);
-
-  // Recalculate when natural widths change (after first measurement)
-  useEffect(() => {
-    if (containerWidthRef.current > 0 && naturalWidths.name > 0) {
+    // Trigger recalc with new content widths
+    if (containerWidthRef.current > 0) {
       recalc(containerWidthRef.current);
     }
-  }, [naturalWidths, recalc]);
+  }, [results, recalc]);
 
   // ResizeObserver
   useEffect(() => {
