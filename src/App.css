@@ -393,11 +393,13 @@ body {
 .col-size {
   text-align: right;
   justify-self: end;
+  min-width: 0;
 }
 
 .col-modified {
   text-align: right;
   justify-self: end;
+  min-width: 0;
 }
 
 .col-resize {
@@ -527,6 +529,7 @@ body {
 .result-body {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   position: relative;
 }
 
