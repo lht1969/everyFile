@@ -650,6 +650,7 @@ function App() {
           onSortChange={handleSortChange}
           scrollToTop={scrollTrigger}
           searching={searching}
+          searchQuery={searchState.query}
         />
       </div>
       <StatusBar

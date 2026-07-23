@@ -4,6 +4,7 @@ import { useVirtualScroll } from '../hooks/useVirtualScroll';
 import { useFileIcon } from '../hooks/useFileIcon';
 import type { SearchResult, SortField, SortDirection } from '../types';
 import { formatSize, formatTime } from '../utils/format';
+import { highlightMatch } from '../utils/highlight';
 
 interface ResultListProps {
   results: SearchResult[];
@@ -17,6 +18,7 @@ interface ResultListProps {
   onSortChange?: (field: SortField, direction: SortDirection) => void;
   scrollToTop?: number;
   searching?: boolean;
+  searchQuery?: string;
 }
 
 const ROW_HEIGHT = 28;
@@ -35,7 +37,7 @@ function FileIcon({ path, isDirectory }: { path: string; isDirectory: boolean })
   return <img className="file-icon-img" src={iconUrl} alt="" draggable={false} />;
 }
 
-function ResultList({ results, totalCount, resultsOffset, sortField, sortDirection, onOpenFile, onOpenFolder, onVisibleRangeChange, onSortChange, scrollToTop, searching }: ResultListProps) {
+function ResultList({ results, totalCount, resultsOffset, sortField, sortDirection, onOpenFile, onOpenFolder, onVisibleRangeChange, onSortChange, scrollToTop, searching, searchQuery }: ResultListProps) {
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
   const [showTooltip, setShowTooltip] = useState(false);
@@ -238,9 +240,9 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                     >
                       <div className="col-name" onContextMenu={(e) => handleContextMenu(e, result.path)}>
                         <FileIcon path={result.path} isDirectory={result.is_directory} />
-                        <span className="col-name-text" title={result.name}>{result.name}</span>
+                        <span className="col-name-text" title={result.name}>{highlightMatch(result.name, searchQuery || '')}</span>
                       </div>
-                      <div className="col-path" title={result.path} onContextMenu={(e) => handleContextMenu(e, getDirectoryPath(result.path, result.is_directory))}>{getDirectoryPath(result.path, result.is_directory)}</div>
+                      <div className="col-path" title={result.path} onContextMenu={(e) => handleContextMenu(e, getDirectoryPath(result.path, result.is_directory))}>{highlightMatch(getDirectoryPath(result.path, result.is_directory), searchQuery || '')}</div>
                       <div className="col-size">{formatSize(result.size)}</div>
                       <div className="col-modified">{formatTime(result.modified_time)}</div>
                     </div>

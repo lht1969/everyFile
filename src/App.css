@@ -479,6 +479,12 @@ body {
   text-overflow: ellipsis;
 }
 
+.col-name-text strong,
+.col-path strong {
+  font-weight: 700;
+  color: var(--primary-color);
+}
+
 .file-icon {
   width: 16px;
   height: 16px;
