@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useVirtualScroll } from '../hooks/useVirtualScroll';
 import { useFileIcon } from '../hooks/useFileIcon';
+import { useColumnWidths } from '../hooks/useColumnWidths';
 import type { SearchResult, SortField, SortDirection } from '../types';
 import { formatSize, formatTime } from '../utils/format';
 import { highlightMatch } from '../utils/highlight';
@@ -41,10 +42,12 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
   const [showTooltip, setShowTooltip] = useState(false);
-  const [colWidths, setColWidths] = useState(['1fr', '2fr', '100px', '150px']);
   const resultBodyRef = useRef<HTMLDivElement>(null);
   const hoverTimeoutRef = useRef<number | null>(null);
   const resizingRef = useRef<{ colIndex: number; startX: number; startWidth: number } | null>(null);
+
+  const { columnWidths, setManualWidth } = useColumnWidths(results, resultBodyRef);
+  const gridTemplate = columnWidths.map(w => w + 'px').join(' ');
 
   const { startIndex, endIndex, offsetY, spacerHeight, scrollToIndex, resetScroll } = useVirtualScroll({
     totalItems: totalCount,
@@ -148,8 +151,8 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
     resizingRef.current = { colIndex, startX: e.clientX, startWidth };
     const onMove = (me: MouseEvent) => {
       if (!resizingRef.current) return;
-      const newWidth = Math.max(50, resizingRef.current.startWidth + (me.clientX - resizingRef.current.startX));
-      setColWidths(prev => { const next = [...prev]; next[resizingRef.current!.colIndex] = newWidth + 'px'; return next; });
+      const newWidth = Math.max(30, resizingRef.current.startWidth + (me.clientX - resizingRef.current.startX));
+      setManualWidth(resizingRef.current.colIndex, newWidth);
     };
     const onUp = () => { resizingRef.current = null; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
     document.addEventListener('mousemove', onMove);
@@ -159,7 +162,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   return (
     <div className="result-list" tabIndex={0} onKeyDown={handleKeyDown}>
       <div className="result-table">
-        <div className="result-row header" style={{ gridTemplateColumns: colWidths.join(' ') }}>
+        <div className="result-row header" style={{ gridTemplateColumns: gridTemplate }}>
           <div className="col-name" onClick={() => handleSort('name')}>
             名称{getSortIcon('name')}
             <div className="col-resize" onMouseDown={(e) => handleResizeStart(e, 0)} />
@@ -220,7 +223,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       <div
                         key={`placeholder-${globalIndex}`}
                         className="result-row"
-                        style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
+                        style={{ height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
                       />
                     );
                   }
@@ -232,7 +235,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       // 表现为"某些行固定不跟着排序"（其实是 DOM 节点没被替换，只是 props 改了）
                       key={`${globalIndex}-${result.path}`}
                       className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
-                      style={{ height: ROW_HEIGHT, gridTemplateColumns: colWidths.join(' ') }}
+                      style={{ height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
                       onClick={() => handleRowClick(globalIndex)}
                       onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
                       onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}

@@ -385,7 +385,6 @@ body {
 
 .result-row {
   display: grid;
-  grid-template-columns: 1fr 2fr 100px 150px;
   gap: 0;
   padding: 4px 16px;
   align-items: center;
@@ -471,6 +470,7 @@ body {
   align-items: center;
   gap: 8px;
   overflow: hidden;
+  min-width: 0;
 }
 
 .col-name-text {
@@ -515,6 +515,7 @@ body {
   text-overflow: ellipsis;
   color: var(--text-secondary);
   font-size: 12px;
+  min-width: 0;
 }
 
 .col-size,
