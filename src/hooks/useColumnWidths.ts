@@ -8,10 +8,10 @@ interface ColumnConfig {
 }
 
 const NAME_ICON_WIDTH = 24;
-const NAME_MIN_WIDTH = 30;
+const NAME_MIN_WIDTH = 100;
 const PATH_MIN_WIDTH = 0;
-const SIZE_NATURAL = 80;
-const SIZE_MIN = 60;
+const SIZE_NATURAL = 100;
+const SIZE_MIN = 80;
 const MODIFIED_NATURAL = 150;
 const MODIFIED_MIN = 110;
 
@@ -27,7 +27,7 @@ function measureTextWidth(text: string, className: string): number {
 }
 
 function measureNaturalWidths(results: SearchResult[]): { name: number; path: number } {
-  if (results.length === 0) return { name: 200, path: 300 };
+  if (results.length === 0) return { name: 0, path: 0 };
 
   let maxNameW = 0;
   let maxPathW = 0;
@@ -161,13 +161,24 @@ export function useColumnWidths(
   results: SearchResult[],
   containerRef: React.RefObject<HTMLDivElement | null>
 ) {
-  const [naturalWidths, setNaturalWidths] = useState<{ name: number; path: number }>({ name: 200, path: 300 });
-  const [columnWidths, setColumnWidths] = useState<number[]>([200, 300, SIZE_NATURAL, MODIFIED_NATURAL]);
+  const [naturalWidths, setNaturalWidths] = useState<{ name: number; path: number }>({ name: 0, path: 0 });
+  const [columnWidths, setColumnWidths] = useState<number[]>([0, 0, SIZE_NATURAL, MODIFIED_NATURAL]);
   const containerWidthRef = useRef(0);
   const frozenColumnsRef = useRef<Set<number>>(new Set());
 
   const recalc = useCallback((containerWidth: number) => {
     containerWidthRef.current = containerWidth;
+
+    // If natural widths not measured yet, use original 1fr/2fr proportions
+    if (naturalWidths.name === 0 && naturalWidths.path === 0 && containerWidth > 0) {
+      const fixedTotal = SIZE_NATURAL + MODIFIED_NATURAL;
+      const avail = Math.max(0, containerWidth - fixedTotal);
+      const nameW = Math.floor(avail / 3);
+      const pathW = avail - nameW;
+      setColumnWidths([nameW, pathW, SIZE_NATURAL, MODIFIED_NATURAL]);
+      return;
+    }
+
     const cols: ColumnConfig[] = [
       { naturalWidth: naturalWidths.name, minWidth: NAME_MIN_WIDTH, fixed: false },
       { naturalWidth: naturalWidths.path, minWidth: PATH_MIN_WIDTH, fixed: false },

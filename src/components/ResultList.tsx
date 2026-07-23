@@ -151,7 +151,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
     resizingRef.current = { colIndex, startX: e.clientX, startWidth };
     const onMove = (me: MouseEvent) => {
       if (!resizingRef.current) return;
-      const newWidth = Math.max(30, resizingRef.current.startWidth + (me.clientX - resizingRef.current.startX));
+      const newWidth = Math.max(100, resizingRef.current.startWidth + (me.clientX - resizingRef.current.startX));
       setManualWidth(resizingRef.current.colIndex, newWidth);
     };
     const onUp = () => { resizingRef.current = null; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
