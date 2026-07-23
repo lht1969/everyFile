@@ -419,6 +419,7 @@ body {
 
 .result-row.header>div {
   position: relative;
+  overflow: visible;
 }
 
 .result-row.header>div:not(:last-child)::after {
