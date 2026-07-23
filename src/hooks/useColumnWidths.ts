@@ -143,17 +143,24 @@ export function useColumnWidths(
   containerRef: React.RefObject<HTMLDivElement | null>
 ) {
   const [columnWidths, setColumnWidths] = useState<number[]>([0, 0, SIZE_NATURAL, MODIFIED_NATURAL]);
+  const columnWidthsRef = useRef(columnWidths);
   const containerWidthRef = useRef(0);
   const frozenColumnsRef = useRef<Set<number>>(new Set());
   const contentWidthsRef = useRef<{ name: number; path: number }>({ name: 0, path: 0 });
 
+  // Keep ref in sync with state
+  columnWidthsRef.current = columnWidths;
+
   const recalc = useCallback((containerWidth: number) => {
     containerWidthRef.current = containerWidth;
+    const current = columnWidthsRef.current;
 
     // Before data loads: use 1fr/2fr proportions
     if (contentWidthsRef.current.name === 0 && contentWidthsRef.current.path === 0 && containerWidth > 0) {
       const prop = getProportionalWidths(containerWidth);
-      setColumnWidths([prop.name, prop.path, SIZE_NATURAL, MODIFIED_NATURAL]);
+      const next = [prop.name, prop.path, SIZE_NATURAL, MODIFIED_NATURAL];
+      columnWidthsRef.current = next;
+      setColumnWidths(next);
       return;
     }
 
@@ -171,14 +178,15 @@ export function useColumnWidths(
       { naturalWidth: MODIFIED_NATURAL, minWidth: MODIFIED_MIN },
     ];
 
-    const raw = calcWidths(containerWidth, columnWidths, cols);
+    const raw = calcWidths(containerWidth, current, cols);
 
     const result = raw.map((w, i) =>
-      frozenColumnsRef.current.has(i) ? columnWidths[i] : w
+      frozenColumnsRef.current.has(i) ? current[i] : w
     );
 
+    columnWidthsRef.current = result;
     setColumnWidths(result);
-  }, [columnWidths]);
+  }, []);
 
   // Store measured content widths when results change
   useEffect(() => {
@@ -219,11 +227,10 @@ export function useColumnWidths(
   }, []);
 
   const setManualWidth = useCallback((index: number, width: number) => {
-    setColumnWidths(prev => {
-      const next = [...prev];
-      next[index] = width;
-      return next;
-    });
+    const next = [...columnWidthsRef.current];
+    next[index] = width;
+    columnWidthsRef.current = next;
+    setColumnWidths(next);
     frozenColumnsRef.current.add(index);
   }, []);
 
