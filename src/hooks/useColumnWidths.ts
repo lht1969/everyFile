@@ -4,7 +4,6 @@ import type { SearchResult } from '../types';
 interface ColumnConfig {
   naturalWidth: number;
   minWidth: number;
-  fixed: boolean;
 }
 
 const NAME_ICON_WIDTH = 24;
@@ -54,97 +53,82 @@ function measureNaturalWidths(results: SearchResult[]): { name: number; path: nu
   };
 }
 
-function calcWidths(available: number, cols: ColumnConfig[]): number[] {
-  const totalNatural = cols.reduce((s, c) => s + c.naturalWidth, 0);
+function shrinkCols(available: number, current: number[], cols: ColumnConfig[]): number[] {
+  let widths = [...current];
+  let deficit = widths.reduce((s, w) => s + w, 0) - available;
+  if (deficit <= 0) return widths;
 
-  if (available >= totalNatural) {
-    const surplus = available - totalNatural;
-    return expandCols(surplus, cols);
-  } else {
-    const deficit = totalNatural - available;
-    return shrinkCols(deficit, cols);
-  }
-}
-
-function shrinkCols(deficit: number, cols: ColumnConfig[]): number[] {
-  let widths = cols.map(c => c.naturalWidth);
-  let remaining = deficit;
-
-  // Phase 0: compress name only (highest priority non-fixed)
-  if (remaining > 0) {
-    const idx = 0; // name
-    const canShrink = Math.max(0, widths[idx] - cols[idx].minWidth);
-    const shrink = Math.min(remaining, canShrink);
-    widths[idx] -= shrink;
-    remaining -= shrink;
-  }
+  // Phase 0: compress name only
+  const nameShrink = Math.min(deficit, Math.max(0, widths[0] - cols[0].minWidth));
+  widths[0] -= nameShrink;
+  deficit -= nameShrink;
 
   // Phase 1: compress path only
-  if (remaining > 0) {
-    const idx = 1; // path
-    const canShrink = Math.max(0, widths[idx] - cols[idx].minWidth);
-    const shrink = Math.min(remaining, canShrink);
-    widths[idx] -= shrink;
-    remaining -= shrink;
+  if (deficit > 0) {
+    const pathShrink = Math.min(deficit, Math.max(0, widths[1] - cols[1].minWidth));
+    widths[1] -= pathShrink;
+    deficit -= pathShrink;
   }
 
   // Phase 2: compress fixed (size, modified) as last resort
-  if (remaining > 0) {
-    const fixedIndices = cols.map((c, i) => ({ c, i })).filter(x => x.c.fixed).map(x => x.i);
-    const fixedTotal = fixedIndices.reduce((s, i) => s + widths[i], 0);
-    const fixedMin = fixedIndices.reduce((s, i) => s + cols[i].minWidth, 0);
-    const fixedNeed = Math.min(remaining, Math.max(0, fixedTotal - fixedMin));
-
-    if (fixedNeed > 0) {
-      const ratio = fixedNeed / fixedTotal;
-      let allocated = 0;
-      for (let j = 0; j < fixedIndices.length; j++) {
-        const idx = fixedIndices[j];
-        const shrink = j === fixedIndices.length - 1
-          ? fixedNeed - allocated
-          : Math.floor(widths[idx] * ratio);
-        widths[idx] = Math.max(cols[idx].minWidth, widths[idx] - shrink);
-        allocated += shrink;
-      }
+  if (deficit > 0) {
+    for (const idx of [2, 3]) {
+      if (deficit <= 0) break;
+      const canShrink = Math.min(deficit, Math.max(0, widths[idx] - cols[idx].minWidth));
+      widths[idx] -= canShrink;
+      deficit -= canShrink;
     }
   }
 
   return widths;
 }
 
-function expandCols(surplus: number, cols: ColumnConfig[]): number[] {
-  let widths = cols.map(c => c.naturalWidth);
-  let remaining = surplus;
+function expandCols(available: number, current: number[], cols: ColumnConfig[]): number[] {
+  let widths = [...current];
+  let remaining = available - widths.reduce((s, w) => s + w, 0);
+  if (remaining <= 0) return widths;
 
-  // Phase 1: expand name to its natural width
-  if (remaining > 0) {
-    const idx = 0; // name
+  // Phase 1: restore fixed columns to natural
+  for (const idx of [2, 3]) {
     const need = cols[idx].naturalWidth - widths[idx];
-    if (need > 0) {
+    if (need > 0 && remaining > 0) {
       const give = Math.min(remaining, need);
       widths[idx] += give;
       remaining -= give;
     }
   }
 
-  // Phase 2: expand path to its natural width
-  if (remaining > 0) {
-    const idx = 1; // path
-    const need = cols[idx].naturalWidth - widths[idx];
-    if (need > 0) {
-      const give = Math.min(remaining, need);
-      widths[idx] += give;
-      remaining -= give;
-    }
+  // Phase 2: expand name to natural
+  const nameNeed = cols[0].naturalWidth - widths[0];
+  if (nameNeed > 0 && remaining > 0) {
+    const give = Math.min(remaining, nameNeed);
+    widths[0] += give;
+    remaining -= give;
   }
 
-  // Phase 3: extra surplus → path continues expanding
+  // Phase 3: expand path to natural
+  const pathNeed = cols[1].naturalWidth - widths[1];
+  if (pathNeed > 0 && remaining > 0) {
+    const give = Math.min(remaining, pathNeed);
+    widths[1] += give;
+    remaining -= give;
+  }
+
+  // Phase 4: extra surplus → path continues expanding
   if (remaining > 0) {
-    const idx = 1; // path
-    widths[idx] += remaining;
+    widths[1] += remaining;
   }
 
   return widths;
+}
+
+function calcWidths(available: number, current: number[], cols: ColumnConfig[]): number[] {
+  const totalNatural = cols.reduce((s, c) => s + c.naturalWidth, 0);
+  if (available >= totalNatural) {
+    return expandCols(available, current, cols);
+  } else {
+    return shrinkCols(available, current, cols);
+  }
 }
 
 export function useColumnWidths(
@@ -155,12 +139,11 @@ export function useColumnWidths(
   const [columnWidths, setColumnWidths] = useState<number[]>([0, 0, SIZE_NATURAL, MODIFIED_NATURAL]);
   const containerWidthRef = useRef(0);
   const frozenColumnsRef = useRef<Set<number>>(new Set());
-  const firstMeasuredRef = useRef(false);
 
   const recalc = useCallback((containerWidth: number) => {
     containerWidthRef.current = containerWidth;
 
-    // If natural widths not measured yet, use original 1fr/2fr proportions
+    // Before data loads: use 1fr/2fr proportions
     if (naturalWidths.name === 0 && naturalWidths.path === 0 && containerWidth > 0) {
       const fixedTotal = SIZE_NATURAL + MODIFIED_NATURAL;
       const avail = Math.max(0, containerWidth - fixedTotal);
@@ -170,31 +153,15 @@ export function useColumnWidths(
       return;
     }
 
-    // First time results measured: use current column widths as natural for name/path,
-    // so they don't jump. Only compress if current exceeds new measured natural.
-    if (!firstMeasuredRef.current && naturalWidths.name > 0) {
-      firstMeasuredRef.current = true;
-      const nameNat = Math.min(columnWidths[0], naturalWidths.name);
-      const pathNat = Math.min(columnWidths[1], naturalWidths.path);
-      const cols: ColumnConfig[] = [
-        { naturalWidth: nameNat, minWidth: NAME_MIN_WIDTH, fixed: false },
-        { naturalWidth: pathNat, minWidth: PATH_MIN_WIDTH, fixed: false },
-        { naturalWidth: SIZE_NATURAL, minWidth: SIZE_MIN, fixed: true },
-        { naturalWidth: MODIFIED_NATURAL, minWidth: MODIFIED_MIN, fixed: true },
-      ];
-      const raw = calcWidths(containerWidth, cols);
-      setColumnWidths(raw);
-      return;
-    }
-
+    // After data loads: use measured naturals for targets, but start from CURRENT widths
     const cols: ColumnConfig[] = [
-      { naturalWidth: naturalWidths.name, minWidth: NAME_MIN_WIDTH, fixed: false },
-      { naturalWidth: naturalWidths.path, minWidth: PATH_MIN_WIDTH, fixed: false },
-      { naturalWidth: SIZE_NATURAL, minWidth: SIZE_MIN, fixed: true },
-      { naturalWidth: MODIFIED_NATURAL, minWidth: MODIFIED_MIN, fixed: true },
+      { naturalWidth: naturalWidths.name, minWidth: NAME_MIN_WIDTH },
+      { naturalWidth: naturalWidths.path, minWidth: PATH_MIN_WIDTH },
+      { naturalWidth: SIZE_NATURAL, minWidth: SIZE_MIN },
+      { naturalWidth: MODIFIED_NATURAL, minWidth: MODIFIED_MIN },
     ];
 
-    const raw = calcWidths(containerWidth, cols);
+    const raw = calcWidths(containerWidth, columnWidths, cols);
 
     // Respect frozen columns
     const result = raw.map((w, i) =>
@@ -208,17 +175,12 @@ export function useColumnWidths(
   useEffect(() => {
     const newNatural = measureNaturalWidths(results);
     setNaturalWidths(newNatural);
-    // Unfreeze all columns on new results
     frozenColumnsRef.current.clear();
-    // Reset first-measured flag when results become empty
-    if (results.length === 0) {
-      firstMeasuredRef.current = false;
-    }
   }, [results]);
 
-  // Recalculate when natural widths change
+  // Recalculate when natural widths change (after first measurement)
   useEffect(() => {
-    if (containerWidthRef.current > 0) {
+    if (containerWidthRef.current > 0 && naturalWidths.name > 0) {
       recalc(containerWidthRef.current);
     }
   }, [naturalWidths, recalc]);
