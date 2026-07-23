@@ -442,8 +442,8 @@ body {
 
 .result-row.header .col-size,
 .result-row.header .col-modified {
-  text-align: center;
-  justify-self: center;
+  text-align: right;
+  justify-self: end;
 }
 
 .result-row.header .col-name,
