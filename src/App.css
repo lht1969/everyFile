@@ -439,6 +439,10 @@ body {
   padding-right: 4px;
 }
 
+.result-row.header>div:not(:first-child) {
+  padding-left: 4px;
+}
+
 .result-row.header {
   font-weight: 600;
   background: #f9fafb;
@@ -446,10 +450,14 @@ body {
   top: 0;
 }
 
-.result-row.header .col-size,
-.result-row.header .col-modified {
+.result-row.header .col-size {
   text-align: right;
   justify-self: end;
+}
+
+.result-row.header .col-modified {
+  text-align: center;
+  justify-self: center;
 }
 
 .result-row.header .col-name,
