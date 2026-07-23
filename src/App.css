@@ -424,9 +424,9 @@ body {
 .result-row.header>div:not(:last-child)::after {
   content: '';
   position: absolute;
-  right: -1px;
-  top: 6px;
-  bottom: 6px;
+  right: -5px;
+  top: 2px;
+  bottom: 2px;
   width: 2px;
   background: #9ca3af;
   border-radius: 1px;
