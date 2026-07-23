@@ -425,10 +425,10 @@ body {
   content: '';
   position: absolute;
   right: 0;
-  top: 4px;
-  bottom: 4px;
+  top: 6px;
+  bottom: 6px;
   width: 1px;
-  background: var(--border-color);
+  background: #d1d5db;
   pointer-events: none;
 }
 
