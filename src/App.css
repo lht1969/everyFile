@@ -425,7 +425,7 @@ body {
 .result-row.header>div:not(:last-child)::after {
   content: '';
   position: absolute;
-  right: -5px;
+  right: -2px;
   top: 2px;
   bottom: 2px;
   width: 2px;
@@ -433,6 +433,10 @@ body {
   border-radius: 1px;
   pointer-events: none;
   z-index: 2;
+}
+
+.result-row.header>div:not(:last-child) {
+  padding-right: 4px;
 }
 
 .result-row.header {
