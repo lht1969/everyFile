@@ -55,7 +55,6 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
     }
     const debounce = setTimeout(() => {
       onSearch(query, filterType === 'files', filterType === 'directories');
-      addToHistory(query);
       fetchSuggestions(query);
     }, 350);
     return () => clearTimeout(debounce);
@@ -99,6 +98,10 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
       e.preventDefault();
+      if (query.trim()) {
+        onSearch(query, filterType === 'files', filterType === 'directories');
+        addToHistory(query);
+      }
     } else if (e.key === 'Escape') {
       if (helpVisible) {
         setHelpVisible(false);
@@ -254,7 +257,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
       {suggestions.length > 0 && (
         <div className="suggestions">
           {suggestions.map((s, i) => (
-            <div key={i} className="suggestion-item" onClick={() => { setQuery(s); onSearch(s); }}>
+            <div key={i} className="suggestion-item" onClick={() => { setQuery(s); onSearch(s); addToHistory(s); }}>
               {s}
             </div>
           ))}
