@@ -13,6 +13,117 @@ use std::os::windows::fs::MetadataExt;
 
 const CACHE_TTL_SECS: u64 = 3600;
 
+/// 最多缓存的排序列数。超过时驱逐最久未使用的条目。
+/// Name/Score 共享一个槽位，实际缓存 2 列 = 2 × 8.84 MB ≈ 17.7 MB。
+const MAX_CACHED_SORTS: usize = 2;
+
+/// Pack (vol_idx: u8, file_idx: u32) into a single u32.
+/// High 8 bits: vol_idx (supports up to 256 volumes)
+/// Low 24 bits: file_idx (supports up to 16M files per volume)
+#[inline]
+fn pack_matched(vol_idx: u8, file_idx: u32) -> u32 {
+    (vol_idx as u32) << 24 | (file_idx & 0x00FF_FFFF)
+}
+
+/// Unpack a u32 into (vol_idx: u8, file_idx: u32).
+#[inline]
+fn unpack_matched(packed: u32) -> (u8, u32) {
+    ((packed >> 24) as u8, packed & 0x00FF_FFFF)
+}
+
+/// SortBy → 固定数组索引。Name/Score 共享槽位 0。
+#[inline]
+fn sort_by_slot(s: SortBy) -> usize {
+    match s {
+        SortBy::Name | SortBy::Score => 0,
+        SortBy::Path => 1,
+        SortBy::Size => 2,
+        SortBy::ModifiedTime => 3,
+    }
+}
+
+/// 固定大小排序索引缓存，最多缓存 MAX_CACHED_SORTS 列。
+/// 替代 HashMap<SortBy, (u64, Arc<Vec<u32>>)>，消除 hash 开销并限制内存上限。
+pub(crate) struct SortedIndicesCache {
+    /// 4 个槽位：[Name|Score, Path, Size, ModifiedTime]
+    entries: [Option<(u64, std::sync::Arc<Vec<u32>>)>; 4],
+    /// LRU 时间戳：每次命中时递增，驱逐时选最小
+    touch: [u64; 4],
+    /// 全局递增计数器
+    clock: u64,
+}
+
+impl SortedIndicesCache {
+    fn new() -> Self {
+        Self {
+            entries: [None, None, None, None],
+            touch: [0; 4],
+            clock: 0,
+        }
+    }
+
+    /// 查询缓存。命中时更新 LRU 时间戳并返回 Some(arc)。
+    fn get(&mut self, sort_by: SortBy, generation: u64) -> Option<std::sync::Arc<Vec<u32>>> {
+        let slot = sort_by_slot(sort_by);
+        if let Some((gen, ref arc)) = self.entries[slot] {
+            if gen == generation {
+                self.clock += 1;
+                self.touch[slot] = self.clock;
+                return Some(arc.clone());
+            }
+        }
+        None
+    }
+
+    /// 插入排序结果。超过 MAX_CACHED_SORTS 时驱逐最久未使用的条目。
+    fn insert(&mut self, sort_by: SortBy, generation: u64, indices: std::sync::Arc<Vec<u32>>) {
+        let slot = sort_by_slot(sort_by);
+
+        // 如果槽位已有有效缓存，直接覆盖
+        if self.entries[slot].is_some() {
+            self.clock += 1;
+            self.touch[slot] = self.clock;
+            self.entries[slot] = Some((generation, indices));
+            return;
+        }
+
+        // 槽位为空，检查是否需要驱逐
+        let occupied = self.entries.iter().filter(|e| e.is_some()).count();
+        if occupied >= MAX_CACHED_SORTS {
+            // 驱逐最久未使用的条目
+            let evict_slot = self
+                .touch
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.entries[*i].is_some())
+                .min_by_key(|(_, &t)| t)
+                .map(|(i, _)| i)
+                .unwrap();
+            self.entries[evict_slot] = None;
+        }
+
+        self.clock += 1;
+        self.touch[slot] = self.clock;
+        self.entries[slot] = Some((generation, indices));
+    }
+
+    /// 清空所有缓存（base.matched 变化时调用）
+    fn clear(&mut self) {
+        self.entries = [None, None, None, None];
+        self.touch = [0; 4];
+        self.clock = 0;
+    }
+
+    /// 估算缓存占用字节数
+    fn memory_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .map(|(_, arc)| arc.len() * std::mem::size_of::<u32>())
+            .sum()
+    }
+}
+
 pub struct IncrementalResult {
     pub added: usize,
     pub updated: usize,
@@ -68,18 +179,10 @@ fn parent_dir_of(full_path: &str) -> &str {
 }
 
 /// Base cache: stable data from full scan.
-/// `valid_indices` is the single source of truth for sort order — an unsorted list of
-/// indices into `matched` that reference valid file entries. Sort permutations are NO
-/// longer cached; instead, `get_sorted_slice` uses `select_nth_unstable_by` (O(n))
-/// + parallel partial sort of only the K needed entries (O(k log k)) on each call.
+/// `matched` stores packed (volume_index, file_index) as u32 — see pack_matched().
 pub struct BaseCache {
-    pub matched: Vec<(u8, u32)>,
-    /// 有效索引缓存，值为 matched 的下标
-    /// 仅当 valid_indices_matched_len == matched.len() 时才有效
-    pub valid_indices: Option<Vec<u32>>,
-    /// 构建 valid_indices 时 matched 的长度，用于验证缓存有效性
-    /// 防止 matched 长度变化后索引越界
-    pub valid_indices_matched_len: usize,
+    pub matched: Vec<u32>,
+    pub matched_generation: u64,
 }
 
 /// Delta cache: incremental changes. new_files is APPEND-ONLY (no swap_remove!).
@@ -92,34 +195,8 @@ pub struct DeltaCache {
     /// delta entry must NOT be filtered out by `deleted_ids`.
     pub renamed_fids: HashSet<u32>,
     pub modified: HashMap<u32, (u8, FileEntry)>,
-    pub matched: Vec<(u8, u32)>,
+    pub matched: Vec<u32>,
     pub generation: u64,
-}
-
-/// 排序结果缓存，存储 base 部分的排序索引
-///
-/// `sorted_base` 保存的是对 `valid_indices` 完全排序后的结果，未预先过滤
-/// deleted/modified 条目。跨 delta 变化复用时，在归并循环中按需跳过这些
-/// 条目即可，避免每次请求都对整个 base 做全量过滤。
-///
-/// 注意：sorted_base 中的值是 base.matched 的索引，因此必须确保
-/// 缓存创建时的 base.matched 长度与当前一致，否则索引可能越界。
-///
-/// sorted_base 仅依赖 base.matched（基础数据），不依赖 delta。
-/// delta 变化由 merge 循环的 is_base_active lazy skip 处理，
-/// 因此 sorted_base 可以跨 delta 变化复用，无需因 delta 变化而重建。
-struct SortedCache {
-    sort_by: SortBy,
-    sort_direction: SortDirection,
-    /// 使用 Arc 共享排序后的 base 索引，避免每次请求都 clone 整个 Vec。
-    /// 对于 221 万文件，Vec<u32> 约 8.8MB，clone 会频繁触发内存分配与波动。
-    sorted_base: std::sync::Arc<Vec<u32>>,
-    /// 缓存创建时 base.matched 的长度，用于验证缓存有效性
-    /// 防止 base.matched 长度变化后缓存索引越界
-    base_matched_len: usize,
-    /// 缓存创建时 valid_indices 对应的 matched 长度，用于验证缓存有效性
-    /// 防止 valid_indices 重建后 sorted_base 基于旧的索引集合
-    valid_indices_matched_len: usize,
 }
 
 pub struct SearchCache {
@@ -130,18 +207,13 @@ pub struct SearchCache {
     pub created_at: Instant,
     pub base: BaseCache,
     pub delta: DeltaCache,
-    sorted_cache: Option<SortedCache>,
     /// 增量维护的 base 有效条目数（未被 delta.deleted_ids/modified 隐藏的条目数）。
-    /// 避免每次 get_sorted_slice 都对 221 万 valid_indices 做 O(n) 全量扫描。
     /// None 表示需要从头计算（首次调用、merge 后、base.matched 变化后）。
     active_base_count: Option<usize>,
-    /// base 中所有文件的 file_id 排序列表，用于 O(log n) 二分查找。
+    /// base 中所有文件的 file_id 位图，用于 O(1) 查找。
+    /// BitVec 比 Vec<u32> 节省约 8.5 MB（270KB vs 8.8MB）。
     /// 延迟构建：首次需要维护 active_base_count 时构建。
-    base_file_ids: Option<Vec<u32>>,
-    /// 预计算的排序索引：SortBy → ascending sorted Vec<u32>
-    /// 在 search_with_options 构建缓存时一次性计算所有 4 个排序字段。
-    /// 列头点击时 O(1) 切换，无需重新排序。
-    sorted_indices_map: std::collections::HashMap<SortBy, std::sync::Arc<Vec<u32>>>,
+    base_file_bitvec: Option<bitvec::vec::BitVec>,
 }
 
 impl SearchCache {
@@ -153,51 +225,61 @@ impl SearchCache {
         self.created_at = Instant::now();
     }
 
-    /// 确保 base_file_ids 已构建。返回 true 表示可用。
-    fn ensure_base_file_ids(
+    /// 确保 base_file_bitvec 已构建。返回 true 表示可用。
+    fn ensure_base_file_bitvec(
         &mut self,
         volumes: &HashMap<String, VolumeMonitor>,
         vol_names: &[String],
     ) -> bool {
-        if self.base_file_ids.is_some() {
+        if self.base_file_bitvec.is_some() {
             return true;
         }
-        if self.base.valid_indices_matched_len != self.base.matched.len() {
+        if self.base.matched.is_empty() {
             return false;
         }
-        let mut fids: Vec<u32> = Vec::with_capacity(self.base.matched.len());
-        for &(vol, file_idx) in &self.base.matched {
+        // 扫描找到最大 file_id，确定 bitvec 大小
+        let mut max_fid: u32 = 0;
+        for &packed in &self.base.matched {
+            let (vol, file_idx) = unpack_matched(packed);
             let vi = vol as usize;
             if let Some(vol_name) = vol_names.get(vi) {
                 if let Some(m) = volumes.get(vol_name) {
                     if (file_idx as usize) < m.files.len() {
-                        fids.push(m.files[file_idx as usize].file_id);
+                        let fid = m.files[file_idx as usize].file_id;
+                        if fid > max_fid {
+                            max_fid = fid;
+                        }
                     }
                 }
             }
         }
-        // 诊断：统计去重前后的差值，检测跨卷 file_id 重复
-        let pre_dedup_len = fids.len();
-        fids.sort_unstable();
-        fids.dedup();
-        let dup_count = pre_dedup_len - fids.len();
-        if dup_count > 0 {
-            log::warn!(
-                "[DIAG] ensure_base_file_ids: matched_len={} unique_fids={} duplicate_fids={}",
-                pre_dedup_len,
-                fids.len(),
-                dup_count
-            );
+        // 创建 bitvec 并设置所有 base file_id 的位
+        let size = (max_fid as usize) + 1;
+        let mut bv = bitvec::vec::BitVec::with_capacity(size);
+        bv.resize(size, false);
+        for &packed in &self.base.matched {
+            let (vol, file_idx) = unpack_matched(packed);
+            let vi = vol as usize;
+            if let Some(vol_name) = vol_names.get(vi) {
+                if let Some(m) = volumes.get(vol_name) {
+                    if (file_idx as usize) < m.files.len() {
+                        let fid = m.files[file_idx as usize].file_id as usize;
+                        if fid < bv.len() {
+                            bv.set(fid, true);
+                        }
+                    }
+                }
+            }
         }
-        self.base_file_ids = Some(fids);
+        self.base_file_bitvec = Some(bv);
         true
     }
 
-    /// O(log n) 检查 file_id 是否在 base 中
+    /// O(1) 检查 file_id 是否在 base 中
     fn is_fid_in_base(&self, fid: u32) -> bool {
-        self.base_file_ids
+        self.base_file_bitvec
             .as_ref()
-            .map_or(false, |ids| ids.binary_search(&fid).is_ok())
+            .map_or(false, |bv| (fid as usize) < bv.len() && bv[fid as usize])
     }
 
     /// 计算并缓存 active_base_count（首次调用时 O(n)，后续增量维护）
@@ -209,51 +291,26 @@ impl SearchCache {
         if self.active_base_count.is_some() {
             return;
         }
-        if self.base.valid_indices_matched_len != self.base.matched.len() {
-            // valid_indices 失效，需要从 matched 直接计算
-            let count = self
-                .base
-                .matched
-                .iter()
-                .filter(|&&(vol, file_idx)| {
-                    let Some(vol_name) = vol_names.get(vol as usize) else {
-                        return false;
-                    };
-                    if let Some(m) = volumes.get(vol_name) {
-                        if let Some(f) = m.files.get(file_idx as usize) {
-                            return !self.delta.deleted_ids.contains(&f.file_id)
-                                && !self.delta.modified.contains_key(&f.file_id);
-                        }
+        // 直接遍历 matched 计算有效条目数
+        let count = self
+            .base
+            .matched
+            .iter()
+            .filter(|&&packed| {
+                let (vol, file_idx) = unpack_matched(packed);
+                let Some(vol_name) = vol_names.get(vol as usize) else {
+                    return false;
+                };
+                if let Some(m) = volumes.get(vol_name) {
+                    if let Some(f) = m.files.get(file_idx as usize) {
+                        return !self.delta.deleted_ids.contains(&f.file_id)
+                            && !self.delta.modified.contains_key(&f.file_id);
                     }
-                    false
-                })
-                .count();
-            self.active_base_count = Some(count);
-            return;
-        }
-        if let Some(ref valid_indices) = self.base.valid_indices {
-            let count = valid_indices
-                .iter()
-                .filter(|&&idx| {
-                    let Some(&(vol, file_idx)) = self.base.matched.get(idx as usize) else {
-                        return false;
-                    };
-                    let Some(vol_name) = vol_names.get(vol as usize) else {
-                        return false;
-                    };
-                    if let Some(m) = volumes.get(vol_name) {
-                        if let Some(f) = m.files.get(file_idx as usize) {
-                            return !self.delta.deleted_ids.contains(&f.file_id)
-                                && !self.delta.modified.contains_key(&f.file_id);
-                        }
-                    }
-                    false
-                })
-                .count();
-            self.active_base_count = Some(count);
-        } else {
-            self.active_base_count = Some(0);
-        }
+                }
+                false
+            })
+            .count();
+        self.active_base_count = Some(count);
     }
 
     /// 增量更新 active_base_count：当 fid 被添加到 delta.deleted_ids 或 delta.modified 时调用。
@@ -288,10 +345,11 @@ impl SearchCache {
         }
     }
 
-    /// 使 active_base_count 和 base_file_ids 失效（base.matched 变化后调用）
+    /// 使 active_base_count 和 base_file_bitvec 失效（base.matched 变化后调用）
     fn invalidate_base_count(&mut self) {
         self.active_base_count = None;
-        self.base_file_ids = None;
+        self.base_file_bitvec = None;
+        self.base.matched_generation += 1;
     }
 
     /// Merge delta into base. Called periodically.
@@ -401,10 +459,6 @@ impl SearchCache {
         self.delta.modified.clear();
         self.delta.matched.clear();
         self.delta.generation += 1;
-        // merge 后 delta 为空，generation 已递增；排序缓存会因 base_matched_len
-        // 变化而失效，此处无需额外处理。
-        self.sorted_cache = None;
-        self.sorted_indices_map.clear();
 
         // Rebuild base matched from scratch
         let mut matched = Vec::new();
@@ -420,14 +474,11 @@ impl SearchCache {
                 if self.directories_only && !file.is_directory {
                     continue;
                 }
-                matched.push((vol_idx, file_idx as u32));
+                matched.push(pack_matched(vol_idx, file_idx as u32));
             }
         }
         self.base.matched = matched;
 
-        // Invalidate base valid_indices (will be rebuilt lazily)
-        self.base.valid_indices = None;
-        self.base.valid_indices_matched_len = 0;
         // 失效增量维护的 base count（base.matched 已重建）
         self.invalidate_base_count();
 
@@ -439,7 +490,7 @@ impl SearchCache {
     }
 
 
-    pub fn get_sorted_slice(
+    pub(crate) fn get_sorted_slice(
         &mut self,
         volumes: &HashMap<String, VolumeMonitor>,
         vol_names: &[String],
@@ -447,6 +498,7 @@ impl SearchCache {
         sort_direction: SortDirection,
         start: usize,
         end: usize,
+        sorted_indices: &mut SortedIndicesCache,
     ) -> (Vec<SearchResult>, usize) {
         let t0 = Instant::now();
         log::debug!(
@@ -467,37 +519,22 @@ impl SearchCache {
         // The is_base_active closure and merge loop also reference self.delta directly.
         // This is safe because self is not mutably borrowed when they run.
 
-        // Build valid_indices if needed (unsorted list of valid indices into matched)
-        // 验证 valid_indices 的有效性：必须与当前 matched.len() 一致
-        // 否则说明 matched 长度已变化，缓存的索引可能越界
-        if self.base.valid_indices.is_some()
-            && self.base.valid_indices_matched_len != self.base.matched.len()
-        {
-            self.base.valid_indices = None;
-        }
-        if self.base.valid_indices.is_none() && !self.base.matched.is_empty() {
-            self.base.valid_indices =
-                Some(build_valid_indices(&self.base.matched, volumes, vol_names));
-            self.base.valid_indices_matched_len = self.base.matched.len();
-        }
-
-        // 提前计算 base_n（需要 &mut self），必须在 valid_indices 借用之前完成
+        // 提前计算 base_n（需要 &mut self）
         let base_n = if self.delta.deleted_ids.is_empty() && self.delta.modified.is_empty() {
-            if self.base.valid_indices_matched_len == self.base.matched.len() {
-                self.base.valid_indices.as_ref().map_or(0, |v| v.len())
-            } else {
-                self.base.matched.len()
-            }
+            // 无 delta 时，直接遍历 matched 计算有效条目数
+            self.base.matched.iter().filter(|&&packed| {
+                let (vol, file_idx) = unpack_matched(packed);
+                let vi = vol as usize;
+                if let Some(vol_name) = vol_names.get(vi) {
+                    if let Some(m) = volumes.get(vol_name) {
+                        return (file_idx as usize) < m.files.len();
+                    }
+                }
+                false
+            }).count()
         } else {
             self.ensure_active_base_count(volumes, vol_names);
             self.active_base_count.unwrap_or(0)
-        };
-
-        // `sorted_base` 将基于未过滤的 valid_indices 构建，deleted/modified 的过滤
-        // 推迟到归并阶段按需跳过，避免每次请求都扫描整个 base。
-        let valid_indices = match self.base.valid_indices {
-            Some(ref v) => v.as_slice(),
-            None => return (Vec::new(), 0),
         };
 
         // Build sorted delta entries directly from self.delta.new_files
@@ -637,61 +674,42 @@ impl SearchCache {
             .map(|i| volumes.get(&vol_names[i]).map(|v| &v.path_table))
             .collect();
 
-        // 优先使用预计算的排序索引（O(1) 切换），回退到 SortedCache，最后实时排序。
-        let base_version_ok =
-            self.base.valid_indices_matched_len == self.base.matched.len();
-        let precomputed = if base_version_ok {
-            self.sorted_indices_map.get(&sort_by)
-        } else {
-            None
-        };
-        let cache_hit = self.sorted_cache.as_ref().is_some_and(|sc| {
-            sc.sort_by == sort_by
-                && sc.sort_direction == sort_direction
-                && sc.base_matched_len == self.base.matched.len()
-                && sc.valid_indices_matched_len == self.base.valid_indices_matched_len
-        });
+        // 按需缓存排序索引：仅在请求某个 sort_by 时计算并缓存该字段。
+        // 升序和降序共享同一套升序索引，降序时从尾部向前读取。
+        // 缓存基于当前 base.matched 版本，base 变化后 matched_generation
+        // 不再匹配，sorted_indices_map 会在下次请求时重新计算。
+        let base_gen = self.base.matched_generation;
+        let cached_sorted = sorted_indices.get(sort_by, base_gen);
         log::info!(
-            "[SORT] precomputed={} cache_hit={} valid_indices_len={} delta_gen={}",
-            precomputed.is_some(),
-            cache_hit,
-            valid_indices.len(),
+            "[SORT] cached={} matched_len={} delta_gen={}",
+            cached_sorted.is_some(),
+            self.base.matched.len(),
             self.delta.generation
         );
 
-        let sorted_base: std::sync::Arc<Vec<u32>> = if let Some(asc_sorted) = precomputed {
-            // 快速路径：使用预计算的排序索引（始终升序）。
-            // 升序和降序都直接使用升序数组：
-            // - 升序归并从头读取（bi 从 0 开始）
-            // - 降序归并从尾读取（bi 从 len 开始），天然得到降序结果
-            asc_sorted.clone()
-        } else if cache_hit {
-            // 回退到旧的 SortedCache
-            self.sorted_cache.as_ref().unwrap().sorted_base.clone()
+        let sorted_base: std::sync::Arc<Vec<u32>> = if let Some(asc_sorted) = cached_sorted {
+            asc_sorted
         } else {
-            // Slow path: 对 valid_indices 做全量排序并缓存。
+            // Slow path: 对 matched 做全量排序并缓存到 sorted_indices_map。
+            // 提取 matched 为局部引用，避免后续归并阶段借用冲突
+            let matched = &self.base.matched;
             let sorted: Vec<u32> = match sort_by {
                 SortBy::Name | SortBy::Score => {
-                    let mut entries: Vec<(&str, u32, u32)> = valid_indices
-                        .par_iter()
-                        .map(|&idx| {
-                            let (vol, file_idx) = self
-                                .base
-                                .matched
-                                .get(idx as usize)
-                                .copied()
-                                .unwrap_or((0, 0));
+                    let mut entries: Vec<(&str, u32, u32)> = matched
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, &packed)| {
+                            let (vol, file_idx) = unpack_matched(packed);
                             let vi = vol as usize;
-                            let (name, fid) = if vi < vol_files.len()
+                            if vi < vol_files.len()
                                 && !vol_files[vi].is_empty()
                                 && (file_idx as usize) < vol_files[vi].len()
                             {
                                 let f = &vol_files[vi][file_idx as usize];
-                                (f.name.as_str(), f.file_id)
+                                Some((f.name.as_str(), f.file_id, idx as u32))
                             } else {
-                                ("", u32::MAX)
-                            };
-                            (name, fid, idx)
+                                None
+                            }
                         })
                         .collect();
                     entries.par_sort_unstable_by(|a, b| {
@@ -700,15 +718,11 @@ impl SearchCache {
                     entries.into_iter().map(|(_, _, idx)| idx).collect()
                 }
                 SortBy::Path => {
-                    let mut entries: Vec<(&str, u32, &str, u32, u32)> = valid_indices
-                        .par_iter()
-                        .map(|&idx| {
-                            let (vol, file_idx) = self
-                                .base
-                                .matched
-                                .get(idx as usize)
-                                .copied()
-                                .unwrap_or((0, 0));
+                    let mut entries: Vec<(&str, u32, &str, u32, u32)> = matched
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, &packed)| {
+                            let (vol, file_idx) = unpack_matched(packed);
                             let vi = vol as usize;
                             let vol_name = vol_names.get(vi).map(|s| s.as_str()).unwrap_or("");
                             if vi < vol_path_tables.len()
@@ -719,15 +733,15 @@ impl SearchCache {
                             {
                                 let pt = vol_path_tables[vi].unwrap();
                                 let f = &vol_files[vi][file_idx as usize];
-                                (
+                                Some((
                                     vol_name,
                                     pt.get_ordinal(f.path_id),
                                     f.name.as_str(),
                                     f.file_id,
-                                    idx,
-                                )
+                                    idx as u32,
+                                ))
                             } else {
-                                (vol_name, u32::MAX, "", u32::MAX, idx)
+                                None
                             }
                         })
                         .collect();
@@ -741,26 +755,21 @@ impl SearchCache {
                     entries.into_iter().map(|(_, _, _, _, idx)| idx).collect()
                 }
                 SortBy::Size => {
-                    let mut entries: Vec<(u64, u32, u32)> = valid_indices
-                        .par_iter()
-                        .map(|&idx| {
-                            let (vol, file_idx) = self
-                                .base
-                                .matched
-                                .get(idx as usize)
-                                .copied()
-                                .unwrap_or((0, 0));
+                    let mut entries: Vec<(u64, u32, u32)> = matched
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, &packed)| {
+                            let (vol, file_idx) = unpack_matched(packed);
                             let vi = vol as usize;
-                            let (size, fid) = if vi < vol_files.len()
+                            if vi < vol_files.len()
                                 && !vol_files[vi].is_empty()
                                 && (file_idx as usize) < vol_files[vi].len()
                             {
                                 let f = &vol_files[vi][file_idx as usize];
-                                (f.size, f.file_id)
+                                Some((f.size, f.file_id, idx as u32))
                             } else {
-                                (u64::MAX, u32::MAX)
-                            };
-                            (size, fid, idx)
+                                None
+                            }
                         })
                         .collect();
                     entries.par_sort_unstable_by(|a, b| {
@@ -769,26 +778,21 @@ impl SearchCache {
                     entries.into_iter().map(|(_, _, idx)| idx).collect()
                 }
                 SortBy::ModifiedTime => {
-                    let mut entries: Vec<(i32, u32, u32)> = valid_indices
-                        .par_iter()
-                        .map(|&idx| {
-                            let (vol, file_idx) = self
-                                .base
-                                .matched
-                                .get(idx as usize)
-                                .copied()
-                                .unwrap_or((0, 0));
+                    let mut entries: Vec<(i32, u32, u32)> = matched
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, &packed)| {
+                            let (vol, file_idx) = unpack_matched(packed);
                             let vi = vol as usize;
-                            let (mt, fid) = if vi < vol_files.len()
+                            if vi < vol_files.len()
                                 && !vol_files[vi].is_empty()
                                 && (file_idx as usize) < vol_files[vi].len()
                             {
                                 let f = &vol_files[vi][file_idx as usize];
-                                (f.modified_time, f.file_id)
+                                Some((f.modified_time, f.file_id, idx as u32))
                             } else {
-                                (i32::MAX, u32::MAX)
-                            };
-                            (mt, fid, idx)
+                                None
+                            }
                         })
                         .collect();
                     entries.par_sort_unstable_by(|a, b| {
@@ -798,23 +802,21 @@ impl SearchCache {
                 }
             };
 
-            self.sorted_cache = Some(SortedCache {
-                sort_by,
-                sort_direction,
-                sorted_base: std::sync::Arc::new(sorted),
-                base_matched_len: self.base.matched.len(),
-                valid_indices_matched_len: self.base.valid_indices_matched_len,
-            });
-            self.sorted_cache.as_ref().unwrap().sorted_base.clone()
+            let sorted_arc = std::sync::Arc::new(sorted);
+            // 缓存排序索引，超过 MAX_CACHED_SORTS 时自动驱逐最久未使用的列。
+            // base 变化后 matched_generation 不匹配，旧缓存会自动失效。
+            sorted_indices.insert(sort_by, base_gen, sorted_arc.clone());
+            sorted_arc
         };
 
         // 判断 sorted_base 中某个 matched 索引当前是否仍然可显示（未被 delta
         // deleted/modified 过滤掉）。在 base_n 计算和归并阶段都会使用，实现
         // lazy skip。
         let is_base_active = |idx: u32| -> bool {
-            let Some(&(vol, file_idx)) = self.base.matched.get(idx as usize) else {
+            let Some(packed) = self.base.matched.get(idx as usize) else {
                 return false;
             };
+            let (vol, file_idx) = unpack_matched(*packed);
             let Some(vol_name) = vol_names.get(vol as usize) else {
                 return false;
             };
@@ -881,10 +883,11 @@ impl SearchCache {
                         false
                     } else {
                         let idx = sorted_base[bi];
-                        let Some(&(va, fa_idx)) = self.base.matched.get(idx as usize) else {
+                        let Some(packed) = self.base.matched.get(idx as usize) else {
                             bi += 1;
                             continue;
                         };
+                        let (va, fa_idx) = unpack_matched(*packed);
                         let Some(vol_a) = vol_names.get(va as usize) else {
                             bi += 1;
                             continue;
@@ -935,7 +938,8 @@ impl SearchCache {
                     if pos >= eff_start {
                         if pick_base {
                             let idx = sorted_base[bi];
-                            if let Some(&(vol, file_idx)) = self.base.matched.get(idx as usize) {
+                            if let Some(packed) = self.base.matched.get(idx as usize) {
+                                let (vol, file_idx) = unpack_matched(*packed);
                                 if let Some(vol_name) = vol_names.get(vol as usize) {
                                     if let Some(m) = volumes.get(vol_name) {
                                         if let Some(f) = m.files.get(file_idx as usize) {
@@ -1028,10 +1032,11 @@ impl SearchCache {
                         false
                     } else {
                         let idx = sorted_base[bi - 1];
-                        let Some(&(va, fa_idx)) = self.base.matched.get(idx as usize) else {
+                        let Some(packed) = self.base.matched.get(idx as usize) else {
                             bi -= 1;
                             continue;
                         };
+                        let (va, fa_idx) = unpack_matched(*packed);
                         let Some(vol_a) = vol_names.get(va as usize) else {
                             bi -= 1;
                             continue;
@@ -1082,7 +1087,8 @@ impl SearchCache {
                         if pick_base {
                             bi -= 1;
                             let idx = sorted_base[bi];
-                            if let Some(&(vol, file_idx)) = self.base.matched.get(idx as usize) {
+                            if let Some(packed) = self.base.matched.get(idx as usize) {
+                                let (vol, file_idx) = unpack_matched(*packed);
                                 if let Some(vol_name) = vol_names.get(vol as usize) {
                                     if let Some(m) = volumes.get(vol_name) {
                                         if let Some(f) = m.files.get(file_idx as usize) {
@@ -1161,39 +1167,6 @@ impl SearchCache {
     }
 }
 
-/// Build unsorted list of valid indices into `matched`.
-/// Filters out entries whose volume or file index is out of bounds.
-/// This is O(n) and called once per cache build; subsequent sorts use
-/// `select_nth_unstable_by` on this list instead of a full O(n log n) sort.
-fn build_valid_indices(
-    matched: &[(u8, u32)],
-    volumes: &HashMap<String, VolumeMonitor>,
-    vol_names: &[String],
-) -> Vec<u32> {
-    let n = matched.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let vol_files: Vec<&[FileEntry]> = (0..vol_names.len())
-        .map(|i| {
-            volumes
-                .get(&vol_names[i])
-                .map(|v| v.files.as_slice())
-                .unwrap_or(&[])
-        })
-        .collect();
-    let mut v: Vec<u32> = Vec::with_capacity(n);
-    for i in 0..n as u32 {
-        let (vol, idx) = matched[i as usize];
-        let vi = vol as usize;
-        if vi < vol_files.len() && !vol_files[vi].is_empty() && (idx as usize) < vol_files[vi].len()
-        {
-            v.push(i);
-        }
-    }
-    v
-}
-
 pub struct VolumeManager {
     volumes: HashMap<String, VolumeMonitor>,
     volume_index: HashMap<String, u8>,
@@ -1203,6 +1176,9 @@ pub struct VolumeManager {
     last_search_query: String,
     /// 上次搜索的选项，用于在文件删除后重建缓存
     last_search_options: Option<SearchOptions>,
+    /// 排序索引缓存（从 SearchCache 中分离出来）。
+    /// 生命周期独立于 SearchCache：查询变化时清空重建，base.matched 变化时（merge/incremental/volume增删）清空。
+    sorted_indices_map: SortedIndicesCache,
 }
 
 pub struct VolumeMonitor {
@@ -1238,6 +1214,7 @@ impl VolumeManager {
             search_cache: None,
             last_search_query: String::new(),
             last_search_options: None,
+            sorted_indices_map: SortedIndicesCache::new(),
         }
     }
 
@@ -1258,6 +1235,7 @@ impl VolumeManager {
         );
         self.volumes.insert(drive_letter.to_string(), monitor);
         self.search_cache = None;
+        self.sorted_indices_map.clear();
         Ok(())
     }
 
@@ -1270,6 +1248,7 @@ impl VolumeManager {
             }
         }
         self.search_cache = None;
+        self.sorted_indices_map.clear();
     }
 
     pub fn volumes(&self) -> Vec<String> {
@@ -1337,6 +1316,7 @@ impl VolumeManager {
                     options.sort_direction,
                     0,
                     50,
+                    &mut self.sorted_indices_map,
                 );
                 log::info!("search_with_options total: {:?}", t0.elapsed());
                 return (first_batch, total);
@@ -1344,7 +1324,9 @@ impl VolumeManager {
         }
 
         // New search: build base matched from all volumes
+        // 清空旧缓存：查询变化后 base.matched 不同，旧排序索引失效
         self.search_cache = None;
+        self.sorted_indices_map.clear();
         let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
         let matched_lock = std::sync::Mutex::new(Vec::with_capacity(total_files / 4));
         let is_empty_query = query.trim().is_empty();
@@ -1365,7 +1347,7 @@ impl VolumeManager {
         self.volumes.par_iter().for_each(|(vol_key, monitor)| {
             let vol_idx = self.volume_index[vol_key];
             if is_empty_query {
-                let local: Vec<(u8, u32)> = monitor
+                let local: Vec<u32> = monitor
                     .files
                     .par_iter()
                     .enumerate()
@@ -1376,13 +1358,13 @@ impl VolumeManager {
                         if directories_only && !file.is_directory {
                             return None;
                         }
-                        Some((vol_idx, idx as u32))
+                        Some(pack_matched(vol_idx, idx as u32))
                     })
                     .collect();
                 matched_lock.lock().unwrap().extend(local);
             } else {
                 let pq = parsed_query.as_ref().unwrap();
-                let local: Vec<(u8, u32)> = monitor
+                let local: Vec<u32> = monitor
                     .files
                     .par_iter()
                     .enumerate()
@@ -1403,7 +1385,7 @@ impl VolumeManager {
                         if directories_only && !file.is_directory {
                             return None;
                         }
-                        Some((vol_idx, idx as u32))
+                        Some(pack_matched(vol_idx, idx as u32))
                     })
                     .collect();
                 matched_lock.lock().unwrap().extend(local);
@@ -1426,8 +1408,7 @@ impl VolumeManager {
             created_at: Instant::now(),
             base: BaseCache {
                 matched: all_matched,
-                valid_indices: None,          // built lazily in get_sorted_slice
-                valid_indices_matched_len: 0, // 与 valid_indices 同步，首次构建时设置
+                matched_generation: 0,
             },
             delta: DeltaCache {
                 new_files: Vec::new(),
@@ -1438,16 +1419,14 @@ impl VolumeManager {
                 matched: Vec::new(),
                 generation: 0,
             },
-            sorted_cache: None,
             active_base_count: None,
-            base_file_ids: None,
-            sorted_indices_map: std::collections::HashMap::new(),
+            base_file_bitvec: None,
         });
 
         // 不预计算完整排序。改为在 get_sorted_slice 中按需计算。
         // 初始显示只需前 50 条，通过 select_nth_unstable_by (O(n)) 快速获取，
         // 而非对 221 万文件做全量排序 (O(n log n))。
-        // 完整排序在 SortedCache 中缓存，后续 get_records_range 调用复用。
+        // 完整排序在 sorted_indices_map 中按需缓存，后续 get_records_range 调用复用。
 
         // Use get_sorted_slice for first_batch (handles base+delta merge)
         let (first_batch, total) = self.search_cache.as_mut().unwrap().get_sorted_slice(
@@ -1457,6 +1436,7 @@ impl VolumeManager {
             options.sort_direction,
             0,
             50,
+            &mut self.sorted_indices_map,
         );
         log::info!("search_with_options total: {:?}", t0.elapsed());
         (first_batch, total)
@@ -1474,6 +1454,7 @@ impl VolumeManager {
             );
         }
         self.search_cache = None;
+        self.sorted_indices_map.clear();
         Ok(total)
     }
 
@@ -1482,6 +1463,7 @@ impl VolumeManager {
             monitor.remove_file(file_path);
         }
         self.search_cache = None;
+        self.sorted_indices_map.clear();
         
         // 文件删除后重建搜索缓存，确保前端能立即获取最新结果
         if let Some(options) = self.last_search_options.clone() {
@@ -1509,6 +1491,7 @@ impl VolumeManager {
             return None;
         }
         cache.refresh();
+        let sorted = &mut self.sorted_indices_map;
         let (results, total) = cache.get_sorted_slice(
             &self.volumes,
             &self.vol_names,
@@ -1516,6 +1499,7 @@ impl VolumeManager {
             sort_direction,
             start,
             end,
+            sorted,
         );
         Some((results, total))
     }
@@ -1552,6 +1536,7 @@ impl VolumeManager {
             monitor.use_usn = true;
         }
         self.search_cache = None;
+        self.sorted_indices_map.clear();
     }
 
     /// 应用增量 USN 变更到卷
@@ -1582,10 +1567,10 @@ impl VolumeManager {
         };
         let has_cache = self.search_cache.is_some();
 
-        // 确保 base_file_ids 已构建，供后续增量维护 active_base_count 使用
+        // 确保 base_file_bitvec 已构建，供后续增量维护 active_base_count 使用
         if has_cache {
             if let Some(cache) = self.search_cache.as_mut() {
-                cache.ensure_base_file_ids(&self.volumes, &self.vol_names);
+                cache.ensure_base_file_bitvec(&self.volumes, &self.vol_names);
             }
         }
 
@@ -1756,14 +1741,14 @@ impl VolumeManager {
                 cache.delta.new_files.push(entry);
             }
             // Rebuild delta.matched from delta.new_files
-            let mut new_delta_matched: Vec<(u8, u32)> = Vec::new();
+            let mut new_delta_matched: Vec<u32> = Vec::new();
             for (i, (v, f)) in cache.delta.new_files.iter().enumerate() {
                 if cache.delta.deleted_ids.contains(&f.file_id)
                     && !cache.delta.renamed_fids.contains(&f.file_id)
                 {
                     continue;
                 }
-                new_delta_matched.push((*v, i as u32));
+                new_delta_matched.push(pack_matched(*v, i as u32));
             }
             cache.delta.matched = new_delta_matched;
             cache.delta.generation += 1;
@@ -1784,13 +1769,16 @@ impl VolumeManager {
                 + std::mem::size_of::<u32>())
             * 2;
         let renamed_bytes = cache.delta.renamed_fids.len() * std::mem::size_of::<u32>() * 2;
-        let matched_bytes = cache.delta.matched.len() * std::mem::size_of::<(u8, u32)>();
+        let matched_bytes = cache.delta.matched.len() * std::mem::size_of::<u32>();
         new_files_bytes + deleted_bytes + modified_bytes + renamed_bytes + matched_bytes
     }
 
     pub fn merge_if_needed(&mut self) {
-        const DELTA_MEMORY_THRESHOLD: usize = 50 * 1024 * 1024; // 50 MB
-        const DELTA_COUNT_THRESHOLD: usize = 10_000;
+        // 降低 delta merge 阈值：让增量变更更早合并回 base，
+        // 避免 delta 缓存长期顶在高位导致常驻内存占用过高。
+        // 1000 条 / 10MB 的阈值在一般桌面文件变更频率下仍足够缓冲批量 USN 事件。
+        const DELTA_MEMORY_THRESHOLD: usize = 10 * 1024 * 1024; // 10 MB
+        const DELTA_COUNT_THRESHOLD: usize = 1_000;
         let should_merge = self.search_cache.as_ref().is_some_and(|c| {
             let count =
                 c.delta.new_files.len() + c.delta.deleted_ids.len() + c.delta.modified.len();
@@ -1803,22 +1791,23 @@ impl VolumeManager {
                     + std::mem::size_of::<u32>())
                 * 2;
             let renamed_bytes = c.delta.renamed_fids.len() * std::mem::size_of::<u32>() * 2;
-            let matched_bytes = c.delta.matched.len() * std::mem::size_of::<(u8, u32)>();
+            let matched_bytes = c.delta.matched.len() * std::mem::size_of::<u32>();
             let memory =
                 new_files_bytes + deleted_bytes + modified_bytes + renamed_bytes + matched_bytes;
             count > DELTA_COUNT_THRESHOLD || memory > DELTA_MEMORY_THRESHOLD
         });
         if should_merge {
             let memory_mb = self.delta_memory_bytes() / 1024 / 1024;
-            let cache = self.search_cache.as_mut().unwrap();
             log::info!(
                 "Merging delta: {} new, {} deleted, {} modified, ~{} MB",
-                cache.delta.new_files.len(),
-                cache.delta.deleted_ids.len(),
-                cache.delta.modified.len(),
+                self.search_cache.as_ref().unwrap().delta.new_files.len(),
+                self.search_cache.as_ref().unwrap().delta.deleted_ids.len(),
+                self.search_cache.as_ref().unwrap().delta.modified.len(),
                 memory_mb
             );
-            cache.merge_delta_to_base(&mut self.volumes, &self.vol_names);
+            self.search_cache.as_mut().unwrap().merge_delta_to_base(&mut self.volumes, &self.vol_names);
+            // merge 后 base.matched 已重建，排序索引全部失效
+            self.sorted_indices_map.clear();
         }
     }
 
@@ -1829,7 +1818,8 @@ impl VolumeManager {
     }
 
     /// 返回当前索引的内存统计信息（单位：字节），用于排查内存占用。
-    pub fn memory_stats(&self) -> (usize, usize, usize, usize) {
+    /// 新增 sorted_indices 字段，便于观察排序缓存是否导致内存上涨。
+    pub fn memory_stats(&self) -> (usize, usize, usize, usize, usize) {
         let files_bytes: usize = self
             .volumes
             .values()
@@ -1850,7 +1840,14 @@ impl VolumeManager {
             })
             .sum();
         let delta_bytes = self.delta_memory_bytes();
-        (files_bytes, path_table_bytes, fid_index_bytes, delta_bytes)
+        let sorted_indices_bytes: usize = self.sorted_indices_map.memory_bytes();
+        (
+            files_bytes,
+            path_table_bytes,
+            fid_index_bytes,
+            delta_bytes,
+            sorted_indices_bytes,
+        )
     }
 
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
@@ -1861,19 +1858,21 @@ impl VolumeManager {
             None => return 0,
         };
 
-        let cache = match self.search_cache.as_mut() {
-            Some(c) => c,
-            None => return 0,
-        };
+        if self.search_cache.is_none() {
+            return 0;
+        }
 
-        apply_incremental_to_cache(
-            cache,
+        let ret = apply_incremental_to_cache(
+            self.search_cache.as_mut().unwrap(),
             &self.volumes,
             &self.vol_names,
             volume_files,
             vol_idx,
             result,
-        )
+        );
+        // base.matched 已被 remap，排序索引全部失效
+        self.sorted_indices_map.clear();
+        ret
     }
 }
 
@@ -1896,14 +1895,15 @@ fn apply_incremental_to_cache(
         return cache.base.matched.len();
     }
 
-    let mut new_matched: Vec<(u8, u32)> = Vec::with_capacity(cache.base.matched.len());
+    let mut new_matched: Vec<u32> = Vec::with_capacity(cache.base.matched.len());
 
-    for (vol, idx) in cache.base.matched.drain(..) {
+    for packed in cache.base.matched.drain(..) {
+        let (vol, idx) = unpack_matched(packed);
         if vol != vol_idx {
-            new_matched.push((vol, idx));
+            new_matched.push(packed);
         } else if (idx as usize) < result.index_map.len() {
             if let Some(new_idx) = result.index_map[idx as usize] {
-                new_matched.push((vol, new_idx as u32));
+                new_matched.push(pack_matched(vol, new_idx as u32));
             }
         }
     }
@@ -1945,17 +1945,13 @@ fn apply_incremental_to_cache(
                 if cache.directories_only && !file.is_directory {
                     continue;
                 }
-                new_matched.push((vol_idx, new_idx as u32));
+                new_matched.push(pack_matched(vol_idx, new_idx as u32));
             }
         }
     }
     let _added_count = new_matched.len() - added_count_before;
 
     cache.base.matched = new_matched;
-    cache.base.valid_indices = None;
-    cache.base.valid_indices_matched_len = 0;
-    cache.sorted_cache = None;
-    cache.sorted_indices_map.clear();
     cache.invalidate_base_count();
 
     cache.base.matched.len()

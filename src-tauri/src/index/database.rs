@@ -16,7 +16,9 @@ impl IndexDatabase {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = -4000;
+             -- 降低 SQLite 页缓存至 8MB，减少常驻内存占用。
+             -- 搜索主路径已走内存索引，SQLite 仅用于配置/建议，影响可忽略。
+             PRAGMA cache_size = -2000;
              PRAGMA temp_store = MEMORY;
              
              CREATE TABLE IF NOT EXISTS files (
