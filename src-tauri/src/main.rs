@@ -839,20 +839,21 @@ fn main() {
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
 
-                        let (files_bytes, path_table_bytes, fid_index_bytes, delta_bytes) = {
+                        let (files_bytes, path_table_bytes, fid_index_bytes, delta_bytes, sorted_indices_bytes) = {
                             let vm = vm_clone_stats.lock().await;
                             vm.memory_stats()
                         };
                         let total_mb =
-                            (files_bytes + path_table_bytes + fid_index_bytes + delta_bytes)
+                            (files_bytes + path_table_bytes + fid_index_bytes + delta_bytes + sorted_indices_bytes)
                                 / 1024
                                 / 1024;
                         log::info!(
-                            "[Memory] files={} MB, path_table={} MB, fid_index={} MB, delta={} MB, total={} MB",
+                            "[Memory] files={} MB, path_table={} MB, fid_index={} MB, delta={} MB, sorted_indices={} MB, total={} MB",
                             files_bytes / 1024 / 1024,
                             path_table_bytes / 1024 / 1024,
                             fid_index_bytes / 1024 / 1024,
                             delta_bytes / 1024 / 1024,
+                            sorted_indices_bytes / 1024 / 1024,
                             total_mb
                         );
                     }
