@@ -4,7 +4,6 @@ use std::fmt;
 pub enum AppError {
     WindowsApi(u32),
     Io(std::io::Error),
-    Database(rusqlite::Error),
     Regex(regex::Error),
 }
 
@@ -13,7 +12,6 @@ impl fmt::Display for AppError {
         match self {
             AppError::WindowsApi(code) => write!(f, "Windows API error: {}", code),
             AppError::Io(e) => write!(f, "IO error: {}", e),
-            AppError::Database(e) => write!(f, "Database error: {}", e),
             AppError::Regex(e) => write!(f, "Regex error: {}", e),
         }
     }
@@ -24,12 +22,6 @@ impl std::error::Error for AppError {}
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
         AppError::Io(e)
-    }
-}
-
-impl From<rusqlite::Error> for AppError {
-    fn from(e: rusqlite::Error) -> Self {
-        AppError::Database(e)
     }
 }
 

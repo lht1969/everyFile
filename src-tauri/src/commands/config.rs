@@ -69,19 +69,18 @@ pub async fn save_config(
 ) -> Result<(), String> {
     log::info!("Received save_config request");
 
-    let config = Config {
-        default_volume: params.default_volume,
-        max_cache_items: params.max_cache_items,
-        max_history_items: params.max_history_items,
-        index_settings: crate::config::IndexSettings {
-            enable_usn_journal: params.enable_usn_journal,
-            include_hidden_files: params.include_hidden_files,
-            include_system_files: params.include_system_files,
-            update_interval: params.update_interval,
-        },
-        monitored_volumes: params.monitored_volumes,
-        startup: params.startup,
+    let mut config = Config::load().map_err(|e| e.to_string())?;
+    config.default_volume = params.default_volume;
+    config.max_cache_items = params.max_cache_items;
+    config.max_history_items = params.max_history_items;
+    config.index_settings = crate::config::IndexSettings {
+        enable_usn_journal: params.enable_usn_journal,
+        include_hidden_files: params.include_hidden_files,
+        include_system_files: params.include_system_files,
+        update_interval: params.update_interval,
     };
+    config.monitored_volumes = params.monitored_volumes;
+    config.startup = params.startup;
 
     let include_hidden = config.index_settings.include_hidden_files;
     let include_system = config.index_settings.include_system_files;

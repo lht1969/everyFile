@@ -1177,8 +1177,11 @@ pub struct VolumeManager {
     /// 上次搜索的选项，用于在文件删除后重建缓存
     last_search_options: Option<SearchOptions>,
     /// 排序索引缓存（从 SearchCache 中分离出来）。
-    /// 生命周期独立于 SearchCache：查询变化时清空重建，base.matched 变化时（merge/incremental/volume增删）清空。
+    /// 生命周期独立于 SearchCache：查询变化时不清理，通过 generation 自动失效。
     sorted_indices_map: SortedIndicesCache,
+    /// 单调递增的缓存代次，每次新建 SearchCache 时递增，
+    /// 使旧 sorted_indices 因 generation 不匹配而自动失效。
+    cache_generation: u64,
 }
 
 pub struct VolumeMonitor {
@@ -1215,6 +1218,7 @@ impl VolumeManager {
             last_search_query: String::new(),
             last_search_options: None,
             sorted_indices_map: SortedIndicesCache::new(),
+            cache_generation: 0,
         }
     }
 
@@ -1324,9 +1328,10 @@ impl VolumeManager {
         }
 
         // New search: build base matched from all volumes
-        // 清空旧缓存：查询变化后 base.matched 不同，旧排序索引失效
+        // 清空旧缓存。不清理 sorted_indices_map：
+        // 新 cache 的 matched_generation 递增后，旧排序索引因 generation 不匹配自动失效，
+        // 无需手动 clear，避免清空搜索框时重复排序 2.21M 条索引。
         self.search_cache = None;
-        self.sorted_indices_map.clear();
         let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
         let matched_lock = std::sync::Mutex::new(Vec::with_capacity(total_files / 4));
         let is_empty_query = query.trim().is_empty();
@@ -1408,7 +1413,10 @@ impl VolumeManager {
             created_at: Instant::now(),
             base: BaseCache {
                 matched: all_matched,
-                matched_generation: 0,
+                matched_generation: {
+                    self.cache_generation += 1;
+                    self.cache_generation
+                },
             },
             delta: DeltaCache {
                 new_files: Vec::new(),

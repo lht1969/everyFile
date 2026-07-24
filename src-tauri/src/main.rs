@@ -137,32 +137,6 @@ fn main() {
         None
     };
 
-    // 数据库路径：使用 AppData 目录，避免在 dev 模式下触发文件监听器重建
-    let db_path = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Everything");
-    info!("Database directory: {:?}", db_path);
-    match std::fs::create_dir_all(&db_path) {
-        Ok(_) => info!("Database directory created/verified"),
-        Err(e) => log::error!("Failed to create database directory: {}", e),
-    }
-    let db_path = db_path.join("everything.db");
-    info!("Database path: {:?}", db_path);
-
-    // 初始化索引管理器
-    info!("Initializing index manager...");
-    let index_manager = match index::IndexManager::new(&db_path) {
-        Ok(m) => {
-            info!("Index manager initialized successfully");
-            m
-        }
-        Err(e) => {
-            log::error!("FATAL: Failed to initialize index manager: {}", e);
-            eprintln!("FATAL: Failed to initialize index manager: {}", e);
-            std::process::exit(1);
-        }
-    };
-
     // 构建 Tauri 应用
     info!("Building Tauri application...");
     tauri::Builder::default()
@@ -174,7 +148,6 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         // 管理应用状态
         .manage(AppState {
-            index_manager,
             // 克隆卷管理器到应用状态
             volume_manager: volume_manager.clone(),
             is_searching: is_searching.clone(),
@@ -894,6 +867,7 @@ fn main() {
             // 搜索相关命令
             commands::search::search_files,
             commands::search::get_search_suggestions,
+            commands::search::add_search_suggestion,
             commands::search::get_records_range,
             commands::search::get_sorted_range,
             // 卷管理相关命令

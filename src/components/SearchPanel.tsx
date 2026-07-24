@@ -31,6 +31,8 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
       localStorage.setItem('searchHistory', JSON.stringify(next));
       return next;
     });
+    // 同步保存到后端配置文件（替代 SQLite）
+    invoke('add_search_suggestion', { query: q }).catch(() => {});
   };
 
   useEffect(() => {

@@ -56,9 +56,6 @@ windows = { version = "0.52", features = [
     "Win32_System_Memory",
 ] }
 
-# 数据库
-rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
-
 # 异步运行时
 tokio = { version = "1.35", features = ["sync", "time", "rt-multi-thread"] }
 

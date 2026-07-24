@@ -243,9 +243,9 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                     >
                       <div className="col-name" onContextMenu={(e) => handleContextMenu(e, result.path)}>
                         <FileIcon path={result.path} isDirectory={result.is_directory} />
-                        <span className="col-name-text" title={result.name}>{highlightMatch(result.name, searchQuery || '')}</span>
+                        <span className="col-name-text">{highlightMatch(result.name, searchQuery || '')}</span>
                       </div>
-                      <div className="col-path" title={result.path} onContextMenu={(e) => handleContextMenu(e, getDirectoryPath(result.path, result.is_directory))}>{highlightMatch(getDirectoryPath(result.path, result.is_directory), searchQuery || '')}</div>
+                      <div className="col-path" onContextMenu={(e) => handleContextMenu(e, getDirectoryPath(result.path, result.is_directory))}>{highlightMatch(getDirectoryPath(result.path, result.is_directory), searchQuery || '')}</div>
                       <div className="col-size">{formatSize(result.size)}</div>
                       <div className="col-modified">{formatTime(result.modified_time)}</div>
                     </div>

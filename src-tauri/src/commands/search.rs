@@ -1,4 +1,3 @@
-use crate::index::IndexManager;
 use crate::index::UsnIndexManager;
 use crate::search::{SearchOptions, SearchResult, SortBy, SortDirection};
 use serde::{Deserialize, Serialize};
@@ -42,7 +41,6 @@ pub struct SearchResponse {
 }
 
 pub struct AppState {
-    pub index_manager: IndexManager,
     pub volume_manager: Arc<Mutex<crate::index::monitor::VolumeManager>>,
     pub is_searching: Arc<AtomicBool>,
     pub last_index_update: Arc<Mutex<String>>,
@@ -90,23 +88,35 @@ pub async fn search_files(
 
 #[tauri::command]
 pub async fn get_search_suggestions(
-    state: State<'_, AppState>,
     query: String,
     limit: usize,
 ) -> Result<Vec<String>, String> {
-    let results = state
-        .index_manager
-        .search(&query, limit, 0)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let suggestions: Vec<String> = results
-        .into_iter()
-        .map(|r| r.name.into())
+    let config = crate::config::Config::load().map_err(|e| e.to_string())?;
+    let query_lower = query.to_lowercase();
+    let suggestions: Vec<String> = config
+        .search_suggestions
+        .iter()
+        .filter(|s| s.to_lowercase().contains(&query_lower))
         .take(limit)
+        .cloned()
         .collect();
-
     Ok(suggestions)
+}
+
+#[tauri::command]
+pub async fn add_search_suggestion(query: String) -> Result<(), String> {
+    if query.trim().is_empty() {
+        return Ok(());
+    }
+    let mut config = crate::config::Config::load().map_err(|e| e.to_string())?;
+    // 去重：移除已有的相同项，插入到头部
+    config.search_suggestions.retain(|s| s != &query);
+    config.search_suggestions.insert(0, query);
+    // 限制最大数量（复用 max_history_items）
+    let max = config.max_history_items;
+    config.search_suggestions.truncate(max);
+    config.save().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
