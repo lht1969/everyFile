@@ -136,18 +136,29 @@ pub fn show_context_menu(
         SetWindowSubclass(hwnd, Some(ctx_menu_subclass_proc), 1, 0);
     }
 
-    unsafe {
+    // TPM_RETURNCMD: returns the selected item ID directly, or 0 if the menu was
+    // cancelled (user clicked outside). Without this flag, TrackPopupMenu always
+    // returns nonzero on success, making it impossible to distinguish "item selected"
+    // from "menu dismissed".
+    let cmd_id = unsafe {
         SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(hmenu, TPM_RIGHTBUTTON, screen_x, screen_y, 0, hwnd, None);
+        let ret = TrackPopupMenu(
+            hmenu,
+            TPM_RETURNCMD,
+            screen_x,
+            screen_y,
+            0,
+            hwnd,
+            None,
+        );
         let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-    }
+        ret.0 as i32
+    };
 
     unsafe {
         RemoveWindowSubclass(hwnd, Some(ctx_menu_subclass_proc), 1);
         CTX_MENU_ICM2 = 0;
     }
-
-    let cmd_id = CTX_MENU_CMD.swap(0, Ordering::SeqCst);
 
     log::info!("Context menu command selected: {}", cmd_id);
 

@@ -1850,6 +1850,33 @@ impl VolumeManager {
         )
     }
 
+    /// 释放后台空闲时可重建的内存，保留核心数据（files + path_table）。
+    /// 窗口隐藏到托盘时调用，首次搜索时自动重建。
+    /// 释放内容：search_cache、sorted_indices_map、各卷 fid_index。
+    /// 保留内容：delta（丢失需全量重扫）、files、path_table。
+    pub fn release_idle_memory(&mut self) {
+        let before = self.memory_stats();
+        let before_total = before.0 + before.1 + before.2 + before.3 + before.4;
+
+        // 释放搜索缓存（含 base.matched、delta、base_file_bitvec）
+        self.search_cache = None;
+        // 释放排序索引缓存
+        self.sorted_indices_map.clear();
+        // 释放各卷的 fid_index（下次增量更新时自动重建）
+        for monitor in self.volumes.values_mut() {
+            monitor.fid_index = None;
+        }
+
+        let after = self.memory_stats();
+        let after_total = after.0 + after.1 + after.2 + after.3 + after.4;
+        log::info!(
+            "[Memory] release_idle_memory: {} MB -> {} MB (freed {} MB)",
+            before_total / 1024 / 1024,
+            after_total / 1024 / 1024,
+            (before_total.saturating_sub(after_total)) / 1024 / 1024,
+        );
+    }
+
     pub fn apply_incremental(&mut self, drive_letter: &str, result: &IncrementalResult) -> usize {
         // volume_files 现在是 &[FileEntry]
         let volume_files: Option<&[FileEntry]> = self.volumes.get(drive_letter).map(|v| v.files());

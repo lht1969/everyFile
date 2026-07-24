@@ -183,11 +183,18 @@ fn main() {
             scanning_volumes: scanning_volumes.clone(),
         })
         // 设置窗口事件处理
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-                log::info!("Window hidden to tray");
+        .on_window_event({
+            let vm = volume_manager.clone();
+            move |window, event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    log::info!("Window hidden to tray");
+                    // 释放后台可重建的内存（search_cache、sorted_indices、fid_index）
+                    if let Ok(mut vm) = vm.try_lock() {
+                        vm.release_idle_memory();
+                    }
+                }
             }
         })
         // 设置应用初始化
