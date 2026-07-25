@@ -7,10 +7,15 @@ pub mod usn_worker;
 
 use crate::index::usn_types::{UsnCommand, UsnResponse};
 use crossbeam_channel::{Receiver, Sender};
+use std::collections::HashMap;
 
 pub struct UsnIndexManager {
-    cmd_tx: Sender<UsnCommand>,
+    /// 每个卷独立的命令发送器
+    workers: HashMap<char, Sender<UsnCommand>>,
+    /// 所有worker共享的响应接收器
     resp_rx: Receiver<UsnResponse>,
+    /// 共享的响应发送器（用于创建新worker时传递）
+    resp_tx: Sender<UsnResponse>,
 }
 
 impl Default for UsnIndexManager {
@@ -21,10 +26,18 @@ impl Default for UsnIndexManager {
 
 impl UsnIndexManager {
     pub fn new() -> Self {
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
-        crate::index::usn_worker::spawn_usn_worker(cmd_rx, resp_tx);
-        Self { cmd_tx, resp_rx }
+        Self {
+            workers: HashMap::new(),
+            resp_rx,
+            resp_tx,
+        }
+    }
+
+    pub fn add_volume(&mut self, drive_letter: char) {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        crate::index::usn_worker::spawn_usn_worker(cmd_rx, self.resp_tx.clone());
+        self.workers.insert(drive_letter, cmd_tx);
     }
 
     pub fn full_scan(
@@ -33,11 +46,13 @@ impl UsnIndexManager {
         include_hidden_files: bool,
         include_system_files: bool,
     ) {
-        let _ = self.cmd_tx.send(UsnCommand::FullScan {
-            drive_letter,
-            include_hidden_files,
-            include_system_files,
-        });
+        if let Some(cmd_tx) = self.workers.get(&drive_letter) {
+            let _ = cmd_tx.send(UsnCommand::FullScan {
+                drive_letter,
+                include_hidden_files,
+                include_system_files,
+            });
+        }
     }
 
     pub fn poll_changes(
@@ -46,25 +61,23 @@ impl UsnIndexManager {
         include_hidden_files: bool,
         include_system_files: bool,
     ) {
-        let _ = self.cmd_tx.send(UsnCommand::PollChanges {
-            drive_letter,
-            include_hidden_files,
-            include_system_files,
-        });
+        if let Some(cmd_tx) = self.workers.get(&drive_letter) {
+            let _ = cmd_tx.send(UsnCommand::PollChanges {
+                drive_letter,
+                include_hidden_files,
+                include_system_files,
+            });
+        }
     }
 
     #[allow(dead_code)]
     pub fn shutdown(&self) {
-        let _ = self.cmd_tx.send(UsnCommand::Shutdown);
+        for cmd_tx in self.workers.values() {
+            let _ = cmd_tx.send(UsnCommand::Shutdown);
+        }
     }
 
     pub fn resp_rx_clone(&self) -> Receiver<UsnResponse> {
         self.resp_rx.clone()
-    }
-
-    /// Non-blocking check for responses
-    #[allow(dead_code)]
-    pub fn try_recv(&self) -> Option<UsnResponse> {
-        self.resp_rx.try_recv().ok()
     }
 }
