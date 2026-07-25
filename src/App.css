@@ -998,3 +998,21 @@ body {
 .result-row.header>div:hover {
   background: #f3f4f6;
 }
+
+/* Volume status colors */
+.volume-tag {
+  display: inline-block;
+  margin-left: 4px;
+}
+
+.volume-tag.loading {
+  color: var(--text-secondary);
+}
+
+.volume-tag.empty {
+  color: var(--warning-color);
+}
+
+.volume-tag.error {
+  color: var(--danger-color);
+}
