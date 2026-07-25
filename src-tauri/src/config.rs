@@ -12,9 +12,6 @@ pub struct Config {
     pub monitored_volumes: Vec<String>,
     #[serde(default)]
     pub startup: bool,
-    /// 搜索建议列表（内存 + 配置文件持久化，替代 SQLite）
-    #[serde(default)]
-    pub search_suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +31,6 @@ impl Default for Config {
             index_settings: IndexSettings::default(),
             monitored_volumes: vec!["D:".to_string()],
             startup: false,
-            search_suggestions: Vec::new(),
         }
     }
 }

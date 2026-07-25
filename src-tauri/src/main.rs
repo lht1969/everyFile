@@ -866,8 +866,6 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // 搜索相关命令
             commands::search::search_files,
-            commands::search::get_search_suggestions,
-            commands::search::add_search_suggestion,
             commands::search::get_records_range,
             commands::search::get_sorted_range,
             // 卷管理相关命令

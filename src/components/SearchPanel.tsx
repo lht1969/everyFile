@@ -31,8 +31,6 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
       localStorage.setItem('searchHistory', JSON.stringify(next));
       return next;
     });
-    // 同步保存到后端配置文件（替代 SQLite）
-    invoke('add_search_suggestion', { query: q }).catch(() => {});
   };
 
   useEffect(() => {
@@ -85,16 +83,11 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
     };
   }, [helpVisible]);
 
-  const fetchSuggestions = async (searchQuery: string) => {
-    try {
-      const result = await invoke<string[]>('get_search_suggestions', {
-        query: searchQuery,
-        limit: 10
-      });
-      setSuggestions(result);
-    } catch (e) {
-      console.error('Failed to get suggestions:', e);
-    }
+  const fetchSuggestions = (searchQuery: string) => {
+    const filtered = searchHistory.filter(h =>
+      h.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+    setSuggestions(filtered.slice(0, 10));
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
