@@ -77,10 +77,10 @@ fn ensure_single_instance() -> bool {
 }
 
 fn main() {
-    // 单例检查：确保只有一个实例在运行
-    if !ensure_single_instance() {
-        std::process::exit(0);
-    }
+    // 单例检查：确保只有一个实例在运行（调试时临时禁用）
+    // if !ensure_single_instance() {
+    //     std::process::exit(0);
+    // }
 
     // 初始化文件日志（先于 env_logger，确保所有启动信息都能记录到文件）
     // 日志文件位置: %APPDATA%\Everything\logs\everything-YYYY-MM-DD.log
@@ -572,7 +572,6 @@ fn main() {
                 if let Some(ref usn) = usn_manager {
                     let usn_clone = usn.clone();
                     let vm_clone_for_usn = vm.clone();
-                    let is_searching_for_usn = is_searching.clone();
 
                     tauri::async_runtime::spawn(async move {
                         // 等待所有卷的全量扫描完成（每个卷都有文件数据）再开始轮询
@@ -592,7 +591,7 @@ fn main() {
                         }
                         // 额外等 3 秒让前端完成初始加载
                         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                        log::debug!("[USN] Polling task started");
+                        log::info!("[USN] Polling task started");
 
                         // Read config once at startup; reload only when file changes
                         let mut config = crate::config::Config::load().ok();
@@ -634,18 +633,12 @@ fn main() {
                                 continue;
                             }
 
-                            // 搜索进行中时跳过轮询，避免与搜索竞争锁
-                            if is_searching_for_usn.load(Ordering::SeqCst) {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                                continue;
-                            }
-
                             let volumes_list = {
                                 let vm = vm_clone_for_usn.lock().await;
                                 vm.volumes()
                             };
 
-                            log::debug!(
+                            log::info!(
                                 "[USN] Polling {} volumes: {:?}, interval={}s",
                                 volumes_list.len(),
                                 volumes_list,

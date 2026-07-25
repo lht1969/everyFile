@@ -44,7 +44,6 @@ pub struct AppState {
     pub volume_manager: Arc<Mutex<crate::index::monitor::VolumeManager>>,
     pub is_searching: Arc<AtomicBool>,
     pub last_index_update: Arc<Mutex<String>>,
-    #[allow(dead_code)]
     pub usn_manager: Option<Arc<UsnIndexManager>>,
     pub scanning_volumes: Arc<Mutex<Vec<String>>>,
 }
@@ -73,12 +72,36 @@ pub async fn search_files(
     options.min_size = params.min_size;
     options.max_size = params.max_size;
 
-    let mut vm = state.volume_manager.lock().await;
-    let (all_results, total) = vm.search_with_options(&params.query, &options);
+    let first_batch;
+    let total;
+    let volumes_to_poll: Vec<String>;
 
-    let first_batch: Vec<SearchResult> = all_results.into_iter().take(50).collect();
+    {
+        let mut vm = state.volume_manager.lock().await;
+        let result = vm.search_with_options(&params.query, &options);
+        total = result.1;
+        first_batch = result.0.into_iter().take(50).collect();
+        volumes_to_poll = vm.volumes();
+    }
 
     state.is_searching.store(false, Ordering::SeqCst);
+
+    // 搜索完成后主动触发 USN 轮询，确保搜索期间发生的文件变更能被立即检测
+    if let Some(ref usn) = state.usn_manager {
+        let config = crate::config::Config::load().ok();
+        let include_hidden = config
+            .as_ref()
+            .map(|c| c.index_settings.include_hidden_files)
+            .unwrap_or(false);
+        let include_system = config
+            .as_ref()
+            .map(|c| c.index_settings.include_system_files)
+            .unwrap_or(false);
+        for dl in &volumes_to_poll {
+            let dl_char = dl.chars().next().unwrap_or('C');
+            usn.poll_changes(dl_char, include_hidden, include_system);
+        }
+    }
 
     Ok(SearchResponse {
         total,
