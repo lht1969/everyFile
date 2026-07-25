@@ -1,4 +1,17 @@
-import type { IndexStatus } from '../types';
+import type { IndexStatus, VolumeState } from '../types';
+
+function getVolumeClassName(state: VolumeState): string {
+  switch (state.type) {
+    case 'Loading':
+      return 'loading';
+    case 'Ready':
+      return state.file_count === 0 ? 'empty' : '';
+    case 'Error':
+      return 'error';
+    default:
+      return '';
+  }
+}
 
 interface StatusBarProps {
   message: string;
@@ -19,9 +32,16 @@ function StatusBar({ message, indexStatus, isAdmin, searchTime }: StatusBarProps
             {searchTime < 1000 ? `${Math.round(searchTime)}ms` : `${(searchTime / 1000).toFixed(1)}s`}
           </span>
         )}
-        {indexStatus.volumes.length > 0 && (
+        {indexStatus.volume_statuses.length > 0 && (
           <span className="volume-info">
-            卷- {indexStatus.volumes.join(' ')}
+            卷- {indexStatus.volume_statuses.map(vs => (
+              <span 
+                key={vs.drive_letter}
+                className={`volume-tag ${getVolumeClassName(vs.state)}`}
+              >
+                {vs.drive_letter}
+              </span>
+            ))}
           </span>
         )}
         <span className="index-status">
