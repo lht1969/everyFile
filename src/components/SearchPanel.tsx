@@ -22,6 +22,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
   const helpRef = useRef<HTMLDivElement>(null);
   const helpBtnRef = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const skipSuggestionsRef = useRef(false);
 
   const addToHistory = (q: string) => {
     if (!q.trim()) return;
@@ -54,7 +55,10 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
     }
     const debounce = setTimeout(() => {
       onSearch(query, filterType === 'files', filterType === 'directories');
-      fetchSuggestions(query);
+      if (!skipSuggestionsRef.current) {
+        fetchSuggestions(query);
+      }
+      skipSuggestionsRef.current = false;
     }, 350);
     return () => clearTimeout(debounce);
   }, [query, filterType]);
@@ -95,6 +99,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
       if (query.trim()) {
         onSearch(query, filterType === 'files', filterType === 'directories');
         addToHistory(query);
+        setSuggestions([]);
       }
     } else if (e.key === 'Escape') {
       if (helpVisible) {
@@ -239,7 +244,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
         <div className="suggestions">
           <div className="suggestion-header">搜索历史（输入搜索条件后回车即可自动加入历史）</div>
           {filteredHistory.slice(0, 10).map((h, i) => (
-            <div key={i} className="suggestion-item" onClick={() => { setQuery(h); onSearch(h); setShowHistory(false); }}>
+            <div key={i} className="suggestion-item" onClick={() => { skipSuggestionsRef.current = true; setQuery(h); onSearch(h); setShowHistory(false); setSuggestions([]); }}>
               <span className="history-icon">🕐</span> {h}
             </div>
           ))}
@@ -251,7 +256,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
       {suggestions.length > 0 && (
         <div className="suggestions">
           {suggestions.map((s, i) => (
-            <div key={i} className="suggestion-item" onClick={() => { setQuery(s); onSearch(s); addToHistory(s); }}>
+            <div key={i} className="suggestion-item" onClick={() => { skipSuggestionsRef.current = true; setQuery(s); onSearch(s); addToHistory(s); setSuggestions([]); }}>
               {s}
             </div>
           ))}
