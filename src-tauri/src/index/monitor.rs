@@ -1274,6 +1274,8 @@ impl VolumeManager {
         self.volumes.insert(drive_letter.to_string(), monitor);
         self.search_cache = None;
         self.sorted_indices_map.clear();
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
         Ok(())
     }
 
@@ -1287,6 +1289,8 @@ impl VolumeManager {
         }
         self.search_cache = None;
         self.sorted_indices_map.clear();
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
     }
 
     pub fn volumes(&self) -> Vec<String> {
@@ -1295,6 +1299,8 @@ impl VolumeManager {
 
     pub fn invalidate_search_cache(&mut self) {
         self.search_cache = None;
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
     }
 
     pub fn get_monitor(&self, drive_letter: &str) -> Option<&VolumeMonitor> {
@@ -1373,7 +1379,12 @@ impl VolumeManager {
         // 清空旧缓存。不清理 sorted_indices_map：
         // 新 cache 的 matched_generation 递增后，旧排序索引因 generation 不匹配自动失效，
         // 无需手动 clear，避免清空搜索框时重复排序 2.21M 条索引。
+        // 必须同时递增 empty_query_generation，使空查询排序缓存失效：
+        // 上一次空查询（可能在卷扫描前）缓存的排序结果已过时，
+        // 若不失效会导致扫描完成后仍返回 0 条结果。
         self.search_cache = None;
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
         let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
         let matched_lock = std::sync::Mutex::new(Vec::with_capacity(total_files / 4));
         let parsed_query = if is_empty_query {
@@ -1507,6 +1518,8 @@ impl VolumeManager {
         }
         self.search_cache = None;
         self.sorted_indices_map.clear();
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
         Ok(total)
     }
 
@@ -1516,6 +1529,8 @@ impl VolumeManager {
         }
         self.search_cache = None;
         self.sorted_indices_map.clear();
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
         
         // 文件删除后重建搜索缓存，确保前端能立即获取最新结果
         if let Some(options) = self.last_search_options.clone() {
@@ -1922,6 +1937,9 @@ impl VolumeManager {
         self.search_cache = None;
         // 释放排序索引缓存
         self.sorted_indices_map.clear();
+        // 释放空查询排序缓存（下次搜索时自动重建）
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
         // 释放各卷的 fid_index（下次增量更新时自动重建）
         for monitor in self.volumes.values_mut() {
             monitor.fid_index = None;
