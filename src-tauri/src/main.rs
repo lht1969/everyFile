@@ -129,13 +129,6 @@ fn main() {
 
     // 检查管理员权限，决定是否使用 USN Journal
     let is_admin = fs::is_elevated();
-    let usn_manager: Option<Arc<UsnIndexManager>> = if is_admin {
-        info!("Admin mode detected, creating USN Index Manager");
-        Some(Arc::new(UsnIndexManager::new()))
-    } else {
-        info!("Non-admin mode, using walkdir for indexing");
-        None
-    };
 
     // 构建 Tauri 应用
     info!("Building Tauri application...");
@@ -152,7 +145,7 @@ fn main() {
             volume_manager: volume_manager.clone(),
             is_searching: is_searching.clone(),
             last_index_update: last_index_update.clone(),
-            usn_manager: usn_manager.clone(),
+            usn_manager: None, // 创建在 async 块中，此处仅占位
             scanning_volumes: scanning_volumes.clone(),
         })
         // 设置窗口事件处理
@@ -352,16 +345,17 @@ fn main() {
                     }
                 }
 
-                // === 阶段 3：dispatch USN full scan（短暂持锁）===
-                // 跟踪 USN 扫描完成数量，全部完成后通知前端
-                // 只统计 NTFS 卷（非 NTFS 卷不走 USN）
+                // === 阶段 3：创建 per-volume workers 并 dispatch USN full scan ===
+                // 创建 USN Index Manager（admin 模式下，为每个 NTFS 卷创建独立 worker）
                 let pending_usn_scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                if let Some(ref usn) = usn_manager {
+                let usn_manager: Option<Arc<UsnIndexManager>> = if is_admin {
+                    info!("[USN] Creating USN Index Manager with per-volume workers");
+                    let mut manager = UsnIndexManager::new();
                     let volumes = {
                         let vm = vm.lock().await;
                         vm.volumes()
                     };
-                    // 只对 NTFS 卷 dispatch USN 扫描，非 NTFS 卷走 walkdir
+                    // 只对 NTFS 卷创建 worker，非 NTFS 卷走 walkdir
                     let mut ntfs_vols = Vec::new();
                     for drive_letter in &volumes {
                         let is_ntfs = {
@@ -376,15 +370,23 @@ fn main() {
                             log::info!("Volume {} is not NTFS, skipping USN scan", drive_letter);
                         }
                     }
+                    // Create a dedicated worker for each NTFS volume
+                    for dl in &ntfs_vols {
+                        let dl_char = dl.chars().next().unwrap();
+                        manager.add_volume(dl_char);
+                        log::info!("[USN] Created worker for drive {}", dl_char);
+                    }
+                    let usn_arc = Arc::new(manager);
                     // 标记 NTFS 卷为扫描中（非 NTFS 卷已在 walkdir 阶段扫描完成）
                     {
                         let mut scan_vols = sv.lock().await;
                         *scan_vols = ntfs_vols.clone();
                     }
+                    // Dispatch parallel scan commands to all workers
                     for drive_letter in &ntfs_vols {
                         let dl_char = drive_letter.chars().next().unwrap_or('C');
                         log::debug!(
-                            "[USN] Issuing full scan for drive {} (hidden={}, system={})",
+                            "[USN] Dispatching parallel scan for drive {} (hidden={}, system={})",
                             dl_char,
                             include_hidden_files,
                             include_system_files
@@ -393,17 +395,19 @@ fn main() {
                             "scan-progress",
                             serde_json::json!({"volume": drive_letter}),
                         );
-                        usn.full_scan(dl_char, include_hidden_files, include_system_files);
+                        usn_arc.full_scan(dl_char, include_hidden_files, include_system_files);
                     }
                     pending_usn_scans.store(ntfs_vols.len(), std::sync::atomic::Ordering::SeqCst);
                     // 如果没有 NTFS 卷，直接通知前端
                     if ntfs_vols.is_empty() {
                         let _ = handle.emit("scan-all-complete", ());
                     }
+                    Some(usn_arc)
                 } else {
                     // 非管理员模式：无 USN 扫描，walkdir 扫描已完成，直接通知前端
                     let _ = handle.emit("scan-all-complete", ());
-                }
+                    None
+                };
 
                 // 创建全量扫描完成信号：walkdir 扫描完成后立即发送，
                 // USN full scan 结果到达时也会发送（双保险）
