@@ -51,8 +51,8 @@ pub enum UsnResponse {
         #[allow(dead_code)]
         last_usn: i64,
     },
-    /// Error
-    Error { message: String },
+    /// Error (drive_letter identifies which volume failed)
+    Error { drive_letter: char, message: String },
 }
 
 /// Persisted USN journal state per volume

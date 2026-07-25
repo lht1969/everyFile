@@ -780,6 +780,7 @@ fn handle_full_scan(
         Ok(v) => v,
         Err(e) => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to open volume {} for journal: {}", drive_letter, e),
             });
             return;
@@ -812,6 +813,7 @@ fn handle_full_scan(
                     Ok(data) => (data.journal_id, data.next_usn),
                     Err(e2) => {
                         let _ = resp_tx.send(UsnResponse::Error {
+                            drive_letter,
                             message: format!(
                                 "Journal create+query failed for {}: {}",
                                 drive_letter, e2
@@ -822,6 +824,7 @@ fn handle_full_scan(
                 },
                 Err(e2) => {
                     let _ = resp_tx.send(UsnResponse::Error {
+                        drive_letter,
                         message: format!("Journal create failed for {}: {}", drive_letter, e2),
                     });
                     return;
@@ -866,6 +869,7 @@ fn handle_full_scan_legacy(
         Ok(v) => v,
         Err(e) => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to open volume {}: {}", drive_letter, e),
             });
             return;
@@ -1186,6 +1190,7 @@ fn handle_full_scan_legacy(
                     Ok(data) => (data.journal_id, data.next_usn),
                     Err(e2) => {
                         let _ = resp_tx.send(UsnResponse::Error {
+                            drive_letter,
                             message: format!(
                                 "Journal create+query failed for {}: {}",
                                 drive_letter, e2
@@ -1196,6 +1201,7 @@ fn handle_full_scan_legacy(
                 },
                 Err(e2) => {
                     let _ = resp_tx.send(UsnResponse::Error {
+                        drive_letter,
                         message: format!("Journal create failed for {}: {}", drive_letter, e2),
                     });
                     return;
@@ -1243,6 +1249,7 @@ fn handle_poll_changes(
         Some(v) => v,
         None => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("No volume handle for drive {}", drive_letter),
             });
             return;
@@ -1253,6 +1260,7 @@ fn handle_poll_changes(
         Some(&usn) => usn,
         None => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("No last USN recorded for drive {}", drive_letter),
             });
             return;
@@ -1267,6 +1275,7 @@ fn handle_poll_changes(
         Err(e) => {
             log::warn!("[USN] Failed to query journal for {}: {}", drive_letter, e);
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to query journal for {}: {}", drive_letter, e),
             });
             return;
@@ -1313,6 +1322,7 @@ fn handle_poll_changes(
         Some(h) => h,
         None => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to open volume handle for drive {}", drive_letter),
             });
             return;
@@ -1329,6 +1339,7 @@ fn handle_poll_changes(
                     e
                 );
                 let _ = resp_tx.send(UsnResponse::Error {
+                    drive_letter,
                     message: format!("Failed to read journal for {}: {}", drive_letter, e),
                 });
                 return;
@@ -1962,6 +1973,7 @@ fn handle_full_scan_for_volume(
         Ok(v) => v,
         Err(e) => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to open volume {} for journal: {}", drive_letter, e),
             });
             return;
@@ -1994,6 +2006,7 @@ fn handle_full_scan_for_volume(
                     Ok(data) => (data.journal_id, data.next_usn),
                     Err(e2) => {
                         let _ = resp_tx.send(UsnResponse::Error {
+                            drive_letter,
                             message: format!(
                                 "Journal create+query failed for {}: {}",
                                 drive_letter, e2
@@ -2004,6 +2017,7 @@ fn handle_full_scan_for_volume(
                 },
                 Err(e2) => {
                     let _ = resp_tx.send(UsnResponse::Error {
+                        drive_letter,
                         message: format!("Journal create failed for {}: {}", drive_letter, e2),
                     });
                     return;
@@ -2043,6 +2057,7 @@ fn handle_full_scan_legacy_for_volume(
         Ok(v) => v,
         Err(e) => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to open volume {}: {}", drive_letter, e),
             });
             return;
@@ -2326,6 +2341,7 @@ fn handle_full_scan_legacy_for_volume(
                     Ok(data) => (data.journal_id, data.next_usn),
                     Err(e2) => {
                         let _ = resp_tx.send(UsnResponse::Error {
+                            drive_letter,
                             message: format!(
                                 "Journal create+query failed for {}: {}",
                                 drive_letter, e2
@@ -2336,6 +2352,7 @@ fn handle_full_scan_legacy_for_volume(
                 },
                 Err(e2) => {
                     let _ = resp_tx.send(UsnResponse::Error {
+                        drive_letter,
                         message: format!("Journal create failed for {}: {}", drive_letter, e2),
                     });
                     return;
@@ -2378,6 +2395,7 @@ fn handle_poll_changes_for_volume(
         Some(v) => v,
         None => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("No volume handle for drive {}", drive_letter),
             });
             return;
@@ -2393,6 +2411,7 @@ fn handle_poll_changes_for_volume(
         Err(e) => {
             log::warn!("[USN] Failed to query journal for {}: {}", drive_letter, e);
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to query journal for {}: {}", drive_letter, e),
             });
             return;
@@ -2425,6 +2444,7 @@ fn handle_poll_changes_for_volume(
         Some(h) => h,
         None => {
             let _ = resp_tx.send(UsnResponse::Error {
+                drive_letter,
                 message: format!("Failed to open volume handle for drive {}", drive_letter),
             });
             return;
@@ -2441,6 +2461,7 @@ fn handle_poll_changes_for_volume(
                     e
                 );
                 let _ = resp_tx.send(UsnResponse::Error {
+                    drive_letter,
                     message: format!("Failed to read journal for {}: {}", drive_letter, e),
                 });
                 return;
