@@ -16,7 +16,8 @@ pub struct VolumeInfo {
     pub free_space: u64,
 }
 
-pub fn get_ntfs_volumes() -> Result<Vec<VolumeInfo>> {
+/// 获取所有可用卷（不限文件系统类型）
+pub fn get_all_volumes() -> Result<Vec<VolumeInfo>> {
     let mut volumes = Vec::new();
 
     let drives = unsafe { GetLogicalDrives() };
@@ -31,9 +32,7 @@ pub fn get_ntfs_volumes() -> Result<Vec<VolumeInfo>> {
             let drive_letter = format!("{}:", (b'A' + i as u8) as char);
 
             if let Ok(info) = get_volume_info(&drive_letter) {
-                if info.file_system.eq_ignore_ascii_case("NTFS") {
-                    volumes.push(info);
-                }
+                volumes.push(info);
             }
         }
     }

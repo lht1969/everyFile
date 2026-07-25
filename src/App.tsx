@@ -53,10 +53,10 @@ function App() {
 
     const unlistenComplete = listen<{ volume: string; count: number }>('scan-complete', (_event) => {
       setStatusMessage(`扫描完成: ${_event.payload.volume} (${_event.payload.count.toLocaleString()} 个文件)`);
-      loadAllFiles();
     });
 
     const unlistenAllComplete = listen('scan-all-complete', () => {
+      loadAllFiles();
       loadIndexStatus();
     });
 

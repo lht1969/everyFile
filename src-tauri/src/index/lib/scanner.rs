@@ -140,7 +140,6 @@ impl MftScanner {
         let mut skip_fixup_fail: u64 = 0;
         let mut skip_inactive: u64 = 0;
         let mut no_timestamp: u64 = 0;
-        let mut pending_ext: Vec<(usize, Vec<u64>)> = Vec::new();
 
         for run in &self.data_runs {
             if total_records >= max_records {
@@ -216,16 +215,8 @@ impl MftScanner {
                 }
                 let parent_record =
                     extract_parent_record(&record_buf, self.file_record_size as usize);
-                let size =
-                    extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
-                if size == 0 && !is_dir {
-                    let ext =
-                        extract_data_extension_records(&record_buf, self.file_record_size as usize);
-                    if !ext.is_empty() {
-                        let result_idx = all_records.len();
-                        pending_ext.push((result_idx, ext));
-                    }
-                }
+                // 从 $FILE_NAME 读取真实大小（常驻属性，始终可用）
+                let size = extract_filename_real_size(&record_buf, self.file_record_size as usize);
                 let mtime = extract_mtime(&record_buf, self.file_record_size as usize);
                 let ctime = extract_ctime(&record_buf, self.file_record_size as usize);
                 let atime = extract_atime(&record_buf, self.file_record_size as usize);
@@ -254,16 +245,7 @@ impl MftScanner {
             }
         }
 
-        if !pending_ext.is_empty() {
-            resolve_pending_sizes(
-                reader,
-                &self.data_runs,
-                self.file_record_size,
-                self.cluster_size,
-                &pending_ext,
-                &mut all_records,
-            );
-        }
+        // 已从 $FILE_NAME 读取所有文件大小，无需二次批量解析
 
         ScanOutput {
             all_records,
@@ -308,9 +290,6 @@ impl MftScanner {
         let mut skip_fixup_fail: u64 = 0;
         let mut skip_inactive: u64 = 0;
         let mut no_timestamp: u64 = 0;
-        // pending_ext: (record_number, ext_record_nums)
-        // 收集主记录 size=0 且有 $ATTRIBUTE_LIST 的文件，扫描结束后统一读取扩展记录获取真实 size
-        let mut pending_ext: Vec<(u64, Vec<u64>)> = Vec::new();
 
         for run in &self.data_runs {
             if total_records >= max_records {
@@ -386,17 +365,9 @@ impl MftScanner {
                 }
                 let parent_record =
                     extract_parent_record(&record_buf, self.file_record_size as usize);
-                let size =
-                    extract_data_size_from_bytes(&record_buf, self.file_record_size as usize);
-                // 主记录 size=0 且非目录：可能是有 $ATTRIBUTE_LIST 的大文件
-                // 收集扩展记录号，扫描结束后批量读取以获取真实 size
-                if size == 0 && !is_dir {
-                    let ext =
-                        extract_data_extension_records(&record_buf, self.file_record_size as usize);
-                    if !ext.is_empty() {
-                        pending_ext.push((total_records, ext));
-                    }
-                }
+                // 从 $FILE_NAME 读取真实大小（常驻属性，始终可用）
+                // 避免 $DATA 在扩展记录时 size=0 的问题，消除二次批量解析
+                let size = extract_filename_real_size(&record_buf, self.file_record_size as usize);
                 let mtime = extract_mtime(&record_buf, self.file_record_size as usize);
                 let ctime = extract_ctime(&record_buf, self.file_record_size as usize);
                 let atime = extract_atime(&record_buf, self.file_record_size as usize);
@@ -428,23 +399,8 @@ impl MftScanner {
             }
         }
 
-        // 扫描结束后，批量读取扩展 MFT 记录获取真实 size
-        // 返回 HashMap<record_number, real_size> 供调用方更新 FileEntry
-        let pending_sizes = if !pending_ext.is_empty() {
-            log::info!(
-                "scan_streaming: resolving {} pending_ext entries for real sizes",
-                pending_ext.len()
-            );
-            resolve_pending_sizes_streaming(
-                reader,
-                &self.data_runs,
-                self.file_record_size,
-                self.cluster_size,
-                &pending_ext,
-            )
-        } else {
-            std::collections::HashMap::new()
-        };
+        // 已从 $FILE_NAME 读取所有文件大小，无需二次批量解析
+        let pending_sizes = std::collections::HashMap::new();
 
         (
             ScanStats {
@@ -704,6 +660,43 @@ fn extract_parent_record(record: &[u8], record_size: usize) -> u64 {
                 if parent != 0 {
                     return parent;
                 }
+            }
+        }
+
+        offset += attr_len;
+    }
+
+    0
+}
+
+/// 从 $FILE_NAME 属性读取文件真实大小（Real Size）。
+/// $FILE_NAME 是常驻属性，始终在主 MFT 记录中，无需读取扩展记录。
+/// 这消除了对 resolve_pending_sizes_streaming 的需求。
+fn extract_filename_real_size(record: &[u8], record_size: usize) -> u64 {
+    let first_attr_offset = read_u16(record, 20) as usize;
+    let mut offset = first_attr_offset;
+
+    while offset + 8 <= record.len().min(record_size) {
+        let attr_type = read_u32(record, offset);
+        let attr_len = read_u32(record, offset + 4) as usize;
+
+        if attr_type == ATTR_END || attr_len < 24 || offset + attr_len > record.len() {
+            break;
+        }
+
+        if attr_type == ATTR_FILE_NAME && record[offset + 8] == 0 {
+            let value_offset = read_u16(record, offset + 20) as usize;
+            let value_start = offset + value_offset;
+            // $FILE_NAME 属性值结构：
+            // +0:  Parent reference (8 bytes)
+            // +8:  Creation time (8 bytes)
+            // +16: Last access time (8 bytes)
+            // +24: Last modification time (8 bytes)
+            // +32: Last MFT change time (8 bytes)
+            // +40: Allocated size (8 bytes)
+            // +48: Real size (8 bytes)
+            if value_start + 56 <= record.len() {
+                return read_u64(record, value_start + 48);
             }
         }
 

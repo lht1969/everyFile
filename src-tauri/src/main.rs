@@ -225,14 +225,21 @@ fn main() {
                             ) {
                                 log::warn!("Failed to add volume {} from config: {}", volume, e);
                             }
+                            // 查询并设置文件系统类型
+                            if let Ok(info) = fs::get_volume_info(volume) {
+                                if let Some(monitor) = volume_manager.get_monitor_mut(volume) {
+                                    monitor.file_system = info.file_system;
+                                }
+                            }
                         }
                     } else if is_admin {
-                        log::info!("Admin mode: adding all NTFS volumes");
-                        if let Ok(volumes) = fs::get_ntfs_volumes() {
+                        log::info!("Admin mode: adding all volumes");
+                        if let Ok(volumes) = fs::get_all_volumes() {
                             for volume in &volumes {
+                                let is_ntfs = volume.file_system.eq_ignore_ascii_case("NTFS");
                                 if let Err(e) = volume_manager.add_volume(
                                     &volume.drive_letter,
-                                    is_admin,
+                                    is_admin && is_ntfs,  // 仅 NTFS 启用 USN
                                     include_hidden_files,
                                     include_system_files,
                                 ) {
@@ -242,6 +249,11 @@ fn main() {
                                         e
                                     );
                                 }
+                                // 设置文件系统类型
+                                if let Some(monitor) = volume_manager.get_monitor_mut(&volume.drive_letter) {
+                                    monitor.file_system = volume.file_system.clone();
+                                }
+                                log::info!("Volume {} ({})", volume.drive_letter, volume.file_system);
                             }
                         }
                     } else {
@@ -256,11 +268,13 @@ fn main() {
                         }
                     }
 
-                    // If admin, mark all monitors for USN and skip walkdir full scan
+                    // If admin, mark NTFS monitors for USN (non-NTFS uses walkdir)
                     if is_admin {
                         for drive_letter in volume_manager.volumes() {
                             if let Some(monitor) = volume_manager.get_monitor_mut(&drive_letter) {
-                                monitor.use_usn = true;
+                                if monitor.file_system.eq_ignore_ascii_case("NTFS") {
+                                    monitor.use_usn = true;
+                                }
                             }
                         }
                     }
@@ -338,21 +352,36 @@ fn main() {
                     }
                 }
 
-                // 所有 walkdir 卷扫描完成，通知前端刷新状态栏
-                let _ = handle.emit("scan-all-complete", ());
-
                 // === 阶段 3：dispatch USN full scan（短暂持锁）===
+                // 跟踪 USN 扫描完成数量，全部完成后通知前端
+                // 只统计 NTFS 卷（非 NTFS 卷不走 USN）
+                let pending_usn_scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 if let Some(ref usn) = usn_manager {
                     let volumes = {
                         let vm = vm.lock().await;
                         vm.volumes()
                     };
-                    // 标记所有卷为扫描中，供前端 get_index_status 查询
+                    // 只对 NTFS 卷 dispatch USN 扫描，非 NTFS 卷走 walkdir
+                    let mut ntfs_vols = Vec::new();
+                    for drive_letter in &volumes {
+                        let is_ntfs = {
+                            let vm = vm.lock().await;
+                            vm.get_monitor(drive_letter)
+                                .map(|m| m.file_system.eq_ignore_ascii_case("NTFS"))
+                                .unwrap_or(false)
+                        };
+                        if is_ntfs {
+                            ntfs_vols.push(drive_letter.clone());
+                        } else {
+                            log::info!("Volume {} is not NTFS, skipping USN scan", drive_letter);
+                        }
+                    }
+                    // 标记 NTFS 卷为扫描中（非 NTFS 卷已在 walkdir 阶段扫描完成）
                     {
                         let mut scan_vols = sv.lock().await;
-                        *scan_vols = volumes.clone();
+                        *scan_vols = ntfs_vols.clone();
                     }
-                    for drive_letter in &volumes {
+                    for drive_letter in &ntfs_vols {
                         let dl_char = drive_letter.chars().next().unwrap_or('C');
                         log::debug!(
                             "[USN] Issuing full scan for drive {} (hidden={}, system={})",
@@ -366,6 +395,14 @@ fn main() {
                         );
                         usn.full_scan(dl_char, include_hidden_files, include_system_files);
                     }
+                    pending_usn_scans.store(ntfs_vols.len(), std::sync::atomic::Ordering::SeqCst);
+                    // 如果没有 NTFS 卷，直接通知前端
+                    if ntfs_vols.is_empty() {
+                        let _ = handle.emit("scan-all-complete", ());
+                    }
+                } else {
+                    // 非管理员模式：无 USN 扫描，walkdir 扫描已完成，直接通知前端
+                    let _ = handle.emit("scan-all-complete", ());
                 }
 
                 // 创建全量扫描完成信号：walkdir 扫描完成后立即发送，
@@ -382,6 +419,7 @@ fn main() {
                     let sv_for_handler = sv.clone();
                     let rt_handle = tokio::runtime::Handle::current();
                     let scan_done_tx = full_scan_done_tx;
+                    let pending_usn_scans = pending_usn_scans.clone();
 
                     std::thread::Builder::new()
                         .name("usn-response-handler".into())
@@ -427,6 +465,12 @@ fn main() {
                                         );
                                         // Signal polling task that full scan data is available
                                         let _ = scan_done_tx.send(true);
+                                        // 所有 USN 卷扫描完成后通知前端
+                                        let remaining = pending_usn_scans.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                        if remaining == 1 {
+                                            log::info!("[USN] All volumes scanned, emitting scan-all-complete");
+                                            let _ = handle_for_handler.emit("scan-all-complete", ());
+                                        }
                                     }
                                     Ok(UsnResponse::IncrementalResult {
                                         drive_letter,

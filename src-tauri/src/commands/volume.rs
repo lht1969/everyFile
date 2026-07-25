@@ -1,4 +1,4 @@
-use crate::fs::{get_ntfs_volumes, VolumeInfo};
+use crate::fs::{get_all_volumes, VolumeInfo};
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tauri::State;
@@ -39,7 +39,7 @@ pub struct IndexStatusResponse {
 
 #[tauri::command]
 pub async fn get_volumes() -> Result<Vec<VolumeResponse>, String> {
-    let volumes = get_ntfs_volumes().map_err(|e| e.to_string())?;
+    let volumes = get_all_volumes().map_err(|e| e.to_string())?;
     let mut result: Vec<VolumeResponse> = volumes.into_iter().map(VolumeResponse::from).collect();
     result.sort_by(|a, b| a.drive_letter.cmp(&b.drive_letter));
     Ok(result)
@@ -64,17 +64,29 @@ pub async fn add_volume(
         .map(|c| c.index_settings.include_system_files)
         .unwrap_or(false);
 
+    // 查询卷的文件系统类型
+    let file_system = crate::fs::get_volume_info(&volume)
+        .ok()
+        .map(|info| info.file_system)
+        .unwrap_or_default();
+    let is_ntfs = file_system.eq_ignore_ascii_case("NTFS");
+
     let mut vm = state.volume_manager.lock().await;
     vm.add_volume(
         &volume,
-        is_admin,
+        is_admin && is_ntfs,  // 仅 NTFS 卷在管理员模式下启用 USN
         include_hidden_files,
         include_system_files,
     )
     .map_err(|e| e.to_string())?;
 
-    if is_admin {
-        // 管理员模式：标记 USN 并通过 USN worker 全量扫描（与启动流程一致）
+    // 设置文件系统类型
+    if let Some(monitor) = vm.get_monitor_mut(&volume) {
+        monitor.file_system = file_system.clone();
+    }
+
+    if is_admin && is_ntfs {
+        // 管理员模式 + NTFS：标记 USN 并通过 USN worker 全量扫描
         if let Some(monitor) = vm.get_monitor_mut(&volume) {
             monitor.use_usn = true;
         }
@@ -93,7 +105,8 @@ pub async fn add_volume(
             }
         }
     } else {
-        // 非管理员模式：使用 walkdir 扫描
+        // 非管理员模式或非 NTFS：使用 walkdir 扫描
+        log::info!("Volume {} ({}) using walkdir scan", volume, file_system);
         if let Some(mut monitor) = vm.take_monitor(&volume) {
             if let Err(e) = monitor.scan() {
                 log::warn!("Failed to scan new volume {}: {:?}", volume, e);
@@ -140,7 +153,7 @@ pub async fn refresh_volumes(
 ) -> Result<Vec<VolumeResponse>, String> {
     let mut vm = state.volume_manager.lock().await;
 
-    let volumes = get_ntfs_volumes().map_err(|e| e.to_string())?;
+    let volumes = get_all_volumes().map_err(|e| e.to_string())?;
 
     // 加载配置，获取索引设置
     let config = crate::config::Config::load().ok();
@@ -304,10 +317,13 @@ pub async fn get_monitored_volumes(
 
     for vol in volumes {
         let count = vm.get_file_count(&vol);
+        let file_system = vm.get_monitor(&vol)
+            .map(|m| m.file_system.clone())
+            .unwrap_or_default();
         result.push(VolumeResponse {
             drive_letter: vol.clone(),
             volume_name: vol.clone(),
-            file_system: "NTFS".to_string(),
+            file_system,
             total_size: 0,
             free_space: 0,
             file_count: count,

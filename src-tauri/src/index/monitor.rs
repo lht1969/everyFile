@@ -1230,6 +1230,8 @@ pub struct VolumeMonitor {
     /// 每项从 16 字节降至 8 字节，节省 50% 内存
     pub fid_index: Option<Vec<(u32, u32)>>,
     pub use_usn: bool,
+    /// 文件系统类型（NTFS、FAT32、exFAT、ReFS 等）
+    pub file_system: String,
 }
 
 impl Default for VolumeManager {
@@ -1293,6 +1295,10 @@ impl VolumeManager {
 
     pub fn invalidate_search_cache(&mut self) {
         self.search_cache = None;
+    }
+
+    pub fn get_monitor(&self, drive_letter: &str) -> Option<&VolumeMonitor> {
+        self.volumes.get(drive_letter)
     }
 
     pub fn get_monitor_mut(&mut self, drive_letter: &str) -> Option<&mut VolumeMonitor> {
@@ -2056,6 +2062,7 @@ impl VolumeMonitor {
             include_system_files,
             fid_index: None,
             use_usn: false,
+            file_system: String::new(),
         }
     }
 
