@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 
 interface SearchPanelProps {
   onSearch: (query: string, filesOnly?: boolean, directoriesOnly?: boolean) => void;

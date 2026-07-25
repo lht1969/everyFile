@@ -416,19 +416,10 @@ function App() {
       ++sortCounterRef.current;
       setTotalCount(response.total);
       if (response.total > 0) {
-        // Fetch a larger initial range to cover scroll area
-        try {
-          const range = await invoke<RecordsRangeResponse>('get_records_range', { start: 0, end: 500, sortBy: sortState.field, sortDirection: sortState.direction });
-          if (myId === searchCounterRef.current) {
-            rangeCacheRef.current.set('0-500', range.results);
-            setResultsOffset(0);
-            setResults(range.results);
-          }
-        } catch {
-          if (myId === searchCounterRef.current) {
-            setResultsOffset(0);
-            setResults(response.results);
-          }
+        if (myId === searchCounterRef.current) {
+          rangeCacheRef.current.set('0-50', response.results);
+          setResultsOffset(0);
+          setResults(response.results);
         }
       } else {
         setResultsOffset(0);

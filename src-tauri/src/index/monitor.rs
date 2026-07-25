@@ -499,6 +499,9 @@ impl SearchCache {
         start: usize,
         end: usize,
         sorted_indices: &mut SortedIndicesCache,
+        is_empty_query: bool,
+        empty_query_sorted: &mut [Option<(u64, std::sync::Arc<Vec<u32>>)>; 4],
+        empty_query_generation: u64,
     ) -> (Vec<SearchResult>, usize) {
         let t0 = Instant::now();
         log::debug!(
@@ -679,7 +682,24 @@ impl SearchCache {
         // 缓存基于当前 base.matched 版本，base 变化后 matched_generation
         // 不再匹配，sorted_indices_map 会在下次请求时重新计算。
         let base_gen = self.base.matched_generation;
-        let cached_sorted = sorted_indices.get(sort_by, base_gen);
+
+        // 空查询优化：empty_query_sorted 仅在文件变化时失效，查询变化时保留，
+        // 避免清空搜索框时对 2.21M 条索引重新排序。
+        let slot = sort_by_slot(sort_by);
+        let cached_sorted = if is_empty_query {
+            // 检查空查询缓存
+            if let Some((gen, ref arc)) = empty_query_sorted[slot] {
+                if gen == empty_query_generation {
+                    Some(arc.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            sorted_indices.get(sort_by, base_gen)
+        };
         log::info!(
             "[SORT] cached={} matched_len={} delta_gen={}",
             cached_sorted.is_some(),
@@ -803,9 +823,14 @@ impl SearchCache {
             };
 
             let sorted_arc = std::sync::Arc::new(sorted);
-            // 缓存排序索引，超过 MAX_CACHED_SORTS 时自动驱逐最久未使用的列。
-            // base 变化后 matched_generation 不匹配，旧缓存会自动失效。
-            sorted_indices.insert(sort_by, base_gen, sorted_arc.clone());
+            // 缓存排序索引
+            if is_empty_query {
+                // 空查询：缓存到 empty_query_sorted（仅文件变化时失效）
+                empty_query_sorted[slot] = Some((empty_query_generation, sorted_arc.clone()));
+            } else {
+                // 非空查询：缓存到 sorted_indices_map（超过 MAX_CACHED_SORTS 时自动驱逐）
+                sorted_indices.insert(sort_by, base_gen, sorted_arc.clone());
+            }
             sorted_arc
         };
 
@@ -1182,6 +1207,11 @@ pub struct VolumeManager {
     /// 单调递增的缓存代次，每次新建 SearchCache 时递增，
     /// 使旧 sorted_indices 因 generation 不匹配而自动失效。
     cache_generation: u64,
+    /// 空查询排序索引缓存：仅在文件变化时失效，查询变化时保留。
+    /// 避免清空搜索框时对 2.21M 条索引重新排序（~300ms）。
+    empty_query_sorted: [Option<(u64, std::sync::Arc<Vec<u32>>)>; 4],
+    /// 空查询排序索引的代次（仅文件变化时递增）
+    empty_query_generation: u64,
 }
 
 pub struct VolumeMonitor {
@@ -1219,6 +1249,8 @@ impl VolumeManager {
             last_search_options: None,
             sorted_indices_map: SortedIndicesCache::new(),
             cache_generation: 0,
+            empty_query_sorted: [None, None, None, None],
+            empty_query_generation: 0,
         }
     }
 
@@ -1307,6 +1339,7 @@ impl VolumeManager {
         options.files_only.hash(&mut hasher);
         options.directories_only.hash(&mut hasher);
         let new_cache_key = hasher.finish();
+        let is_empty_query = query.trim().is_empty();
 
         // Check cache reuse
         if let Some(old) = self.search_cache.as_mut() {
@@ -1321,6 +1354,9 @@ impl VolumeManager {
                     0,
                     50,
                     &mut self.sorted_indices_map,
+                    is_empty_query,
+                    &mut self.empty_query_sorted,
+                    self.empty_query_generation,
                 );
                 log::info!("search_with_options total: {:?}", t0.elapsed());
                 return (first_batch, total);
@@ -1334,7 +1370,6 @@ impl VolumeManager {
         self.search_cache = None;
         let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
         let matched_lock = std::sync::Mutex::new(Vec::with_capacity(total_files / 4));
-        let is_empty_query = query.trim().is_empty();
         let parsed_query = if is_empty_query {
             None
         } else {
@@ -1445,6 +1480,9 @@ impl VolumeManager {
             0,
             50,
             &mut self.sorted_indices_map,
+            is_empty_query,
+            &mut self.empty_query_sorted,
+            self.empty_query_generation,
         );
         log::info!("search_with_options total: {:?}", t0.elapsed());
         (first_batch, total)
@@ -1499,6 +1537,7 @@ impl VolumeManager {
             return None;
         }
         cache.refresh();
+        let is_empty_query = cache.query.trim().is_empty();
         let sorted = &mut self.sorted_indices_map;
         let (results, total) = cache.get_sorted_slice(
             &self.volumes,
@@ -1508,6 +1547,9 @@ impl VolumeManager {
             start,
             end,
             sorted,
+            is_empty_query,
+            &mut self.empty_query_sorted,
+            self.empty_query_generation,
         );
         Some((results, total))
     }
@@ -1545,6 +1587,8 @@ impl VolumeManager {
         }
         self.search_cache = None;
         self.sorted_indices_map.clear();
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
     }
 
     /// 应用增量 USN 变更到卷
@@ -1816,6 +1860,8 @@ impl VolumeManager {
             self.search_cache.as_mut().unwrap().merge_delta_to_base(&mut self.volumes, &self.vol_names);
             // merge 后 base.matched 已重建，排序索引全部失效
             self.sorted_indices_map.clear();
+            self.empty_query_generation += 1;
+            self.empty_query_sorted = [None, None, None, None];
         }
     }
 
@@ -1907,6 +1953,8 @@ impl VolumeManager {
         );
         // base.matched 已被 remap，排序索引全部失效
         self.sorted_indices_map.clear();
+        self.empty_query_generation += 1;
+        self.empty_query_sorted = [None, None, None, None];
         ret
     }
 }
