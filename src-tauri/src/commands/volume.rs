@@ -4,6 +4,20 @@ use tauri::Emitter;
 use tauri::State;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeStatus {
+    pub drive_letter: String,
+    pub state: VolumeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum VolumeState {
+    Loading,
+    Ready { file_count: usize },
+    Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeResponse {
     pub drive_letter: String,
     pub volume_name: String,
@@ -35,6 +49,7 @@ pub struct IndexStatusResponse {
     pub volumes: Vec<String>,
     pub last_update: String,
     pub scanning_volumes: Vec<String>,
+    pub volume_statuses: Vec<VolumeStatus>,
 }
 
 #[tauri::command]
@@ -296,6 +311,18 @@ pub async fn get_index_status(
         "就绪".to_string()
     };
 
+    let volume_statuses: Vec<VolumeStatus> = volumes.iter().map(|v| {
+        let state = if scanning_volumes.contains(v) {
+            VolumeState::Loading
+        } else {
+            VolumeState::Ready { file_count: vm.get_file_count(v) }
+        };
+        VolumeStatus {
+            drive_letter: v.clone(),
+            state,
+        }
+    }).collect();
+
     Ok(IndexStatusResponse {
         status: if scanning_volumes.is_empty() { "ready".to_string() } else { "scanning".to_string() },
         file_count,
@@ -304,6 +331,7 @@ pub async fn get_index_status(
         volumes,
         last_update,
         scanning_volumes,
+        volume_statuses,
     })
 }
 
