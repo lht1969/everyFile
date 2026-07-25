@@ -314,6 +314,8 @@ pub async fn get_index_status(
     let volume_statuses: Vec<VolumeStatus> = volumes.iter().map(|v| {
         let state = if scanning_volumes.contains(v) {
             VolumeState::Loading
+        } else if let Some(msg) = vm.scan_errors.get(v) {
+            VolumeState::Error { message: msg.clone() }
         } else {
             VolumeState::Ready { file_count: vm.get_file_count(v) }
         };

@@ -1212,6 +1212,8 @@ pub struct VolumeManager {
     empty_query_sorted: [Option<(u64, std::sync::Arc<Vec<u32>>)>; 4],
     /// 空查询排序索引的代次（仅文件变化时递增）
     empty_query_generation: u64,
+    /// 扫描失败的卷及错误信息
+    pub scan_errors: HashMap<String, String>,
 }
 
 pub struct VolumeMonitor {
@@ -1253,7 +1255,18 @@ impl VolumeManager {
             cache_generation: 0,
             empty_query_sorted: [None, None, None, None],
             empty_query_generation: 0,
+            scan_errors: HashMap::new(),
         }
+    }
+
+    /// 记录扫描错误
+    pub fn set_scan_error(&mut self, drive_letter: &str, error: String) {
+        self.scan_errors.insert(drive_letter.to_string(), error);
+    }
+
+    /// 清除扫描错误（扫描开始时调用）
+    pub fn clear_scan_error(&mut self, drive_letter: &str) {
+        self.scan_errors.remove(drive_letter);
     }
 
     pub fn add_volume(
