@@ -15,7 +15,7 @@ function App() {
   const [resultsOffset, setResultsOffset] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
-  const [indexStatus, setIndexStatus] = useState<IndexStatus>({ status: 'ready', file_count: 0, progress: 1, message: '', volumes: [], last_update: '', scanning_volumes: [] });
+  const [indexStatus, setIndexStatus] = useState<IndexStatus>({ status: 'ready', file_count: 0, progress: 1, message: '', volumes: [], last_update: '', scanning_volumes: [], volume_statuses: [] });
   const [showSettings, setShowSettings] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [searchState, setSearchState] = useState({ query: '', filesOnly: true, directoriesOnly: false });

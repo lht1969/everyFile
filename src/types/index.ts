@@ -19,6 +19,16 @@ export interface RecordsRangeResponse {
   end: number;
 }
 
+export interface VolumeStatus {
+  drive_letter: string;
+  state: VolumeState;
+}
+
+export type VolumeState = 
+  | { type: 'Loading' }
+  | { type: 'Ready'; file_count: number }
+  | { type: 'Error'; message: string };
+
 export interface IndexStatus {
   status: string;
   file_count: number;
@@ -27,6 +37,7 @@ export interface IndexStatus {
   volumes: string[];
   last_update: string;
   scanning_volumes: string[];
+  volume_statuses: VolumeStatus[];
 }
 
 export interface AppConfig {
