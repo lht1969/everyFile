@@ -62,6 +62,7 @@ pub async fn get_volumes() -> Result<Vec<VolumeResponse>, String> {
 
 #[tauri::command]
 pub async fn add_volume(
+    app_handle: tauri::AppHandle,
     state: State<'_, super::search::AppState>,
     volume: String,
 ) -> Result<(), String> {
@@ -86,47 +87,26 @@ pub async fn add_volume(
         .unwrap_or_default();
     let is_ntfs = file_system.eq_ignore_ascii_case("NTFS");
 
-    let mut vm = state.volume_manager.lock().await;
-    vm.add_volume(
-        &volume,
-        is_admin && is_ntfs,  // 仅 NTFS 卷在管理员模式下启用 USN
-        include_hidden_files,
-        include_system_files,
-    )
-    .map_err(|e| e.to_string())?;
+    // === 立即操作：注册卷 + 保存配置 ===
+    {
+        let mut vm = state.volume_manager.lock().await;
+        vm.add_volume(
+            &volume,
+            is_admin && is_ntfs,  // 仅 NTFS 卷在管理员模式下启用 USN
+            include_hidden_files,
+            include_system_files,
+        )
+        .map_err(|e| e.to_string())?;
 
-    // 设置文件系统类型
-    if let Some(monitor) = vm.get_monitor_mut(&volume) {
-        monitor.file_system = file_system.clone();
-    }
-
-    if is_admin && is_ntfs {
-        // 管理员模式 + NTFS：标记 USN 并通过 USN worker 全量扫描
+        // 设置文件系统类型
         if let Some(monitor) = vm.get_monitor_mut(&volume) {
-            monitor.use_usn = true;
+            monitor.file_system = file_system.clone();
         }
-        if let Some(ref usn) = state.usn_manager {
-            let dl_char = volume.chars().next().unwrap_or('C');
-            drop(vm);
-            log::info!("[USN] Adding volume: dispatching full scan for {}", dl_char);
-            usn.full_scan(dl_char, include_hidden_files, include_system_files);
-        } else {
-            // fallback: walkdir 扫描
-            if let Some(mut monitor) = vm.take_monitor(&volume) {
-                if let Err(e) = monitor.scan() {
-                    log::warn!("Failed to scan new volume {}: {:?}", volume, e);
-                }
-                vm.return_monitor(&volume, monitor);
+
+        if is_admin && is_ntfs {
+            if let Some(monitor) = vm.get_monitor_mut(&volume) {
+                monitor.use_usn = true;
             }
-        }
-    } else {
-        // 非管理员模式或非 NTFS：使用 walkdir 扫描
-        log::info!("Volume {} ({}) using walkdir scan", volume, file_system);
-        if let Some(mut monitor) = vm.take_monitor(&volume) {
-            if let Err(e) = monitor.scan() {
-                log::warn!("Failed to scan new volume {}: {:?}", volume, e);
-            }
-            vm.return_monitor(&volume, monitor);
         }
     }
 
@@ -138,6 +118,88 @@ pub async fn add_volume(
             }
         }
     }
+
+    // === 后台异步扫描 ===
+    let volume_clone = volume.clone();
+    let vm = state.volume_manager.clone();
+    let scanning_volumes = state.scanning_volumes.clone();
+    let usn_manager = state.usn_manager.clone();
+
+    tokio::spawn(async move {
+        // 标记扫描中
+        {
+            let mut sv = scanning_volumes.lock().await;
+            if !sv.contains(&volume_clone) {
+                sv.push(volume_clone.clone());
+            }
+        }
+
+        // 清除之前的扫描错误
+        {
+            let mut vm = vm.lock().await;
+            vm.clear_scan_error(&volume_clone);
+        }
+
+        // 执行扫描
+        let scan_result = if is_admin && is_ntfs {
+            if let Some(ref usn) = usn_manager {
+                let dl_char = volume_clone.chars().next().unwrap_or('C');
+                log::info!("[USN] Adding volume: dispatching full scan for {}", dl_char);
+                usn.full_scan(dl_char, include_hidden_files, include_system_files);
+                // USN scan is dispatched via channel; treat dispatch as success
+                Ok(0)
+            } else {
+                // fallback: walkdir 扫描
+                log::info!("Volume {} ({}) using walkdir scan (no USN manager)", volume_clone, file_system);
+                let mut vm = vm.lock().await;
+                if let Some(mut monitor) = vm.take_monitor(&volume_clone) {
+                    let result = monitor.scan();
+                    vm.return_monitor(&volume_clone, monitor);
+                    result
+                } else {
+                    Ok(0)
+                }
+            }
+        } else {
+            // 非管理员模式或非 NTFS：使用 walkdir 扫描
+            log::info!("Volume {} ({}) using walkdir scan", volume_clone, file_system);
+            let mut vm = vm.lock().await;
+            if let Some(mut monitor) = vm.take_monitor(&volume_clone) {
+                let result = monitor.scan();
+                vm.return_monitor(&volume_clone, monitor);
+                result
+            } else {
+                Ok(0)
+            }
+        };
+
+        // 记录错误
+        match scan_result {
+            Ok(count) => {
+                log::info!("Scanned new volume {}: {} files", volume_clone, count);
+                let _ = app_handle.emit(
+                    "scan-complete",
+                    serde_json::json!({
+                        "volume": volume_clone,
+                        "count": count
+                    }),
+                );
+            }
+            Err(e) => {
+                log::warn!("Failed to scan new volume {}: {:?}", volume_clone, e);
+                let mut vm = vm.lock().await;
+                vm.set_scan_error(&volume_clone, e.to_string());
+            }
+        }
+
+        // 从扫描中卷列表移除
+        {
+            let mut sv = scanning_volumes.lock().await;
+            sv.retain(|v| v != &volume_clone);
+        }
+
+        let _ = app_handle.emit("index-updated", ());
+    });
 
     Ok(())
 }
