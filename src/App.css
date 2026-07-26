@@ -491,6 +491,19 @@ body {
   text-overflow: ellipsis;
 }
 
+.rename-input {
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid var(--primary-color);
+  border-radius: 2px;
+  outline: none;
+  font: inherit;
+  background: inherit;
+  color: inherit;
+}
+
 .col-name-text strong,
 .col-path strong {
   font-weight: 700;

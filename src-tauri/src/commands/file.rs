@@ -100,6 +100,58 @@ pub async fn copy_file(source: String, destination: String) -> Result<(), String
 }
 
 #[tauri::command]
+pub async fn rename_file(
+    old_path: String,
+    new_name: String,
+    force: Option<bool>,
+    state: State<'_, super::search::AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    log::info!("Renaming {} -> {} (force={})", old_path, new_name, force.unwrap_or(false));
+
+    let parent = Path::new(&old_path)
+        .parent()
+        .ok_or_else(|| format!("Cannot get parent directory of {}", old_path))?;
+    let new_path = parent.join(&new_name).to_string_lossy().to_string();
+
+    let new_path_exists = Path::new(&new_path).exists();
+    if new_path_exists && !force.unwrap_or(false) {
+        return Ok(serde_json::json!({
+            "status": "conflict",
+            "existingPath": new_path,
+        }));
+    }
+
+    let old_clone = old_path.clone();
+    let new_clone = new_path.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::rename(&old_clone, &new_clone).map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let mut vm = state.volume_manager.lock().await;
+    vm.remove_file(&old_path);
+    vm.remove_file(&new_path);
+    drop(vm);
+
+    let _ = app.emit(
+        "records-refresh",
+        serde_json::json!({
+            "added": 0,
+            "updated": 0,
+            "removed": 1,
+        }),
+    );
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "newPath": new_path,
+    }))
+}
+
+#[tauri::command]
 pub async fn move_file(
     source: String,
     destination: String,

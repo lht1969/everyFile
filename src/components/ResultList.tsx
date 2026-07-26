@@ -42,9 +42,13 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [hoveredItem, setHoveredItem] = useState<{ index: number; x: number; y: number; data: SearchResult } | null>(null);
   const [showTooltip, setShowTooltip] = useState(false);
+  const [renamingIndex, setRenamingIndex] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [conflictInfo, setConflictInfo] = useState<{ oldPath: string; newName: string; existingPath: string } | null>(null);
   const resultBodyRef = useRef<HTMLDivElement>(null);
   const hoverTimeoutRef = useRef<number | null>(null);
   const resizingRef = useRef<{ colIndex: number; startX: number; startWidth: number } | null>(null);
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   const { columnWidths, setManualWidth } = useColumnWidths(results, resultBodyRef);
   const gridTemplate = columnWidths.map(w => w + 'px').join(' ');
@@ -80,11 +84,101 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
     onSortChange?.(field, newDirection);
   };
 
-  const handleRowClick = (index: number) => setSelectedIndex(index);
+  const commitRename = async (index: number, force?: boolean) => {
+    const result = results[index - resultsOffset];
+    if (!result || !renameValue.trim() || renameValue === result.name) {
+      setRenamingIndex(null);
+      return;
+    }
+    try {
+      const resp = await invoke<{ status: string; newPath?: string; existingPath?: string }>('rename_file', {
+        oldPath: result.path,
+        newName: renameValue.trim(),
+        force: force ?? false,
+      });
+      if (resp.status === 'ok') {
+        result.name = renameValue.trim();
+        result.path = resp.newPath!;
+        setRenamingIndex(null);
+      } else if (resp.status === 'conflict') {
+        setConflictInfo({ oldPath: result.path, newName: renameValue.trim(), existingPath: resp.existingPath! });
+      }
+    } catch (err) {
+      console.error('[RENAME] rename_file FAILED:', err);
+      setRenamingIndex(null);
+    }
+  };
+
+  const cancelRename = () => { setRenamingIndex(null); setConflictInfo(null); };
+
+  const handleConflictOverwrite = () => {
+    if (conflictInfo && renamingIndex !== null) {
+      setConflictInfo(null);
+      commitRename(renamingIndex, true);
+    }
+  };
+
+  const handleConflictAutoRename = async () => {
+    if (conflictInfo && renamingIndex !== null) {
+      const result = results[renamingIndex - resultsOffset];
+      if (result) {
+        setConflictInfo(null);
+        const ext = result.name.lastIndexOf('.');
+        const base = ext > 0 ? result.name.substring(0, ext) : result.name;
+        const suffix = ext > 0 ? result.name.substring(ext) : '';
+        for (let n = 2; n <= 99; n++) {
+          const candidate = `${base} (${n})${suffix}`;
+          if (candidate === result.name) continue;
+          try {
+            const resp = await invoke<{ status: string; newPath?: string; existingPath?: string }>('rename_file', {
+              oldPath: result.path,
+              newName: candidate,
+              force: false,
+            });
+            if (resp.status === 'ok') {
+              result.name = candidate;
+              result.path = resp.newPath!;
+              setRenamingIndex(null);
+              return;
+            }
+            if (resp.status === 'conflict') continue;
+          } catch { break; }
+        }
+        setRenamingIndex(null);
+      }
+    }
+  };
+
+  const handleRowClick = (index: number, e: React.MouseEvent) => {
+    if (selectedIndex === index && renamingIndex === null) {
+      const target = e.target as HTMLElement;
+      if (target.closest('.col-name')) {
+        const result = results[index - resultsOffset];
+        if (result) {
+          setRenamingIndex(index);
+          setRenameValue(result.name);
+          return;
+        }
+      }
+    }
+    if (renamingIndex !== null && renamingIndex !== index) {
+      commitRename(renamingIndex);
+    }
+    setSelectedIndex(index);
+  };
 
   const handleRowDoubleClick = (path: string, isDirectory: boolean) => {
     isDirectory ? onOpenFolder(path) : onOpenFile(path);
   };
+
+  useEffect(() => {
+    if (renamingIndex !== null && renameInputRef.current) {
+      const input = renameInputRef.current;
+      input.focus();
+      const dotIndex = renameValue.lastIndexOf('.');
+      input.setSelectionRange(0, dotIndex > 0 ? dotIndex : renameValue.length);
+    }
+  }, [renamingIndex]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') {
@@ -117,8 +211,9 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
 
   const getSortIcon = (field: SortField) => sortField !== field ? '' : (sortDirection === 'asc' ? ' ▲' : ' ▼');
 
-  const handleContextMenu = (e: React.MouseEvent, path: string) => {
+  const handleContextMenu = (e: React.MouseEvent, path: string, index: number) => {
     e.preventDefault();
+    setSelectedIndex(index);
     setShowTooltip(false);
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
@@ -236,16 +331,34 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       key={`${globalIndex}-${result.path}`}
                       className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
                       style={{ height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
-                      onClick={() => handleRowClick(globalIndex)}
+                      onClick={(e) => handleRowClick(globalIndex, e)}
                       onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
                       onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
                       onMouseLeave={handleMouseLeave}
                     >
-                      <div className="col-name" onContextMenu={(e) => handleContextMenu(e, result.path)}>
-                        <FileIcon path={result.path} isDirectory={result.is_directory} />
-                        <span className="col-name-text">{highlightMatch(result.name, searchQuery || '')}</span>
+                      <div className="col-name" onContextMenu={(e) => handleContextMenu(e, result.path, globalIndex)}>
+                        {renamingIndex === globalIndex ? (
+                          <input
+                            ref={renameInputRef}
+                            className="rename-input"
+                            value={renameValue}
+                            onChange={e => setRenameValue(e.target.value)}
+                            onBlur={() => commitRename(globalIndex)}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') { e.preventDefault(); commitRename(globalIndex); }
+                              else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                              e.stopPropagation();
+                            }}
+                            onClick={e => e.stopPropagation()}
+                          />
+                        ) : (
+                          <>
+                            <FileIcon path={result.path} isDirectory={result.is_directory} />
+                            <span className="col-name-text">{highlightMatch(result.name, searchQuery || '')}</span>
+                          </>
+                        )}
                       </div>
-                      <div className="col-path" onContextMenu={(e) => handleContextMenu(e, getDirectoryPath(result.path, result.is_directory))}>{highlightMatch(getDirectoryPath(result.path, result.is_directory), searchQuery || '')}</div>
+                      <div className="col-path" onContextMenu={(e) => handleContextMenu(e, getDirectoryPath(result.path, result.is_directory), globalIndex)}>{highlightMatch(getDirectoryPath(result.path, result.is_directory), searchQuery || '')}</div>
                       <div className="col-size">{formatSize(result.size)}</div>
                       <div className="col-modified">{formatTime(result.modified_time)}</div>
                     </div>
@@ -263,6 +376,27 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
           <div className="hover-tooltip-row"><strong>大小:</strong> {formatSize(hoveredItem.data.size)}</div>
           <div className="hover-tooltip-row"><strong>日期:</strong> {formatTime(hoveredItem.data.modified_time)}</div>
           <div className="hover-tooltip-row"><strong>路径:</strong> {hoveredItem.data.path}</div>
+        </div>
+      )}
+
+      {conflictInfo && (
+        <div className="modal-overlay" onClick={cancelRename}>
+          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: 420 }}>
+            <div className="modal-header">
+              <h2>文件名冲突</h2>
+            </div>
+            <div className="modal-body">
+              <p>目标文件已存在：</p>
+              <p style={{ margin: '8px 0', padding: '6px 10px', background: '#f3f4f6', borderRadius: 4, fontSize: 13, wordBreak: 'break-all' }}>
+                {conflictInfo.existingPath}
+              </p>
+            </div>
+            <div className="modal-footer" style={{ gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={cancelRename}>取消</button>
+              <button className="btn btn-secondary" onClick={handleConflictAutoRename}>自动重命名</button>
+              <button className="btn btn-primary" onClick={handleConflictOverwrite}>替换目标文件</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
