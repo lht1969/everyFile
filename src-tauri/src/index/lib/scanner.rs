@@ -266,9 +266,12 @@ impl MftScanner {
     /// 内存优势：恒定占用（仅 record_buf ~1MB），不随文件数量增长
     /// 对比 scan() 方法在 221万文件下 ~260MB 的 all_records，显著降低峰值内存
     ///
+    /// 大小解析策略（两层）：
+    /// 1. 优先从 $FILE_NAME.Real Size 读取（常驻属性，零额外 I/O）
+    /// 2. 若 Real Size=0 且有 $ATTRIBUTE_LIST，收集扩展记录号，扫描结束后批量解析
+    ///
     /// 返回值：(ScanStats, pending_sizes)
     /// - pending_sizes: HashMap<record_number, real_size>
-    ///   对于主记录 size=0 且有 $ATTRIBUTE_LIST 的文件，通过读取扩展 MFT 记录获取真实 size
     ///   调用方需用此 map 更新 FileEntry 中 size=0 的条目
     ///
     /// callback 内可进行路径解析、FileEntry 构建等操作
@@ -290,6 +293,10 @@ impl MftScanner {
         let mut skip_fixup_fail: u64 = 0;
         let mut skip_inactive: u64 = 0;
         let mut no_timestamp: u64 = 0;
+
+        // 收集 $FILE_NAME.Real Size=0 且有 $ATTRIBUTE_LIST 的文件，
+        // 记录其扩展记录号，扫描结束后批量读取获取真实 size
+        let mut pending_ext: Vec<(u64, Vec<u64>)> = Vec::new();
 
         for run in &self.data_runs {
             if total_records >= max_records {
@@ -365,9 +372,21 @@ impl MftScanner {
                 }
                 let parent_record =
                     extract_parent_record(&record_buf, self.file_record_size as usize);
-                // 从 $FILE_NAME 读取真实大小（常驻属性，始终可用）
-                // 避免 $DATA 在扩展记录时 size=0 的问题，消除二次批量解析
+                // 从 $FILE_NAME 读取真实大小（常驻属性，始终在主记录中）
                 let size = extract_filename_real_size(&record_buf, self.file_record_size as usize);
+
+                // $FILE_NAME.Real Size=0 的兜底：记录扩展记录号，扫描结束后批量解析
+                // 常见于大文件/稀疏文件的 $DATA 属性存储在 $ATTRIBUTE_LIST 扩展记录中
+                if size == 0 && !is_dir {
+                    let ext_records = extract_data_extension_records(
+                        &record_buf,
+                        self.file_record_size as usize,
+                    );
+                    if !ext_records.is_empty() {
+                        pending_ext.push((total_records, ext_records));
+                    }
+                }
+
                 let mtime = extract_mtime(&record_buf, self.file_record_size as usize);
                 let ctime = extract_ctime(&record_buf, self.file_record_size as usize);
                 let atime = extract_atime(&record_buf, self.file_record_size as usize);
@@ -399,8 +418,22 @@ impl MftScanner {
             }
         }
 
-        // 已从 $FILE_NAME 读取所有文件大小，无需二次批量解析
-        let pending_sizes = std::collections::HashMap::new();
+        // 批量解析扩展记录中的 $DATA size（按磁盘偏移排序，顺序 I/O）
+        let pending_sizes = if pending_ext.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            log::info!(
+                "scan_streaming: {} files with size=0 have $ATTRIBUTE_LIST, resolving from extension records",
+                pending_ext.len()
+            );
+            resolve_pending_sizes_streaming(
+                reader,
+                &self.data_runs,
+                self.file_record_size,
+                self.cluster_size,
+                &pending_ext,
+            )
+        };
 
         (
             ScanStats {

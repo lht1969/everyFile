@@ -52,7 +52,11 @@ pub enum UsnResponse {
         last_usn: i64,
     },
     /// Error (drive_letter identifies which volume failed)
-    Error { drive_letter: char, message: String },
+    Error {
+        #[allow(dead_code)]
+        drive_letter: char,
+        message: String,
+    },
 }
 
 /// Persisted USN journal state per volume

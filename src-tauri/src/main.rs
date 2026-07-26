@@ -77,10 +77,10 @@ fn ensure_single_instance() -> bool {
 }
 
 fn main() {
-    // 单例检查：确保只有一个实例在运行（调试时临时禁用）
-    // if !ensure_single_instance() {
-    //     std::process::exit(0);
-    // }
+    // 单例检查：确保只有一个实例在运行
+    if !ensure_single_instance() {
+        std::process::exit(0);
+    }
 
     // 初始化文件日志（先于 env_logger，确保所有启动信息都能记录到文件）
     // 日志文件位置: %APPDATA%\Everything\logs\everything-YYYY-MM-DD.log
@@ -550,22 +550,8 @@ fn main() {
                                             }),
                                         );
                                     }
-                                    Ok(UsnResponse::Error { drive_letter, message }) => {
-                                        log::error!("[USN] Worker error for drive {}: {}", drive_letter, message);
-                                        let drive_string = format!("{}:", drive_letter);
-                                        {
-                                            let mut scan_vols = rt_handle.block_on(sv_for_handler.lock());
-                                            scan_vols.retain(|v| v != &drive_string);
-                                        }
-                                        // Decrement only during initial scan phase (counter > 0) to avoid underflow
-                                        let remaining = pending_usn_scans.load(std::sync::atomic::Ordering::SeqCst);
-                                        if remaining > 0 {
-                                            let new_remaining = pending_usn_scans.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                                            if new_remaining == 1 {
-                                                log::info!("[USN] All USN scans completed (some with errors), emitting scan-all-complete");
-                                                let _ = handle_for_handler.emit("scan-all-complete", ());
-                                            }
-                                        }
+                                    Ok(UsnResponse::Error { drive_letter: _, message }) => {
+                                        log::error!("[USN] Worker error: {}", message);
                                     }
                                     Err(_) => {
                                         log::info!(
@@ -586,23 +572,27 @@ fn main() {
                 if let Some(ref usn) = usn_manager {
                     let usn_clone = usn.clone();
                     let vm_clone_for_usn = vm.clone();
-                    let pending_usn_scans_for_poll = pending_usn_scans.clone();
+                    let is_searching_for_usn = is_searching.clone();
 
                     tauri::async_runtime::spawn(async move {
-                        // 等待所有 USN 全量扫描完成（成功或失败）再开始轮询。
-                        // 使用原子计数器而非 per-volume file_count，
-                        // 确保扫描失败的卷不会阻止轮询启动。
-                        log::debug!("[USN] Polling task waiting for all USN scans to complete...");
+                        // 等待所有卷的全量扫描完成（每个卷都有文件数据）再开始轮询
+                        // 不依赖 watch channel 信号，因为 USN full scan 是异步的，
+                        // 可能 C 盘完成后 D/E 盘还在扫描中
+                        log::debug!("[USN] Polling task waiting for all volumes to have data...");
                         loop {
-                            let remaining = pending_usn_scans_for_poll.load(std::sync::atomic::Ordering::SeqCst);
-                            if remaining == 0 {
+                            let all_ready = {
+                                let vm = vm_clone_for_usn.lock().await;
+                                let volumes = vm.volumes();
+                                volumes.iter().all(|v| vm.get_file_count(v) > 0)
+                            };
+                            if all_ready {
                                 break;
                             }
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
                         // 额外等 3 秒让前端完成初始加载
                         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                        log::info!("[USN] Polling task started");
+                        log::debug!("[USN] Polling task started");
 
                         // Read config once at startup; reload only when file changes
                         let mut config = crate::config::Config::load().ok();
@@ -644,12 +634,18 @@ fn main() {
                                 continue;
                             }
 
+                            // 搜索进行中时跳过轮询，避免与搜索竞争锁
+                            if is_searching_for_usn.load(Ordering::SeqCst) {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
+
                             let volumes_list = {
                                 let vm = vm_clone_for_usn.lock().await;
                                 vm.volumes()
                             };
 
-                            log::info!(
+                            log::debug!(
                                 "[USN] Polling {} volumes: {:?}, interval={}s",
                                 volumes_list.len(),
                                 volumes_list,
