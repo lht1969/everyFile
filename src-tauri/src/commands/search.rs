@@ -44,7 +44,8 @@ pub struct AppState {
     pub volume_manager: Arc<Mutex<crate::index::monitor::VolumeManager>>,
     pub is_searching: Arc<AtomicBool>,
     pub last_index_update: Arc<Mutex<String>>,
-    pub usn_manager: Option<Arc<UsnIndexManager>>,
+    /// 使用 Mutex 包装，允许在 setup 完成后再写入真实实例
+    pub usn_manager: Arc<Mutex<Option<Arc<UsnIndexManager>>>>,
     pub scanning_volumes: Arc<Mutex<Vec<String>>>,
 }
 
@@ -87,7 +88,8 @@ pub async fn search_files(
     state.is_searching.store(false, Ordering::SeqCst);
 
     // 搜索完成后主动触发 USN 轮询，确保搜索期间发生的文件变更能被立即检测
-    if let Some(ref usn) = state.usn_manager {
+    let usn_guard = state.usn_manager.lock().await;
+    if let Some(ref usn) = *usn_guard {
         let config = crate::config::Config::load().ok();
         let include_hidden = config
             .as_ref()

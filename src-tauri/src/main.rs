@@ -145,7 +145,8 @@ fn main() {
             volume_manager: volume_manager.clone(),
             is_searching: is_searching.clone(),
             last_index_update: last_index_update.clone(),
-            usn_manager: None, // 创建在 async 块中，此处仅占位
+            // 先用空占位，setup 阶段会把真实 UsnIndexManager 写入其中
+            usn_manager: Arc::new(Mutex::new(None)),
             scanning_volumes: scanning_volumes.clone(),
         })
         // 设置窗口事件处理
@@ -173,6 +174,8 @@ fn main() {
             let sv = scanning_volumes.clone();
             let handle = app.handle().clone();
             let handle_for_tray = app.handle().clone();
+            // 获取 AppState 中的 usn_manager 占位，setup 阶段完成后写入真实实例
+            let usn_manager_state = app.state::<AppState>().usn_manager.clone();
 
             // 如果不是静默模式，显示窗口
             if !silent_mode {
@@ -408,6 +411,10 @@ fn main() {
                     let _ = handle.emit("scan-all-complete", ());
                     None
                 };
+
+                // 将创建好的 UsnIndexManager（或 None）保存到 AppState，
+                // 使设置界面添加卷、搜索后触发轮询等命令能正确使用 USN。
+                *usn_manager_state.lock().await = usn_manager.clone();
 
                 // 创建全量扫描完成信号：walkdir 扫描完成后立即发送，
                 // USN full scan 结果到达时也会发送（双保险）

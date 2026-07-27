@@ -142,7 +142,8 @@ pub async fn add_volume(
 
         // 执行扫描
         let scan_result = if is_admin && is_ntfs {
-            if let Some(ref usn) = usn_manager {
+            let usn_guard = usn_manager.lock().await;
+            if let Some(ref usn) = *usn_guard {
                 let dl_char = volume_clone.chars().next().unwrap_or('C');
                 log::info!("[USN] Adding volume: dispatching full scan for {}", dl_char);
                 usn.full_scan(dl_char, include_hidden_files, include_system_files);
