@@ -764,6 +764,44 @@ fn handle_full_scan(
         }
     }
 
+    // Phase 4: 对 Phase 3 后仍然 size=0 的非目录文件，批量调用 GetFileAttributesExW 获取真实大小
+    // 场景：$ATTRIBUTE_LIST 扩展记录解析失败、MFT 记录损坏、或稀疏文件无 $ATTRIBUTE_LIST
+    {
+        let t3 = Instant::now();
+        let zero_entries: Vec<(CompactString, bool)> = files
+            .iter()
+            .filter(|f| f.size == 0 && !f.is_directory)
+            .map(|f| {
+                let path = path_table.resolve_file_path(f.path_id, &f.name);
+                (CompactString::from(path), false)
+            })
+            .collect();
+        if !zero_entries.is_empty() {
+            let real_sizes = ntfs_mft::batch_metadata(&zero_entries);
+            let mut updated = 0usize;
+            let mut still_zero = 0usize;
+            let mut zidx = 0;
+            for f in files.iter_mut() {
+                if f.size == 0 && !f.is_directory {
+                    if zidx < real_sizes.len() {
+                        let (real_size, _) = real_sizes[zidx];
+                        if real_size > 0 {
+                            f.size = real_size;
+                            updated += 1;
+                        } else {
+                            still_zero += 1;
+                        }
+                    }
+                    zidx += 1;
+                }
+            }
+            log::info!(
+                "[USN] Phase 4: batch GetFileAttributesExW for {} zero-size files: {} updated, {} still zero ({:?})",
+                zero_entries.len(), updated, still_zero, t3.elapsed()
+            );
+        }
+    }
+
     // 释放 dir_map 和 deferred（不再需要）
     drop(dir_map);
     drop(deferred);

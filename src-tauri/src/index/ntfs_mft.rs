@@ -16,10 +16,11 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use windows::core::HSTRING;
 use windows::Win32::{
-    Foundation::{FILETIME, HANDLE},
+    Foundation::{CloseHandle, FILETIME, HANDLE},
     Storage::FileSystem::{
-        CreateFileW, GetFileAttributesExW, GetFileExInfoStandard, FILE_GENERIC_READ,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WIN32_FILE_ATTRIBUTE_DATA,
+        CreateFileW, GetFileAttributesExW, GetFileExInfoStandard, GetFileTime, GetFileSizeEx,
+        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING, WIN32_FILE_ATTRIBUTE_DATA,
     },
     System::Ioctl::{FSCTL_ENUM_USN_DATA, MFT_ENUM_DATA_V0},
     System::IO::DeviceIoControl,
@@ -152,9 +153,12 @@ pub fn batch_metadata(entries: &[(compact_str::CompactString, bool)]) -> Vec<(u6
 /// `GetFileAttributesExW` 在 NTFS 文件系统上是查询单文件元数据最快的 API，
 /// 比 `std::fs::metadata` 少一次 open 句柄的系统调用。
 ///
+/// 若 `GetFileAttributesExW` 失败，回退到 `CreateFileW` + `GetFileSizeEx`，
+/// 以处理文件被独占锁定、长路径等场景。
+///
 /// 暴露为 `pub` 以便在路径解析阶段就地合并调用，避免二次遍历。
-#[inline]
 pub fn query_one(path_str: &str) -> (u64, i64) {
+    // 快速路径：GetFileAttributesExW（不需要打开句柄）
     let path_h = HSTRING::from(path_str);
     let mut file_info = WIN32_FILE_ATTRIBUTE_DATA::default();
     let ok = unsafe {
@@ -167,11 +171,45 @@ pub fn query_one(path_str: &str) -> (u64, i64) {
     if ok.is_ok() {
         let size = ((file_info.nFileSizeHigh as u64) << 32) | (file_info.nFileSizeLow as u64);
         let modified_time = filetime_to_unix(&file_info.ftLastWriteTime);
-        (size, modified_time)
-    } else {
-        // 文件可能在 MFT 快照后被删除，或权限不足，使用默认值
-        (0, 0)
+        return (size, modified_time);
     }
+
+    // 回退路径：CreateFileW + GetFileSizeEx + GetFileTime
+    // 处理 GetFileAttributesExW 失败的场景（文件被锁定、权限不足、长路径等）
+    let handle = unsafe {
+        CreateFileW(
+            &path_h,
+            0, // 仅查询元数据，不需要读写权限
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    };
+    if let Ok(h) = handle {
+        let mut size: i64 = 0;
+        let size_ok = unsafe { GetFileSizeEx(h, &mut size) };
+
+        let mut ft_write = FILETIME::default();
+        let time_ok = unsafe {
+            GetFileTime(h, None, None, Some(&mut ft_write))
+        };
+
+        unsafe { let _ = CloseHandle(h); };
+
+        if size_ok.is_ok() {
+            let modified_time = if time_ok.is_ok() {
+                filetime_to_unix(&ft_write)
+            } else {
+                0
+            };
+            return (size as u64, modified_time);
+        }
+    }
+
+    log::trace!("[query_one] Failed to get metadata for: {}", path_str);
+    (0, 0)
 }
 
 /// 自定义 MFT 条目（扩展 usn-journal-rs 的 MftEntry，增加 timestamp 字段）
