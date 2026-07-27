@@ -217,14 +217,6 @@ export function useColumnWidths(
     return () => observer.disconnect();
   }, [containerRef, recalc]);
 
-  const freezeColumn = useCallback((index: number) => {
-    frozenColumnsRef.current.add(index);
-  }, []);
-
-  const unfreezeAll = useCallback(() => {
-    frozenColumnsRef.current.clear();
-  }, []);
-
   const setManualWidth = useCallback((index: number, width: number) => {
     const next = [...columnWidthsRef.current];
     next[index] = width;
@@ -235,8 +227,6 @@ export function useColumnWidths(
 
   return {
     columnWidths,
-    freezeColumn,
-    unfreezeAll,
     setManualWidth,
   };
 }

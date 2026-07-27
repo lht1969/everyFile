@@ -6,7 +6,6 @@ use winreg::RegKey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigResponse {
-    pub default_volume: String,
     pub max_cache_items: usize,
     pub max_history_items: usize,
     pub enable_usn_journal: bool,
@@ -30,7 +29,6 @@ fn startup_registry_enabled() -> bool {
 impl From<Config> for ConfigResponse {
     fn from(c: Config) -> Self {
         Self {
-            default_volume: c.default_volume,
             max_cache_items: c.max_cache_items,
             max_history_items: c.max_history_items,
             enable_usn_journal: c.index_settings.enable_usn_journal,
@@ -51,7 +49,6 @@ pub fn get_config() -> Result<ConfigResponse, String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveConfigParams {
-    pub default_volume: String,
     pub max_cache_items: usize,
     pub max_history_items: usize,
     pub enable_usn_journal: bool,
@@ -70,7 +67,6 @@ pub async fn save_config(
     log::info!("Received save_config request");
 
     let mut config = Config::load().map_err(|e| e.to_string())?;
-    config.default_volume = params.default_volume;
     config.max_cache_items = params.max_cache_items;
     config.max_history_items = params.max_history_items;
     config.index_settings = crate::config::IndexSettings {

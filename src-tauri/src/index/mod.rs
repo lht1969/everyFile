@@ -70,13 +70,6 @@ impl UsnIndexManager {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn shutdown(&self) {
-        for cmd_tx in self.workers.values() {
-            let _ = cmd_tx.send(UsnCommand::Shutdown);
-        }
-    }
-
     pub fn resp_rx_clone(&self) -> Receiver<UsnResponse> {
         self.resp_rx.clone()
     }

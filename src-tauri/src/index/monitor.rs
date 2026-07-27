@@ -1518,24 +1518,6 @@ impl VolumeManager {
         (first_batch, total)
     }
 
-    pub fn scan_all_with_progress(&mut self, handle: &tauri::AppHandle) -> Result<usize> {
-        let mut total = 0;
-        for (drive_letter, monitor) in self.volumes.iter_mut() {
-            let count = monitor.scan_with_progress_callback(handle)?;
-            log::info!("Scanned volume {}: {} files", drive_letter, count);
-            total += count;
-            let _ = handle.emit(
-                "scan-complete",
-                serde_json::json!({"volume": drive_letter, "count": count}),
-            );
-        }
-        self.search_cache = None;
-        self.sorted_indices_map.clear();
-        self.empty_query_generation += 1;
-        self.empty_query_sorted = [None, None, None, None];
-        Ok(total)
-    }
-
     pub fn remove_file(&mut self, file_path: &str) {
         for monitor in self.volumes.values_mut() {
             monitor.remove_file(file_path);

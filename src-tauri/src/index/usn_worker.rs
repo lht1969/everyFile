@@ -445,7 +445,7 @@ fn worker_loop(cmd_rx: Receiver<UsnCommand>, resp_tx: Sender<UsnResponse>) {
                     &mut batch_name_buf,
                 );
             }
-            Ok(UsnCommand::Shutdown) | Err(_) => {
+            Err(_) => {
                 // 关闭前立即持久化 last_usn，避免 1 小时间隔内崩溃/退出导致进度回退
                 save_usn_state(&last_usn_map);
                 log::info!("[USN] Worker shutdown, last_usn saved");
@@ -844,7 +844,6 @@ fn handle_full_scan(
         drive_letter,
         files,
         path_table,
-        last_usn,
     });
 }
 
@@ -1218,7 +1217,6 @@ fn handle_full_scan_legacy(
         drive_letter,
         files,
         path_table,
-        last_usn,
     });
 }
 
@@ -1593,6 +1591,5 @@ fn handle_poll_changes(
         added,
         removed,
         updated,
-        last_usn: new_last_usn,
     });
 }

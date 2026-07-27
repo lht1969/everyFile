@@ -921,7 +921,6 @@ fn main() {
             commands::volume::add_volume,
             commands::volume::remove_volume,
             commands::volume::refresh_volumes,
-            commands::volume::rebuild_index,
             commands::volume::get_index_status,
             commands::volume::get_monitored_volumes,
             // 文件操作相关命令

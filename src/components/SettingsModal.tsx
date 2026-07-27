@@ -5,13 +5,11 @@ import { formatSize } from '../utils/format';
 
 interface SettingsModalProps {
   onClose: () => void;
-  onRebuildIndex: () => void;
   indexStatus: IndexStatus;
   onVolumeChange?: () => void;
-  rebuilding: boolean;
 }
 
-function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, rebuilding }: SettingsModalProps) {
+function SettingsModal({ onClose, indexStatus, onVolumeChange }: SettingsModalProps) {
   const [volumes, setVolumes] = useState<VolumeResponse[]>([]);
   const [monitoredVolumes, setMonitoredVolumes] = useState<VolumeResponse[]>([]);
   const [config, setConfig] = useState<ConfigResponse | null>(null);
@@ -79,7 +77,6 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
     try {
       await invoke('save_config', {
         params: {
-          default_volume: configToSave.default_volume,
           max_cache_items: configToSave.max_cache_items,
           max_history_items: configToSave.max_history_items,
           enable_usn_journal: configToSave.enable_usn_journal,
@@ -97,13 +94,11 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
   };
 
   return (
-    <div className={`modal-overlay${rebuilding ? ' rebuilding' : ''}`} onClick={rebuilding ? undefined : onClose}>
+    <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <h2>设置</h2>
-          {!rebuilding && (
-            <button className="close-button" onClick={onClose}>×</button>
-          )}
+          <button className="close-button" onClick={onClose}>×</button>
         </div>
 
         <div className="modal-body">
@@ -204,11 +199,11 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
             <p>索引状态: {indexStatus.message}</p>
             {config && (
               <div className="interval-setting">
-                <label className="interval-label" htmlFor="rebuild-interval">
-                  后台定时重建间隔（分钟）：
+                <label className="interval-label" htmlFor="update-interval">
+                  后台定时更新间隔（秒）：
                 </label>
                 <input
-                  id="rebuild-interval"
+                  id="update-interval"
                   className="interval-input"
                   type="number"
                   min={0}
@@ -222,16 +217,13 @@ function SettingsModal({ onClose, onRebuildIndex, indexStatus, onVolumeChange, r
                 <span className="interval-hint">秒，设为 0 表示不自动更新</span>
               </div>
             )}
-            <button className="rebuild-button" onClick={onRebuildIndex} disabled={rebuilding}>
-              {rebuilding ? '正在重建索引...' : '立即重建索引'}
-            </button>
 
           </section>
         </div>
 
         <div className="modal-footer">
-          <button type="button" className="cancel-button" onClick={onClose} disabled={rebuilding}>取消</button>
-          <button type="button" className="save-button" onClick={handleSaveConfig} disabled={rebuilding}>保存</button>
+          <button type="button" className="cancel-button" onClick={onClose}>取消</button>
+          <button type="button" className="save-button" onClick={handleSaveConfig}>保存</button>
         </div>
       </div>
     </div>

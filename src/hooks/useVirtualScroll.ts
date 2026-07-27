@@ -15,7 +15,6 @@ interface UseVirtualScrollReturn {
   endIndex: number;
   offsetY: number;
   spacerHeight: number;
-  visibleItems: number;
   scrollToIndex: (index: number) => void;
   resetScroll: () => void;
 }
@@ -207,7 +206,6 @@ export function useVirtualScroll({
     endIndex,
     offsetY,
     spacerHeight,
-    visibleItems: endIndex - startIndex,
     scrollToIndex,
     resetScroll,
   };

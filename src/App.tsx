@@ -23,7 +23,6 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [searchTime, setSearchTime] = useState<number | null>(null);
   const [scrollTrigger, setScrollTrigger] = useState(0);
-  const [rebuilding, setRebuilding] = useState(false);
   const initialLoadDone = useRef(false);
 
   useEffect(() => {
@@ -574,20 +573,6 @@ function App() {
     }
   };
 
-  const handleRebuildIndex = async () => {
-    setRebuilding(true);
-    try {
-      await invoke('rebuild_index');
-      await loadIndexStatus();
-      loadAllFiles();
-    } catch (e) {
-      console.error('Failed to rebuild index:', e);
-      message(`重建索引失败: ${e}`, { title: '错误', kind: 'error' });
-    } finally {
-      setRebuilding(false);
-    }
-  };
-
   const handleExport = async (format: 'csv' | 'txt' | 'json') => {
     const beijingTime = new Date(new Date().getTime() + 8 * 60 * 60 * 1000);
     const timestamp = beijingTime.toISOString().replace(/[:.]/g, '-');
@@ -654,10 +639,8 @@ function App() {
       {showSettings && (
         <SettingsModal
           onClose={() => setShowSettings(false)}
-          onRebuildIndex={handleRebuildIndex}
           indexStatus={indexStatus}
           onVolumeChange={() => loadAllFiles()}
-          rebuilding={rebuilding}
         />
       )}
     </div>

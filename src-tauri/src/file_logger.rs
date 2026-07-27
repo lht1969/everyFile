@@ -162,16 +162,6 @@ pub fn init() {
     }
 }
 
-/// 关闭日志文件（程序退出前调用以确保刷新）
-///
-/// 注意：当前未在任何地方调用，作为公共 API 保留以备将来使用。
-#[allow(dead_code)]
-pub fn shutdown() {
-    if let Ok(mut guard) = LOG_FILE.lock() {
-        *guard = None;
-    }
-}
-
 /// 写入一行日志到文件
 ///
 /// 在写入前会自动检查并执行日志滚动。

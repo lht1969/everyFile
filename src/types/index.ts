@@ -40,10 +40,6 @@ export interface IndexStatus {
   volume_statuses: VolumeStatus[];
 }
 
-export interface AppConfig {
-  update_interval: number;
-}
-
 export interface VolumeResponse {
   drive_letter: string;
   volume_name: string;
@@ -54,7 +50,6 @@ export interface VolumeResponse {
 }
 
 export interface ConfigResponse {
-  default_volume: string;
   max_cache_items: number;
   max_history_items: number;
   enable_usn_journal: boolean;

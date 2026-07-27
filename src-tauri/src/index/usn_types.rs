@@ -20,9 +20,6 @@ pub enum UsnCommand {
         include_hidden_files: bool,
         include_system_files: bool,
     },
-    /// Shutdown the worker
-    #[allow(dead_code)]
-    Shutdown,
 }
 
 /// Response from the USN worker thread
@@ -35,8 +32,6 @@ pub enum UsnResponse {
         files: Vec<FileEntry>,
         /// 路径前缀压缩表，用于按需解析完整路径
         path_table: PathTable,
-        #[allow(dead_code)]
-        last_usn: i64,
     },
     /// Incremental changes from USN journal
     IncrementalResult {
@@ -48,12 +43,10 @@ pub enum UsnResponse {
         removed: Vec<(u64, String)>,
         /// (file_id, new SearchResult) for updated files - fid-based to avoid index drift
         updated: Vec<(u64, crate::search::SearchResult)>,
-        #[allow(dead_code)]
-        last_usn: i64,
     },
     /// Error (drive_letter identifies which volume failed)
+    #[allow(dead_code)]
     Error {
-        #[allow(dead_code)]
         drive_letter: char,
         message: String,
     },
