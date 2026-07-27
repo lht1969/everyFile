@@ -22,7 +22,7 @@ fn startup_registry_enabled() -> bool {
         Ok(k) => k,
         Err(_) => return false,
     };
-    let value: Result<String, _> = key.get_value("Everything Tauri");
+    let value: Result<String, _> = key.get_value("everyFile");
     value.is_ok()
 }
 

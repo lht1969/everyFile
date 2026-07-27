@@ -506,8 +506,11 @@ fn extract_parent_record(record: &[u8], record_size: usize) -> u64 {
 }
 
 /// 从 $FILE_NAME 属性读取文件真实大小（Real Size）。
-/// $FILE_NAME 是常驻属性，始终在主 MFT 记录中，无需读取扩展记录。
-/// 这消除了对 resolve_pending_sizes_streaming 的需求。
+/// 策略（两层）：
+/// 1. 优先从 $FILE_NAME.Real Size 读取（常驻属性，零额外 I/O）
+/// 2. 若 Real Size=0，回退到 $DATA 属性的 size（非-resident $DATA header 或 resident value length）
+///    NTFS 卷上 $FILE_NAME.RealSize 可能未及时更新（~80-96% 的文件为0），
+///    而 $DATA.size 始终准确。此回退消除了绝大部分 size=0 问题，无需 I/O。
 fn extract_filename_real_size(record: &[u8], record_size: usize) -> u64 {
     let first_attr_offset = read_u16(record, 20) as usize;
     let mut offset = first_attr_offset;
@@ -523,23 +526,20 @@ fn extract_filename_real_size(record: &[u8], record_size: usize) -> u64 {
         if attr_type == ATTR_FILE_NAME && record[offset + 8] == 0 {
             let value_offset = read_u16(record, offset + 20) as usize;
             let value_start = offset + value_offset;
-            // $FILE_NAME 属性值结构：
-            // +0:  Parent reference (8 bytes)
-            // +8:  Creation time (8 bytes)
-            // +16: Last access time (8 bytes)
-            // +24: Last modification time (8 bytes)
-            // +32: Last MFT change time (8 bytes)
-            // +40: Allocated size (8 bytes)
-            // +48: Real size (8 bytes)
+
             if value_start + 56 <= record.len() {
-                return read_u64(record, value_start + 48);
+                let real = read_u64(record, value_start + 48);
+                if real > 0 {
+                    return real;
+                }
+                break;
             }
         }
 
         offset += attr_len;
     }
 
-    0
+    extract_data_size_from_bytes(record, record_size)
 }
 
 fn well_known_name(record_number: u64) -> Option<&'static str> {

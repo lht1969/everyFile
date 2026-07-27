@@ -105,12 +105,12 @@ impl UsnState {
 
     fn state_path_inner() -> Option<std::path::PathBuf> {
         let appdata = dirs::data_dir().or_else(dirs::home_dir)?;
-        Some(appdata.join("Everything").join("usn_state.json"))
+        Some(appdata.join("everyFile").join("usn_state.json"))
     }
 
     #[cfg(test)]
     fn test_state_path(suffix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("everything_test_usn_{}.json", suffix))
+        std::env::temp_dir().join(format!("everyFile_test_usn_{}.json", suffix))
     }
 
     #[cfg(test)]

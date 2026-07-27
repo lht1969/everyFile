@@ -1,10 +1,10 @@
-# Everything-Tauri 项目文档
+# everyFile 项目文档
 
 ## 一、项目概述
 
 ### 1.1 项目背景
 
-本项目是从 Rust+egui 实现的本地文件搜索引擎 "Everything" 迁移到 Rust+Tauri+React 技术栈的桌面应用程序。
+本项目是从 Rust+egui 实现的本地文件搜索引擎 "everyFile" 迁移到 Rust+Tauri+React 技术栈的桌面应用程序。
 
 ### 1.2 核心功能
 
@@ -36,7 +36,7 @@
 ## 二、项目结构
 
 ```
-everything-tauri/
+everyFile/
 ├── src/                          # React 前端源码
 │   ├── components/               # React 组件
 │   │   ├── SearchPanel.tsx      # 搜索面板
@@ -176,7 +176,7 @@ useEffect(() => {
 
 ## 四、配置文件
 
-**位置**：`%APPDATA%/everything-tauri/config.toml`
+**位置**：`%APPDATA%/everyFile-tauri/config.toml`
 
 ```toml
 scan_all_volumes = true

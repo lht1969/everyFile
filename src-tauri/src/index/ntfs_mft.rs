@@ -117,7 +117,11 @@ fn filetime_to_unix(ft: &FILETIME) -> i64 {
 /// # 返回
 /// - `Vec<(u64, i64)>`: 每个条目对应的 (文件大小, 修改时间戳)
 pub fn batch_metadata(entries: &[(compact_str::CompactString, bool)]) -> Vec<(u64, i64)> {
+    use std::time::Instant;
     const CHUNK_SIZE: usize = 4096;
+
+    let t_start = Instant::now();
+    log::debug!("[batch_metadata] start: {} entries", entries.len());
 
     // 并行分块处理：每块 4096 个文件
     // 在 32 核机器上约 540 个块，恰好填满 rayon 默认线程池
@@ -137,6 +141,8 @@ pub fn batch_metadata(entries: &[(compact_str::CompactString, bool)]) -> Vec<(u6
         })
         .collect();
 
+    let t_par = t_start.elapsed();
+
     // 按原始索引构建有序结果数组
     let mut meta_by_index = vec![(0u64, 0i64); entries.len()];
     for (idx, size, modified_time) in results {
@@ -144,6 +150,17 @@ pub fn batch_metadata(entries: &[(compact_str::CompactString, bool)]) -> Vec<(u6
             meta_by_index[idx] = (size, modified_time);
         }
     }
+
+    let total = t_start.elapsed();
+    let avg = if !entries.is_empty() {
+        total / entries.len() as u32
+    } else {
+        std::time::Duration::ZERO
+    };
+    log::info!(
+        "[batch_metadata] done: {} entries, parallel_query={:?}, total={:?}, avg={:.2?}/file",
+        entries.len(), t_par, total, avg
+    );
 
     meta_by_index
 }
@@ -174,8 +191,13 @@ pub fn query_one(path_str: &str) -> (u64, i64) {
         return (size, modified_time);
     }
 
+    // GetFileAttributesExW 失败，记录错误码
+    let gafe_err = ok.unwrap_err();
+    let gafe_code = gafe_err.code().0 as u32;
+
     // 回退路径：CreateFileW + GetFileSizeEx + GetFileTime
     // 处理 GetFileAttributesExW 失败的场景（文件被锁定、权限不足、长路径等）
+    let t_fallback = std::time::Instant::now();
     let handle = unsafe {
         CreateFileW(
             &path_h,
@@ -192,9 +214,7 @@ pub fn query_one(path_str: &str) -> (u64, i64) {
         let size_ok = unsafe { GetFileSizeEx(h, &mut size) };
 
         let mut ft_write = FILETIME::default();
-        let time_ok = unsafe {
-            GetFileTime(h, None, None, Some(&mut ft_write))
-        };
+        let time_ok = unsafe { GetFileTime(h, None, None, Some(&mut ft_write)) };
 
         unsafe { let _ = CloseHandle(h); };
 
@@ -204,11 +224,20 @@ pub fn query_one(path_str: &str) -> (u64, i64) {
             } else {
                 0
             };
+            log::debug!(
+                "[query_one] GetFileAttributesExW failed (code={}), CreateFileW fallback OK: {} (size={}, {:?})",
+                gafe_code, path_str, size, t_fallback.elapsed()
+            );
             return (size as u64, modified_time);
         }
     }
 
-    log::trace!("[query_one] Failed to get metadata for: {}", path_str);
+    // 两条路径均失败
+    let fallback_err = handle.err().map(|e| e.code().0 as u32).unwrap_or(0);
+    log::warn!(
+        "[query_one] BOTH failed: gafe_code={}, fallback_code={}, path={}",
+        gafe_code, fallback_err, path_str
+    );
     (0, 0)
 }
 

@@ -767,7 +767,10 @@ fn handle_full_scan(
     // Phase 4: 对 Phase 3 后仍然 size=0 的非目录文件，批量调用 GetFileAttributesExW 获取真实大小
     // 场景：$ATTRIBUTE_LIST 扩展记录解析失败、MFT 记录损坏、或稀疏文件无 $ATTRIBUTE_LIST
     {
-        let t3 = Instant::now();
+        let t4_total = Instant::now();
+
+        // 4a: 路径解析 — 收集所有 size=0 非目录文件的完整路径
+        let t4a = Instant::now();
         let zero_entries: Vec<(CompactString, bool)> = files
             .iter()
             .filter(|f| f.size == 0 && !f.is_directory)
@@ -776,8 +779,16 @@ fn handle_full_scan(
                 (CompactString::from(path), false)
             })
             .collect();
+        let t_resolve = t4a.elapsed();
+
         if !zero_entries.is_empty() {
+            // 4b: batch_metadata 调用 GetFileAttributesExW
+            let t4b = Instant::now();
             let real_sizes = ntfs_mft::batch_metadata(&zero_entries);
+            let t_batch = t4b.elapsed();
+
+            // 4c: 结果回写
+            let t4c = Instant::now();
             let mut updated = 0usize;
             let mut still_zero = 0usize;
             let mut zidx = 0;
@@ -795,9 +806,17 @@ fn handle_full_scan(
                     zidx += 1;
                 }
             }
+            let t_update = t4c.elapsed();
+
             log::info!(
-                "[USN] Phase 4: batch GetFileAttributesExW for {} zero-size files: {} updated, {} still zero ({:?})",
-                zero_entries.len(), updated, still_zero, t3.elapsed()
+                "[USN] Phase 4: {} zero-size files, {} updated, {} still zero | resolve={:?}, batch={:?}, update={:?}, total={:?}",
+                zero_entries.len(), updated, still_zero,
+                t_resolve, t_batch, t_update, t4_total.elapsed()
+            );
+        } else {
+            log::info!(
+                "[USN] Phase 4: no zero-size files (resolve={:?})",
+                t_resolve
             );
         }
     }

@@ -1,7 +1,7 @@
 //! 文件日志模块
 //!
 //! 将日志同时输出到控制台和文件。
-//! 日志文件位置: `%APPDATA%\Everything\logs\everything-YYYY-MM-DD.log`
+//! 日志文件位置: `%APPDATA%\everyFile\logs\everyFile-YYYY-MM-DD.log`
 //!
 //! 这样即使程序以静默模式（开机自启动）启动，
 //! 用户也能在日志文件中查看程序是否真的启动以及启动过程。
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// 日志文件目录名
-const LOG_DIR_NAME: &str = "Everything";
+const LOG_DIR_NAME: &str = "everyFile";
 const LOG_SUBDIR_NAME: &str = "logs";
 
 /// 单个日志文件最大大小（字节）：5MB
@@ -26,7 +26,7 @@ const MAX_LOG_FILES: usize = 7;
 /// 全局文件句柄，使用 Mutex 保证线程安全
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 
-/// 获取日志目录完整路径: `%APPDATA%\Everything\logs\`
+/// 获取日志目录完整路径: `%APPDATA%\everyFile\logs\`
 ///
 /// # 返回值
 /// 成功时返回日志目录路径，失败时返回 None
@@ -47,11 +47,11 @@ fn get_log_dir() -> Option<PathBuf> {
 
 /// 获取当前日志文件路径
 ///
-/// 文件名格式: `everything-YYYY-MM-DD.log`
+/// 文件名格式: `everyFile-YYYY-MM-DD.log`
 fn get_log_file_path() -> Option<PathBuf> {
     let dir = get_log_dir()?;
     let date = Local::now().format("%Y-%m-%d").to_string();
-    let filename = format!("everything-{}.log", date);
+    let filename = format!("everyFile-{}.log", date);
     Some(dir.join(filename))
 }
 
@@ -88,7 +88,7 @@ fn rotate_if_needed() {
     *guard = None;
     drop(guard);
 
-    // 滚动现有文件: everything-YYYY-MM-DD.log -> everything-YYYY-MM-DD.1.log
+    // 滚动现有文件: everyFile-YYYY-MM-DD.log -> everyFile-YYYY-MM-DD.1.log
     let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
     let backup_path = path.with_extension(format!("{}.log.bak", timestamp));
     let _ = fs::rename(&path, &backup_path);
@@ -118,7 +118,7 @@ fn cleanup_old_logs(dir: &PathBuf) {
             p.is_file()
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("everything-") && n.ends_with(".log"))
+                    .map(|n| n.starts_with("everyFile-") && n.ends_with(".log"))
                     .unwrap_or(false)
         })
         .collect();
@@ -189,9 +189,9 @@ impl log::Log for DualLogger {
             return;
         }
 
-        if record.target().contains("usn_worker") {
-            return;
-        }
+        // if record.target().contains("usn_worker") {
+        //     return;
+        // }
 
         // 格式: 2026-07-06 14:30:25.123 INFO  [main] message
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");

@@ -576,7 +576,7 @@ function App() {
   const handleExport = async (format: 'csv' | 'txt' | 'json') => {
     const beijingTime = new Date(new Date().getTime() + 8 * 60 * 60 * 1000);
     const timestamp = beijingTime.toISOString().replace(/[:.]/g, '-');
-    const filename = `everything_export_${timestamp}`;
+    const filename = `everyFile_export_${timestamp}`;
     const ext = format === 'csv' ? 'csv' : format === 'txt' ? 'txt' : 'json';
 
     try {

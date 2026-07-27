@@ -3,7 +3,7 @@
 mod commands;
 mod config;
 mod error;
-mod file_logger; // 文件日志模块：将启动信息写入 %APPDATA%\Everything\logs\
+mod file_logger; // 文件日志模块：将启动信息写入 %APPDATA%\everyFile\logs\
 mod fs;
 mod index;
 mod search;
@@ -50,7 +50,7 @@ fn ensure_single_instance() -> bool {
 
         unsafe {
             SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
-            let name = "Everything_Tauri_Single_Instance\0";
+            let name = "everyFile_Tauri_Single_Instance\0";
             let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
             let _ = CreateMutexW(None, false, windows::core::PCWSTR(name_wide.as_ptr()));
 
@@ -58,7 +58,7 @@ fn ensure_single_instance() -> bool {
             if windows::core::Error::from_win32().code().0 & 0x0000FFFF == 183 {
                 log::info!("Another instance detected, activating existing window");
                 // 查找已有窗口并置前
-                let title = "Everything - 极速文件搜索\0";
+                let title = "everyFile - 极速文件搜索\0";
                 let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let hwnd = FindWindowW(
                     windows::core::PCWSTR(std::ptr::null()),
@@ -83,7 +83,7 @@ fn main() {
     }
 
     // 初始化文件日志（先于 env_logger，确保所有启动信息都能记录到文件）
-    // 日志文件位置: %APPDATA%\Everything\logs\everything-YYYY-MM-DD.log
+    // 日志文件位置: %APPDATA%\everyFile\logs\everyFile-YYYY-MM-DD.log
     file_logger::init();
 
     // 初始化日志系统，使用自定义 DualLogger 同时输出到 stderr 和文件
@@ -94,7 +94,7 @@ fn main() {
 
     // 记录应用启动信息
     info!("=================================================");
-    info!("Starting Everything Tauri v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting everyFile v{}", env!("CARGO_PKG_VERSION"));
     info!("Log directory: {:?}", file_logger::log_dir_path());
     info!("=================================================");
 

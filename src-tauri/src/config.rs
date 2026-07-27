@@ -89,7 +89,7 @@ impl Config {
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir()
             .ok_or("Cannot find config directory")?
-            .join("Everything");
+            .join("everyFile");
 
         Ok(config_dir.join("config.toml"))
     }

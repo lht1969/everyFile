@@ -1,13 +1,13 @@
 [package]
-name = "everything-tauri"
-version = "0.1.0"
+name = "everyFile"
+version = "1.0.0"
 description = "极速本地文件搜索引擎 - 基于 Rust + Tauri"
 authors = ["lht1969"]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [lib]
-name = "everything_tauri_lib"
+name = "every_file_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

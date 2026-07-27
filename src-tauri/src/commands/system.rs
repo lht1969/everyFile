@@ -24,7 +24,7 @@ pub fn add_startup() -> std::result::Result<(), String> {
         .map_err(|e| format!("打开注册表 HKCU\\{} 失败: {}", startup_key_path(), e))?;
 
     // 设置前先读取旧值
-    let old_value: Result<String, _> = key.get_value("Everything Tauri");
+    let old_value: Result<String, _> = key.get_value("everyFile");
     match old_value {
         Ok(ref val) if val == &command => {
             log::info!("Startup entry already up-to-date, skipping");
@@ -38,11 +38,11 @@ pub fn add_startup() -> std::result::Result<(), String> {
         }
     }
 
-    key.set_value("Everything Tauri", &command)
+    key.set_value("everyFile", &command)
         .map_err(|e| format!("设置注册表值 '{}' 失败: {}", command, e))?;
 
     // 验证写入结果
-    let verify: Result<String, _> = key.get_value("Everything Tauri");
+    let verify: Result<String, _> = key.get_value("everyFile");
     match verify {
         Ok(ref val) if val == &command => {
             log::info!("Startup entry verified successfully");
@@ -70,7 +70,7 @@ pub fn remove_startup() -> std::result::Result<(), String> {
         .open_subkey_with_flags(startup_key_path(), KEY_WRITE)
         .map_err(|e| format!("打开注册表 HKCU\\{} 失败: {}", startup_key_path(), e))?;
 
-    match key.delete_value("Everything Tauri") {
+    match key.delete_value("everyFile") {
         Ok(_) => {
             log::info!("Startup entry removed successfully");
             Ok(())
@@ -92,7 +92,7 @@ pub fn is_startup_enabled() -> std::result::Result<bool, String> {
             return Ok(false);
         }
     };
-    match key.get_value::<String, _>("Everything Tauri") {
+    match key.get_value::<String, _>("everyFile") {
         Ok(val) => {
             log::info!("Startup entry found: {}", val);
             Ok(true)

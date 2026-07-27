@@ -13,7 +13,7 @@ pub fn setup_tray(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     let tray_builder = TrayIconBuilder::new()
         .menu(&menu)
-        .tooltip("Everything - 极速文件搜索");
+        .tooltip("everyFile - 极速文件搜索");
     let tray_builder = if let Some(icon) = app.default_window_icon().cloned() {
         tray_builder.icon(icon)
     } else {

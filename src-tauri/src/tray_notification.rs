@@ -22,7 +22,7 @@ use tauri_plugin_notification::NotificationExt;
 /// 如果通知失败（例如权限不足、用户禁用了通知），
 /// 不会影响程序正常运行，仅记录警告日志。
 pub fn show_startup_notification(app: &AppHandle) {
-    let title = "Everything Tauri";
+    let title = "everyFile";
     let body = "已开机启动，程序在后台运行。\n\
         点击任务栏右下角托盘图标可以打开主窗口。";
 

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Everything",
-  "version": "0.1.0",
-  "identifier": "com.everything.desktop",
+  "productName": "everyFile",
+  "version": "1.0.0",
+  "identifier": "com.everyFile.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Everything - 极速文件搜索",
+        "title": "everyFile - 极速文件搜索",
         "width": 900,
         "height": 600,
         "minWidth": 600,
@@ -29,7 +29,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -42,11 +44,14 @@
       "nsis": {
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
-        "languages": ["SimpChinese", "English"],
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
         "installMode": "both",
         "headerImage": "icons/header.bmp",
         "sidebarImage": "icons/sidebar.bmp",
-        "startMenuFolder": "Everything"
+        "startMenuFolder": "everyFile"
       }
     },
     "category": "Utility",
