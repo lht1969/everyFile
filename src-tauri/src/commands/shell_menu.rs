@@ -1,11 +1,13 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
-use tauri::State;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::DataExchange::*;
+use windows::Win32::System::Memory::*;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -15,14 +17,223 @@ use super::search::AppState;
 static CTX_MENU_CMD: AtomicI32 = AtomicI32::new(0);
 static mut CTX_MENU_ICM2: usize = 0;
 
+/// Handle of the owner window of the currently active menu session (0 = none).
+/// Only one context menu may be open at a time; a new right-click cancels the
+/// previous menu instead of stacking a second one on top of it.
+static ACTIVE_OWNER_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// 记录进入 Hung 状态的时间戳（Unix 秒），0 表示未记录。
+/// 超过 HUNG_RECOVERY_SECONDS 后自动重置为 Idle，允许重新尝试 Shell 菜单，
+/// 避免休眠/唤醒后永久卡在 fallback 菜单。
+static HUNG_SINCE: AtomicI64 = AtomicI64::new(0);
+const HUNG_RECOVERY_SECONDS: i64 = 300; // 5 分钟后自动恢复
+
+/// fallback 菜单的 TrackPopupMenu 超时时间（秒）。
+/// 超时后向 owner 窗口发送 WM_CANCELMODE 强制关闭菜单，
+/// 防止休眠/唤醒后 TrackPopupMenu 永不返回导致前端 invoke 无响应。
+const FALLBACK_MENU_TIMEOUT_SECS: u64 = 15;
+
+/// Lifecycle of the current menu session.
+///
+/// Only `Hung` is used for gating: once a Shell menu build times out (the
+/// hung-shell-component behaviour observed after sleep/resume), every later
+/// right-click shows the built-in fallback menu instead of spawning yet
+/// another thread that gets stuck inside `QueryContextMenu`.
+#[repr(i32)]
+enum SessionState {
+    Idle = 0,
+    Building = 1,
+    Tracking = 2,
+    Hung = 3,
+}
+static SESSION_STATE: AtomicI32 = AtomicI32::new(SessionState::Idle as i32);
+
+/// How long the Shell menu may take to build (QueryContextMenu) before we
+/// treat it as hung. Normal builds complete in tens of milliseconds.
+const MENU_BUILD_TIMEOUT_MS: u64 = 5000;
+
+/// `CMIC_MASK_UNICODE` — prefer the `W` fields of `CMINVOKECOMMANDINFOEX`.
+const CMIC_MASK_UNICODE: u32 = 0x0000_4000;
+
 /// Show Windows native Shell context menu at specified screen coordinates
+///
+/// The whole menu session runs on a dedicated thread that owns its own hidden
+/// owner window. This is required for two reasons:
+/// 1. `TrackPopupMenu` must be called from the thread that owns the owner
+///    window, otherwise the menu is silently not displayed.
+/// 2. A sync `#[tauri::command]` executes on the main thread, and a hung Shell
+///    component (observed after sleep/resume) kept `TrackPopupMenu`'s modal
+///    loop stuck forever, freezing both the main window and the tray.
 #[tauri::command]
-pub fn show_context_menu(
+pub async fn show_context_menu(
     path: String,
     screen_x: i32,
     screen_y: i32,
     app: tauri::AppHandle,
-    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    // If a previous Shell build hung (e.g. after sleep/resume), don't spawn
+    // more threads that will hang again — go straight to the fallback menu.
+    if SESSION_STATE.load(Ordering::SeqCst) == SessionState::Hung as i32 {
+        // 检查 Hung 状态是否已超过恢复时间，若是则重置为 Idle，重新尝试 Shell 菜单。
+        // 这样休眠/唤醒后 Shell 子系统恢复正常时，无需重启程序即可恢复原生菜单。
+        let hung_since = HUNG_SINCE.load(Ordering::SeqCst);
+        if hung_since > 0 {
+            let now = chrono::Local::now().timestamp();
+            let elapsed = now - hung_since;
+            if elapsed > HUNG_RECOVERY_SECONDS {
+                log::info!(
+                    "[CTX_MENU] Hung state expired ({}s elapsed), resetting to try Shell menu again",
+                    elapsed
+                );
+                SESSION_STATE.store(SessionState::Idle as i32, Ordering::SeqCst);
+                HUNG_SINCE.store(0, Ordering::SeqCst);
+                // 继续走下方的正常 Shell 菜单流程
+            } else {
+                log::info!(
+                    "[CTX_MENU] Shell menu known-hung ({}s ago), using built-in menu",
+                    elapsed
+                );
+                return show_fallback_menu_async(path, screen_x, screen_y, app).await;
+            }
+        } else {
+            log::info!("[CTX_MENU] Shell menu known-hung, using built-in menu");
+            return show_fallback_menu_async(path, screen_x, screen_y, app).await;
+        }
+    }
+
+    // The session thread signals us as soon as QueryContextMenu finished and
+    // the native menu is about to be tracked.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
+    SESSION_STATE.store(SessionState::Building as i32, Ordering::SeqCst);
+    // Clone path 和 app 给 session 线程，原始 path/app 保留给超时后的 fallback 调用
+    let path_for_session = path.clone();
+    let app_for_session = app.clone();
+    std::thread::spawn(move || {
+        let _ = run_menu_session(path_for_session, screen_x, screen_y, &app_for_session, ready_tx);
+    });
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(MENU_BUILD_TIMEOUT_MS),
+        ready_rx,
+    )
+    .await
+    {
+        // Menu built and is being shown by the session thread.
+        Ok(Ok(Ok(()))) => Ok(()),
+        // The session reported a quick, real error (bad path, COM failure...).
+        Ok(Ok(Err(e))) => {
+            SESSION_STATE.store(SessionState::Idle as i32, Ordering::SeqCst);
+            Err(e)
+        }
+        Ok(Err(_)) => {
+            SESSION_STATE.store(SessionState::Idle as i32, Ordering::SeqCst);
+            Err("Context menu task failed".to_string())
+        }
+        // QueryContextMenu is stuck (hung shell component after sleep). The
+        // stuck thread leaks — we cannot kill a blocked COM call — but we mark
+        // the session Hung so every later right-click uses the fallback menu.
+        Err(_elapsed) => {
+            log::warn!(
+                "[CTX_MENU] Shell menu build timed out after {}ms, marking hung and using built-in menu",
+                MENU_BUILD_TIMEOUT_MS
+            );
+            SESSION_STATE.store(SessionState::Hung as i32, Ordering::SeqCst);
+            HUNG_SINCE.store(chrono::Local::now().timestamp(), Ordering::SeqCst);
+            show_fallback_menu_async(path, screen_x, screen_y, app).await
+        }
+    }
+}
+
+fn run_menu_session(
+    path: String,
+    screen_x: i32,
+    screen_y: i32,
+    app: &tauri::AppHandle,
+    ready_tx: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+) -> std::result::Result<(), String> {
+    let _com_guard = ComGuard::new()?;
+    let owner_hwnd = create_owner_window()?;
+
+    // Single active session: if another menu is still open, cancel it now.
+    // Posting WM_CANCELMODE to the previous session's owner window makes its
+    // TrackPopupMenu modal loop dismiss the old menu immediately.
+    let prev_hwnd = ACTIVE_OWNER_HWND.swap(owner_hwnd.0 as usize, Ordering::SeqCst);
+    if prev_hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(prev_hwnd as _), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    // 用 Option 包装 ready_tx：show_menu_owned 成功时 take() 并发送 Ok(())，
+    // 若 show_menu_owned 早期失败（未发送），则在此处发送错误。
+    // oneshot::Sender 不支持 clone，必须用 take() 模式。
+    let mut ready_tx_opt = Some(ready_tx);
+    let result = show_menu_owned(owner_hwnd, path, screen_x, screen_y, app, &mut ready_tx_opt);
+    // 如果 show_menu_owned 未发送 ready_tx（早期失败），在此发送错误
+    if let Some(tx) = ready_tx_opt.take() {
+        let _ = tx.send(result.clone());
+    }
+
+    // Release ownership only if it's still ours (a newer session may have taken over).
+    let _ = ACTIVE_OWNER_HWND.compare_exchange(
+        owner_hwnd.0 as usize,
+        0,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    // Reset the lifecycle only if we're still the current session. Never clears
+    // a Hung state (that would re-enable the hung Shell path).
+    let _ = SESSION_STATE.compare_exchange(
+        SessionState::Tracking as i32,
+        SessionState::Idle as i32,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+
+    unsafe {
+        let _ = DestroyWindow(owner_hwnd);
+    }
+    result
+}
+
+/// Create the hidden owner window that all menu tracking on this thread must use.
+fn create_owner_window() -> std::result::Result<HWND, String> {
+    // The menu's owner window must be owned by this thread for TrackPopupMenu to
+    // display the menu. A hidden "STATIC" control window is a valid owner and
+    // needs no custom window class. All Shell/COM work then happens on this
+    // thread, fully isolated from the main thread.
+    let owner_hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            PCWSTR::null(),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+    if owner_hwnd.0 == 0 {
+        return Err(format!(
+            "Failed to create menu owner window, error: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(owner_hwnd)
+}
+
+fn show_menu_owned(
+    owner_hwnd: HWND,
+    path: String,
+    screen_x: i32,
+    screen_y: i32,
+    app: &tauri::AppHandle,
+    ready_tx: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
 ) -> std::result::Result<(), String> {
     log::info!(
         "Showing context menu for '{}' at ({}, {})",
@@ -35,8 +246,7 @@ pub fn show_context_menu(
         return Err(format!("Path does not exist: {}", path));
     }
 
-    let _com_guard = ComGuard::new()?;
-    let hwnd = get_main_window_hwnd(&app)?;
+    let main_hwnd = get_main_window_hwnd(app)?;
 
     // ---- Shell object setup ----
     let desktop: IShellFolder = unsafe {
@@ -119,6 +329,8 @@ pub fn show_context_menu(
         .cast()
         .map_err(|e| format!("Failed to get IContextMenu2: {}", e))?;
 
+    log::info!("[CTX_MENU] Shell objects ready, building popup menu");
+
     let hmenu =
         unsafe { CreatePopupMenu().map_err(|e| format!("Failed to create popup menu: {}", e))? };
 
@@ -127,36 +339,47 @@ pub fn show_context_menu(
             .QueryContextMenu(hmenu, 0, 1, 0x7FFF, CMF_NORMAL)
             .map_err(|e| format!("Failed to query context menu: {}", e))?
     };
+    log::info!("[CTX_MENU] QueryContextMenu done");
 
-    // ---- Subclass the Tauri window to track menu selection ----
+    // The menu is built; tell the watchdog we are ready so it doesn't time out
+    // and fall back to the built-in menu.
+    SESSION_STATE.store(SessionState::Tracking as i32, Ordering::SeqCst);
+    // take() 取出 Sender 并发送 Ok(())，表示菜单已构建完成
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Ok(()));
+    }
+
+    // ---- Subclass the owner window to track menu selection ----
     CTX_MENU_CMD.store(0, Ordering::SeqCst);
     unsafe { CTX_MENU_ICM2 = &context_menu_2 as *const IContextMenu2 as usize };
 
     unsafe {
-        SetWindowSubclass(hwnd, Some(ctx_menu_subclass_proc), 1, 0);
+        SetWindowSubclass(owner_hwnd, Some(ctx_menu_subclass_proc), 1, 0);
     }
 
     // TPM_RETURNCMD: returns the selected item ID directly, or 0 if the menu was
     // cancelled (user clicked outside). Without this flag, TrackPopupMenu always
     // returns nonzero on success, making it impossible to distinguish "item selected"
     // from "menu dismissed".
+    log::info!("[CTX_MENU] TrackPopupMenu starting (main thread stays responsive)");
     let cmd_id = unsafe {
-        SetForegroundWindow(hwnd);
+        SetForegroundWindow(main_hwnd);
         let ret = TrackPopupMenu(
             hmenu,
             TPM_RETURNCMD,
             screen_x,
             screen_y,
             0,
-            hwnd,
+            owner_hwnd,
             None,
         );
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(owner_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
         ret.0 as i32
     };
+    log::info!("[CTX_MENU] TrackPopupMenu returned");
 
     unsafe {
-        RemoveWindowSubclass(hwnd, Some(ctx_menu_subclass_proc), 1);
+        RemoveWindowSubclass(owner_hwnd, Some(ctx_menu_subclass_proc), 1);
         CTX_MENU_ICM2 = 0;
     }
 
@@ -167,7 +390,6 @@ pub fn show_context_menu(
         // InvokeCommand with high word=0 treats low word as OFFSET (0-based).
         // offset = absolute_id - idCmdFirst = cmd_id - 1
         let offset = (cmd_id - 1) as u32;
-        let verb_ptr = PCSTR(offset as usize as *const u8);
 
         log::info!(
             "[CTX_MENU] Invoking command: absolute_id={}, offset={}",
@@ -175,18 +397,63 @@ pub fn show_context_menu(
             offset
         );
 
-        let mut invoke_info: CMINVOKECOMMANDINFO = unsafe { std::mem::zeroed() };
-        invoke_info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32;
-        invoke_info.hwnd = hwnd;
-        invoke_info.lpVerb = verb_ptr;
-        invoke_info.nShow = SW_SHOWDEFAULT.0;
-
-        unsafe {
-            context_menu_2
-                .InvokeCommand(&invoke_info)
-                .map_err(|e| format!("Failed to invoke command: {}", e))?
+        // Resolve the canonical verb so we can special-case "properties":
+        // invoking it through the context menu object is unreliable in this
+        // host context, but SHObjectProperties opens it directly.
+        let mut verb_buf = [0u16; 260];
+        let verb = if unsafe {
+            context_menu_2.GetCommandString(
+                offset as usize,           // windows 0.52 需要 usize
+                GCS_VERBW,
+                None,
+                PSTR(verb_buf.as_mut_ptr() as *mut u8),  // 需要 PSTR 而非 *mut i8
+                verb_buf.len() as u32,
+            )
+        }
+        .is_ok()
+        {
+            let end = verb_buf.iter().position(|&c| c == 0).unwrap_or(verb_buf.len());
+            Some(String::from_utf16_lossy(&verb_buf[..end]))
+        } else {
+            None
         };
-        log::info!("Context menu command {} executed successfully", cmd_id);
+        log::info!(
+            "[CTX_MENU] command {} verb: {:?}",
+            cmd_id,
+            verb.as_deref().unwrap_or("<unknown>")
+        );
+
+        if verb.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("properties")) {
+            // 使用 ShellExecuteExW + "properties" verb 打开属性对话框。
+            // 这是 Windows 资源管理器自身使用的方法，比 SHObjectProperties 更可靠——
+            // 后者在非 Explorer 宿主进程中常返回失败并提示"此项目的属性未知"。
+            if !show_properties_via_shell_execute(owner_hwnd, &path) {
+                log::warn!(
+                    "[CTX_MENU] ShellExecuteExW properties failed for '{}', error: {}",
+                    path,
+                    std::io::Error::last_os_error()
+                );
+            }
+            log::info!("Context menu command {} (properties) opened", cmd_id);
+        } else {
+            let mut invoke_info: CMINVOKECOMMANDINFOEX = unsafe { std::mem::zeroed() };
+            invoke_info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32;
+            invoke_info.fMask = CMIC_MASK_UNICODE;
+            // The command's modal dialogs must be parented to a window owned by
+            // the calling thread; main_hwnd belongs to the main thread, and a
+            // cross-thread owner breaks the shell property-sheet host.
+            invoke_info.hwnd = owner_hwnd;
+            invoke_info.lpVerb = PCSTR(offset as usize as *const u8);
+            invoke_info.lpVerbW = PCWSTR(offset as usize as *const u16);
+            invoke_info.nShow = SW_SHOWDEFAULT.0;
+
+            unsafe {
+                context_menu_2
+                    .InvokeCommand(std::ptr::addr_of!(invoke_info) as *const _)
+                    .map_err(|e| format!("Failed to invoke command: {}", e))?
+            };
+            log::info!("Context menu command {} executed successfully", cmd_id);
+        }
     }
 
     unsafe {
@@ -199,7 +466,7 @@ pub fn show_context_menu(
             "File '{}' no longer exists after context menu action, updating index",
             path
         );
-        let vm = state.volume_manager.clone();
+        let vm = app.state::<AppState>().volume_manager.clone();
         let path_clone = path.clone();
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -327,4 +594,241 @@ impl Drop for ComGuard {
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Built-in fallback menu
+//
+// Used when the Shell context menu cannot be built (the hung-shell-component
+// behaviour observed after sleep/resume stalls QueryContextMenu forever). Only
+// basic operations are provided, implemented with plain Win32 so they never
+// touch the broken Shell extensions.
+// ---------------------------------------------------------------------------
+
+const FALLBACK_OPEN: usize = 1;
+const FALLBACK_OPEN_LOCATION: usize = 2;
+const FALLBACK_COPY_PATH: usize = 3;
+const FALLBACK_DELETE: usize = 4;
+const FALLBACK_PROPERTIES: usize = 5;
+
+async fn show_fallback_menu_async(
+    path: String,
+    screen_x: i32,
+    screen_y: i32,
+    app: tauri::AppHandle,
+) -> std::result::Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = show_fallback_menu(path, screen_x, screen_y, &app);
+        let _ = tx.send(result);
+    });
+    rx.await
+        .map_err(|e| format!("Fallback menu task failed: {}", e))?
+}
+
+fn show_fallback_menu(
+    path: String,
+    screen_x: i32,
+    screen_y: i32,
+    app: &tauri::AppHandle,
+) -> std::result::Result<(), String> {
+    let _com_guard = ComGuard::new()?;
+    let owner_hwnd = create_owner_window()?;
+
+    log::info!(
+        "[CTX_MENU] Showing built-in fallback menu for '{}' at ({}, {})",
+        path,
+        screen_x,
+        screen_y
+    );
+
+    let main_hwnd = get_main_window_hwnd(app)?;
+
+    let hmenu = unsafe {
+        CreatePopupMenu().map_err(|e| format!("Failed to create popup menu: {}", e))?
+    };
+    unsafe {
+        let _ = AppendMenuW(hmenu, MF_STRING, FALLBACK_OPEN, w!("打开(&O)"));
+        let _ = AppendMenuW(hmenu, MF_STRING, FALLBACK_OPEN_LOCATION, w!("打开所在位置(&I)"));
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(hmenu, MF_STRING, FALLBACK_COPY_PATH, w!("复制路径(&C)"));
+        let _ = AppendMenuW(hmenu, MF_STRING, FALLBACK_DELETE, w!("删除(&D)"));
+        let _ = AppendMenuW(hmenu, MF_STRING, FALLBACK_PROPERTIES, w!("属性(&R)"));
+    }
+
+    // 超时保护：启动定时器线程，FALLBACK_MENU_TIMEOUT_SECS 秒后若菜单仍未关闭，
+    // 向 owner 窗口发送 WM_CANCELMODE 强制取消 TrackPopupMenu。
+    // 防止休眠/唤醒后 TrackPopupMenu 永不返回导致前端 invoke 无响应。
+    let menu_done = Arc::new(AtomicBool::new(false));
+    let menu_done_clone = menu_done.clone();
+    let owner_hwnd_for_timer = owner_hwnd;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(FALLBACK_MENU_TIMEOUT_SECS));
+        if !menu_done_clone.load(Ordering::SeqCst) {
+            log::warn!(
+                "[CTX_MENU] Fallback menu timed out after {}s, cancelling",
+                FALLBACK_MENU_TIMEOUT_SECS
+            );
+            unsafe {
+                let _ = PostMessageW(owner_hwnd_for_timer, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+            }
+        }
+    });
+
+    let cmd_id = unsafe {
+        SetForegroundWindow(main_hwnd);
+        let ret = TrackPopupMenu(
+            hmenu,
+            TPM_RETURNCMD,
+            screen_x,
+            screen_y,
+            0,
+            owner_hwnd,
+            None,
+        );
+        let _ = PostMessageW(owner_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        ret.0 as usize
+    };
+    // 标记菜单已返回，定时器线程不再需要发送 WM_CANCELMODE
+    menu_done.store(true, Ordering::SeqCst);
+    log::info!("[CTX_MENU] Fallback menu command selected: {}", cmd_id);
+
+    unsafe {
+        let _ = DestroyMenu(hmenu);
+    }
+
+    match cmd_id {
+        FALLBACK_OPEN => shell_open(owner_hwnd, &path),
+        FALLBACK_OPEN_LOCATION => open_location(&path),
+        FALLBACK_COPY_PATH => copy_path_to_clipboard(owner_hwnd, &path),
+        FALLBACK_DELETE => delete_file(owner_hwnd, &path),
+        FALLBACK_PROPERTIES => show_properties_dialog(owner_hwnd, &path),
+        _ => {}
+    }
+
+    unsafe {
+        let _ = DestroyWindow(owner_hwnd);
+    }
+
+    // 每次右键菜单操作后都通知前端刷新当前可见范围。
+    {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = app_clone.emit("refresh-visible", ());
+        });
+    }
+
+    Ok(())
+}
+
+fn shell_open(owner_hwnd: HWND, path: &str) {
+    let path_wide = to_wide(path);
+    unsafe {
+        // windows 0.52 版本冲突导致 Option<T> 不实现 IntoParam，
+        // 直接传值而非 Some/None 来绕过
+        let _ = ShellExecuteW(
+            owner_hwnd,
+            w!("open"),
+            PCWSTR(path_wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+fn open_location(path: &str) {
+    // explorer.exe /select,"<path>"
+    let args = format!("/select,\"{}\"", path);
+    let args_wide = to_wide(&args);
+    unsafe {
+        let _ = ShellExecuteW(
+            HWND::default(),
+            w!("open"),
+            w!("explorer.exe"),
+            PCWSTR(args_wide.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+fn copy_path_to_clipboard(owner_hwnd: HWND, path: &str) {
+    let wide = to_wide(path);
+    // windows 0.52 中 GlobalAlloc 返回 Result<HGLOBAL>
+    let h_mem = match unsafe { GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) } {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if h_mem.0.is_null() {
+        return;
+    }
+    unsafe {
+        // GlobalLock 在 0.52 中返回 *mut c_void
+        let dst = GlobalLock(h_mem) as *mut u16;
+        if !dst.is_null() {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+            let _ = GlobalUnlock(h_mem);
+        }
+    }
+    // OpenClipboard 直接传 HWND，不用 Option 绕过版本冲突
+    if unsafe { OpenClipboard(owner_hwnd).is_err() } {
+        unsafe {
+            let _ = GlobalFree(h_mem);
+        }
+        return;
+    }
+    unsafe {
+        let _ = EmptyClipboard();
+        // HANDLE 字段是 isize，需要从 *mut c_void 转换
+        let h = SetClipboardData(13u32, HANDLE(h_mem.0 as isize)); // CF_UNICODETEXT = 13
+        let _ = CloseClipboard();
+        if h.is_err() {
+            let _ = GlobalFree(h_mem);
+        }
+    }
+}
+
+fn delete_file(owner_hwnd: HWND, path: &str) {
+    // Double-null-terminated source path list for SHFileOperationW.
+    let from = path.encode_utf16().chain([0u16, 0u16]).collect::<Vec<u16>>();
+    let mut ops: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
+    ops.hwnd = owner_hwnd;
+    ops.wFunc = FO_DELETE;
+    ops.pFrom = PCWSTR(from.as_ptr());
+    // FOF_ALLOWUNDO | FOF_NOCONFIRMATION: 取 .0 获取 u16 值
+    ops.fFlags = (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0) as u16;
+    // SHFileOperationW 需要 *mut SHFILEOPSTRUCTW
+    let result = unsafe { SHFileOperationW(&mut ops) };
+    log::info!("[CTX_MENU] Fallback delete result: {}", result);
+}
+
+fn show_properties_dialog(owner_hwnd: HWND, path: &str) {
+    // 同样使用 ShellExecuteExW + "properties" verb，与主菜单保持一致
+    if !show_properties_via_shell_execute(owner_hwnd, path) {
+        log::warn!(
+            "[CTX_MENU] Fallback properties failed for '{}', error: {}",
+            path,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// 使用 ShellExecuteExW + "properties" verb 打开文件属性对话框。
+/// 这是 Windows 资源管理器自身使用的方法，比 SHObjectProperties 更可靠。
+/// SHObjectProperties 在非 Explorer 宿主进程中常返回失败并提示"此项目的属性未知"。
+/// SEE_MASK_INVOKEIDLIST 确保 verb 通过 IContextMenu::InvokeCommand 路由，
+/// 而不是简单的 ShellExecute，从而正确显示属性页。
+fn show_properties_via_shell_execute(owner_hwnd: HWND, path: &str) -> bool {
+    let path_wide = to_wide(path);
+    let verb_wide = to_wide("properties");
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_INVOKEIDLIST;
+    info.hwnd = owner_hwnd;
+    info.lpVerb = PCWSTR(verb_wide.as_ptr());
+    info.lpFile = PCWSTR(path_wide.as_ptr());
+    info.nShow = SW_SHOW.0;
+    // windows 0.52 中 ShellExecuteExW 返回 Result<()>，用 is_ok() 判断成功
+    unsafe { ShellExecuteExW(&mut info).is_ok() }
 }

@@ -1050,6 +1050,7 @@ impl SearchCache {
                         bi -= 1;
                         skipped_base += 1;
                     }
+                    if bi == 0 && di == 0 { continue; }
 
                     let pick_base = if di == 0 {
                         true
@@ -1214,6 +1215,8 @@ pub struct VolumeManager {
     empty_query_generation: u64,
     /// 扫描失败的卷及错误信息
     pub scan_errors: HashMap<String, String>,
+    /// 缓存每个卷的最后已知文件数，监控器被 take_monitor 取出时回退到此值
+    file_counts: HashMap<String, usize>,
 }
 
 pub struct VolumeMonitor {
@@ -1256,6 +1259,7 @@ impl VolumeManager {
             empty_query_sorted: [None, None, None, None],
             empty_query_generation: 0,
             scan_errors: HashMap::new(),
+            file_counts: HashMap::new(),
         }
     }
 
@@ -1325,21 +1329,31 @@ impl VolumeManager {
     }
 
     pub fn take_monitor(&mut self, drive_letter: &str) -> Option<VolumeMonitor> {
-        self.volumes.remove(drive_letter)
+        let monitor = self.volumes.remove(drive_letter);
+        if let Some(ref m) = monitor {
+            self.file_counts.insert(drive_letter.to_string(), m.files.len());
+        }
+        monitor
     }
 
     pub fn return_monitor(&mut self, drive_letter: &str, monitor: VolumeMonitor) {
+        self.file_counts.insert(drive_letter.to_string(), monitor.files.len());
         self.volumes.insert(drive_letter.to_string(), monitor);
     }
 
     pub fn total_file_count(&self) -> usize {
-        self.volumes.values().map(|v| v.files.len()).sum()
+        self.vol_names.iter().filter(|n| !n.is_empty()).map(|n| {
+            self.volumes.get(n).map(|v| v.files.len())
+                .or_else(|| self.file_counts.get(n).copied())
+                .unwrap_or(0)
+        }).sum()
     }
 
     pub fn get_file_count(&self, drive_letter: &str) -> usize {
         self.volumes
             .get(drive_letter)
             .map(|v| v.files.len())
+            .or_else(|| self.file_counts.get(drive_letter).copied())
             .unwrap_or(0)
     }
 
@@ -1395,7 +1409,48 @@ impl VolumeManager {
         // 必须同时递增 empty_query_generation，使空查询排序缓存失效：
         // 上一次空查询（可能在卷扫描前）缓存的排序结果已过时，
         // 若不失效会导致扫描完成后仍返回 0 条结果。
-        self.search_cache = None;
+        //
+        // 保留旧缓存的 delta：增量变更（新增/删除/修改/重命名）只存在于 delta 中，
+        // 尚未 merge 回 monitor.files（merge 仅在 delta 超过阈值或定期任务触发）。
+        // 若清空搜索框/切换关键词时丢弃 delta，新 cache 的 base 只包含 monitor.files，
+        // 新创建的文件会在清空搜索框后的下一次搜索中凭空消失。
+        let (preserved_new_files, preserved_file_id_index, preserved_deleted_ids,
+             preserved_renamed_fids, preserved_modified, preserved_matched, preserved_generation) =
+            if let Some(old) = self.search_cache.take() {
+                let new_files = old.delta.new_files;
+                let mut file_id_index = HashMap::with_capacity(new_files.len());
+                for (i, (_, f)) in new_files.iter().enumerate() {
+                    file_id_index.insert(f.file_id, i);
+                }
+                let mut matched: Vec<u32> = Vec::with_capacity(new_files.len());
+                for (i, (v, f)) in new_files.iter().enumerate() {
+                    if old.delta.deleted_ids.contains(&f.file_id)
+                        && !old.delta.renamed_fids.contains(&f.file_id)
+                    {
+                        continue;
+                    }
+                    matched.push(pack_matched(*v, i as u32));
+                }
+                (
+                    new_files,
+                    file_id_index,
+                    old.delta.deleted_ids,
+                    old.delta.renamed_fids,
+                    old.delta.modified,
+                    matched,
+                    old.delta.generation + 1,
+                )
+            } else {
+                (
+                    Vec::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashMap::new(),
+                    Vec::new(),
+                    0,
+                )
+            };
         self.empty_query_generation += 1;
         self.empty_query_sorted = [None, None, None, None];
         let total_files: usize = self.volumes.values().map(|v| v.files.len()).sum();
@@ -1484,13 +1539,13 @@ impl VolumeManager {
                 },
             },
             delta: DeltaCache {
-                new_files: Vec::new(),
-                file_id_index: HashMap::new(),
-                deleted_ids: HashSet::new(),
-                renamed_fids: HashSet::new(),
-                modified: HashMap::new(),
-                matched: Vec::new(),
-                generation: 0,
+                new_files: preserved_new_files,
+                file_id_index: preserved_file_id_index,
+                deleted_ids: preserved_deleted_ids,
+                renamed_fids: preserved_renamed_fids,
+                modified: preserved_modified,
+                matched: preserved_matched,
+                generation: preserved_generation,
             },
             active_base_count: None,
             base_file_bitvec: None,
@@ -2262,6 +2317,8 @@ impl VolumeMonitor {
         let drive_letter = self.drive_letter.clone();
 
         let walker = self.build_walker();
+        let mut last_parent_str = CompactString::new("");
+        let mut last_parent_id = u32::MAX;
         for entry in walker
             .into_iter()
             .filter_entry(move |e| {
@@ -2306,14 +2363,24 @@ impl VolumeMonitor {
                 .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
             let name = entry.file_name().to_string_lossy().to_string();
-            let path_str = entry.path().to_string_lossy().to_string();
 
-            // 文件：intern 父目录路径得到 path_id（FileEntry.path_id 指向父目录）
-            // 目录：额外注册自身路径供子条目使用
-            let parent_path = parent_dir_of(&path_str);
-            let path_id = self.path_table.intern(parent_path);
+            // 利用 walkdir 深度优先遍历的目录连续性，缓存上一个父目录的 path_id
+            let path_id = {
+                let entry_path = entry.path();
+                let parent = entry_path.parent().unwrap_or(entry_path);
+                let parent_lossy = parent.to_string_lossy();
+                if parent_lossy == last_parent_str.as_str() {
+                    last_parent_id
+                } else {
+                    let id = self.path_table.intern(&parent_lossy);
+                    last_parent_str = CompactString::from(parent_lossy.as_ref());
+                    last_parent_id = id;
+                    id
+                }
+            };
             if is_dir {
-                self.path_table.intern(&path_str);
+                // 目录额外注册自身路径供子条目使用
+                self.path_table.intern(&entry.path().to_string_lossy());
             }
 
             // 用 (path_id, name) 作为唯一标识查找
@@ -2434,5 +2501,142 @@ impl VolumeMonitor {
             let full_path = path_table.resolve_file_path(f.path_id, &f.name);
             full_path.as_str() != file_path
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::{FileEntry, SearchOptions, SearchResult, SortBy, SortDirection};
+    use compact_str::CompactString;
+
+    /// 构造一个含单卷、两个 base 文件的 VolumeManager。
+    /// apply_full_scan 会设置 files/fid_index/use_usn，与 USN 全量扫描结果一致。
+    fn build_test_manager() -> VolumeManager {
+        let mut vm = VolumeManager::new();
+        vm.add_volume("C:", false, true, true).unwrap();
+
+        let mut path_table = PathTable::new();
+        let root_id = path_table.intern("C:\\");
+        let files = vec![
+            FileEntry::new(
+                CompactString::from("龙腾虎跃.txt"),
+                root_id,
+                100,
+                1_700_000_000,
+                1001,
+                false,
+            ),
+            FileEntry::new(
+                CompactString::from("other.txt"),
+                root_id,
+                200,
+                1_700_000_000,
+                1002,
+                false,
+            ),
+        ];
+        vm.apply_full_scan("C:", files, path_table);
+        vm
+    }
+
+    fn name_options() -> SearchOptions {
+        SearchOptions {
+            sort_by: SortBy::Name,
+            sort_direction: SortDirection::Ascending,
+            ..Default::default()
+        }
+    }
+
+    fn has_result(results: &[SearchResult], name: &str) -> bool {
+        results.iter().any(|r| r.name.as_str() == name)
+    }
+
+    /// 回归测试：清空搜索框后，新创建的文件不应从搜索结果中消失。
+    ///
+    /// 对应实际 UI 操作（用户报告的问题）：
+    /// 1. 搜索"龙" → 命中 base 中的"龙腾虎跃.txt"
+    /// 2. USN 增量：桌面上创建"龙腾虎跃 - 副本.txt" → 进入当前 cache 的 delta
+    /// 3. 同关键词再搜索 → delta 中的新文件可见
+    /// 4. 清空搜索框（空查询重建 cache）
+    /// 5. 再次搜索"龙" → 新文件必须仍然可见（修复前此处丢失）
+    #[test]
+    fn new_file_survives_cache_rebuild_after_clear() {
+        let mut vm = build_test_manager();
+
+        // 1. 首次搜索命中 base 文件
+        let (results, total) = vm.search_with_options("龙", &name_options());
+        assert!(has_result(&results, "龙腾虎跃.txt"));
+        assert_eq!(total, 1);
+
+        // 2. USN 增量：新文件进入当前 cache 的 delta
+        vm.apply_incremental_usn(
+            "C:",
+            vec![SearchResult {
+                name: CompactString::from("龙腾虎跃 - 副本.txt"),
+                path: CompactString::from("C:\\龙腾虎跃 - 副本.txt"),
+                size: 0,
+                modified_time: 1_700_000_000,
+                file_id: 1003,
+                is_directory: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // 3. 同关键词再搜：命中 base + delta 两个文件
+        let (results, total) = vm.search_with_options("龙", &name_options());
+        assert!(has_result(&results, "龙腾虎跃.txt"));
+        assert!(has_result(&results, "龙腾虎跃 - 副本.txt"));
+        assert_eq!(total, 2);
+
+        // 4. 清空搜索框：空查询重建 cache，delta 必须被保留
+        let (results, total) = vm.search_with_options("", &name_options());
+        assert!(has_result(&results, "龙腾虎跃 - 副本.txt"));
+        assert_eq!(total, 3);
+
+        // 5. 再次搜索"龙"：新文件必须仍然可见（回归点）
+        let (results, total) = vm.search_with_options("龙", &name_options());
+        assert!(has_result(&results, "龙腾虎跃.txt"));
+        assert!(has_result(&results, "龙腾虎跃 - 副本.txt"));
+        assert_eq!(total, 2);
+    }
+
+    /// 新文件进入 delta 后，经 merge_delta_to_base 合并回 base，
+    /// 再清空搜索框重建 cache，新文件仍应可见（不重复、不丢失）。
+    #[test]
+    fn merged_new_file_still_visible_after_rebuild() {
+        let mut vm = build_test_manager();
+
+        vm.search_with_options("龙", &name_options());
+        vm.apply_incremental_usn(
+            "C:",
+            vec![SearchResult {
+                name: CompactString::from("龙腾虎跃 - 副本.txt"),
+                path: CompactString::from("C:\\龙腾虎跃 - 副本.txt"),
+                size: 0,
+                modified_time: 1_700_000_000,
+                file_id: 1003,
+                is_directory: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // 模拟周期性 merge：delta 合并回 base，delta 被清空
+        {
+            let mut vm = &mut vm;
+            let cache = vm.search_cache.as_mut().unwrap();
+            cache.merge_delta_to_base(&mut vm.volumes, &vm.vol_names);
+        }
+
+        // 清空搜索框重建 cache：新文件此时在 base 中，且 delta 为空，应恰好 3 条
+        let (results, total) = vm.search_with_options("", &name_options());
+        assert!(has_result(&results, "龙腾虎跃 - 副本.txt"));
+        assert_eq!(total, 3);
+
+        let (results, total) = vm.search_with_options("龙", &name_options());
+        assert!(has_result(&results, "龙腾虎跃 - 副本.txt"));
+        assert_eq!(total, 2);
     }
 }

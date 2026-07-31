@@ -145,7 +145,7 @@ function SettingsModal({ onClose, indexStatus, onVolumeChange }: SettingsModalPr
                   checked={config.enable_usn_journal}
                   onChange={e => setConfig({ ...config, enable_usn_journal: e.target.checked })}
                 />
-                启用 USN Journal 监控（需要管理员权限）
+                启用 USN Journal 监控（需管理员权限，开启后将以管理员身份重启应用）
               </label>
               <label>
                 <input

@@ -24,6 +24,12 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
   const inputRef = useRef<HTMLInputElement>(null);
   const skipSuggestionsRef = useRef(false);
 
+  useEffect(() => {
+    if (!query.trim() && document.activeElement === inputRef.current) {
+      setShowHistory(true);
+    }
+  }, [query]);
+
   const addToHistory = (q: string) => {
     if (!q.trim()) return;
     setSearchHistory(prev => {

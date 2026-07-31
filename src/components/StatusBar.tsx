@@ -5,7 +5,7 @@ function getVolumeClassName(state: VolumeState): string {
     case 'Loading':
       return 'loading';
     case 'Ready':
-      return state.file_count === 0 ? 'empty' : '';
+      return '';
     case 'Error':
       return 'error';
     default:
@@ -56,8 +56,13 @@ function StatusBar({ message, indexStatus, isAdmin, searchTime }: StatusBarProps
             更新: {indexStatus.last_update}
           </span>
         )}
-        <span className={`admin-badge ${isAdmin ? 'admin' : 'normal'}`}>
-          {isAdmin ? '管理员' : '普通用户'}
+        <span
+          className={`admin-badge ${isAdmin ? 'admin' : 'normal'}`}
+          title={isAdmin
+            ? '已以管理员权限运行：USN Journal 实时监控需要管理员权限，启用后应用会自动提权'
+            : '以普通用户权限运行：实时增量更新（USN Journal）不可用'}
+        >
+          {isAdmin ? '管理员(已提权)' : '普通用户'}
         </span>
       </div>
     </div>

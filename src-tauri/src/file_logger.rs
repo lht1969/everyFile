@@ -11,6 +11,7 @@ use log::{LevelFilter, Metadata, Record};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Mutex;
 
 /// 日志文件目录名
@@ -25,6 +26,12 @@ const MAX_LOG_FILES: usize = 7;
 
 /// 全局文件句柄，使用 Mutex 保证线程安全
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+
+/// 控制台输出队列容量：超过后仅丢弃控制台行（文件日志不受影响）
+const CONSOLE_QUEUE_SIZE: usize = 4096;
+
+/// 控制台输出通道：由专用线程消费，避免任何线程在日志路径上同步写 stderr
+static CONSOLE_TX: Mutex<Option<mpsc::SyncSender<String>>> = Mutex::new(None);
 
 /// 获取日志目录完整路径: `%APPDATA%\everyFile\logs\`
 ///
@@ -146,18 +153,47 @@ fn open_log_file() -> Option<File> {
         .ok()
 }
 
+/// 将一行文本异步交给控制台输出线程写入（不阻塞、不影响文件日志）
+///
+/// 修复根因：旧实现直接在日志路径上同步 `eprintln!`，
+/// 一旦控制台（conhost）卡死，`NtWriteFile` 会永久阻塞并持有全局 stderr 锁，
+/// 拖垮所有线程（表现为 tokio worker 全部卡在 `Stderr::lock()`）。
+/// 现在 stderr 写只发生在专用线程；通道满时仅丢弃控制台行。
+pub fn write_console(line: String) {
+    if let Ok(guard) = CONSOLE_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.try_send(line);
+        }
+    }
+}
+
 /// 初始化文件日志
 ///
 /// 应在程序启动早期调用，确保后续日志能被记录。
 /// 调用后会自动打开当前日期的日志文件。
 pub fn init() {
+    // 启动控制台输出线程：所有 stderr 写集中到此线程，
+    // 即使控制台卡死也只会阻塞它自己，不影响其它线程。
+    let (tx, rx) = mpsc::sync_channel(CONSOLE_QUEUE_SIZE);
+    std::thread::Builder::new()
+        .name("console-writer".to_string())
+        .spawn(move || {
+            while let Ok(line) = rx.recv() {
+                eprintln!("{}", line);
+            }
+        })
+        .ok();
+    if let Ok(mut guard) = CONSOLE_TX.lock() {
+        *guard = Some(tx);
+    }
+
     if let Ok(mut guard) = LOG_FILE.lock() {
         *guard = open_log_file();
         if guard.is_some() {
-            eprintln!(
+            write_console(format!(
                 "[file_logger] 日志文件初始化成功: {:?}",
                 get_log_file_path()
-            );
+            ));
         }
     }
 }
@@ -201,8 +237,8 @@ impl log::Log for DualLogger {
 
         let line = format!("{} {:<5} [{}] {}", timestamp, level, target, args);
 
-        // 输出到 stderr（控制台）
-        eprintln!("{}", line);
+        // 输出到 stderr（控制台）：异步，由专用线程写入，绝不阻塞当前线程
+        write_console(line.clone());
 
         // 输出到文件
         write_to_file(&line);

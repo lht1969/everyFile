@@ -906,9 +906,6 @@ body {
   color: var(--text-secondary);
 }
 
-.volume-tag.empty {
-  color: var(--warning-color);
-}
 
 .volume-tag.error {
   color: var(--danger-color);

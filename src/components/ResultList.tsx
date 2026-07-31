@@ -23,6 +23,7 @@ interface ResultListProps {
 }
 
 const ROW_HEIGHT = 28;
+const DOUBLE_CLICK_MS = 500;
 
 function FileIcon({ path, isDirectory }: { path: string; isDirectory: boolean }) {
   const iconUrl = useFileIcon(path, isDirectory);
@@ -49,6 +50,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   const hoverTimeoutRef = useRef<number | null>(null);
   const resizingRef = useRef<{ colIndex: number; startX: number; startWidth: number } | null>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const pendingRenameRef = useRef<{ index: number; timerId: number } | null>(null);
 
   const { columnWidths, setManualWidth } = useColumnWidths(results, resultBodyRef);
   const gridTemplate = columnWidths.map(w => w + 'px').join(' ');
@@ -68,7 +70,10 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
   };
 
   useEffect(() => {
-    return () => { if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current); };
+    return () => {
+      if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+      if (pendingRenameRef.current) clearTimeout(pendingRenameRef.current.timerId);
+    };
   }, []);
 
   const prevScrollTrigger = useRef(scrollToTop);
@@ -149,14 +154,38 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
     }
   };
 
+  const cancelPendingRename = () => {
+    if (pendingRenameRef.current) {
+      clearTimeout(pendingRenameRef.current.timerId);
+      pendingRenameRef.current = null;
+    }
+  };
+
+  const startRename = (index: number, name: string) => {
+    setRenamingIndex(index);
+    setRenameValue(name);
+  };
+
+  // 延迟进入重命名状态：双击会依次触发 click → click → dblclick，
+  // 首次 click 无法区分"单击改名"与"双击的第一步"。延迟 DOUBLE_CLICK_MS
+  // 后若没有 dblclick 到来才进入重命名；dblclick 到达时取消待定的重命名。
+  const scheduleRename = (index: number, name: string) => {
+    cancelPendingRename();
+    const timerId = window.setTimeout(() => {
+      pendingRenameRef.current = null;
+      startRename(index, name);
+    }, DOUBLE_CLICK_MS);
+    pendingRenameRef.current = { index, timerId };
+  };
+
   const handleRowClick = (index: number, e: React.MouseEvent) => {
+    cancelPendingRename();
     if (selectedIndex === index && renamingIndex === null) {
       const target = e.target as HTMLElement;
       if (target.closest('.col-name')) {
         const result = results[index - resultsOffset];
         if (result) {
-          setRenamingIndex(index);
-          setRenameValue(result.name);
+          scheduleRename(index, result.name);
           return;
         }
       }
@@ -167,7 +196,9 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
     setSelectedIndex(index);
   };
 
-  const handleRowDoubleClick = (path: string, isDirectory: boolean) => {
+  const handleRowDoubleClick = (index: number, path: string, isDirectory: boolean) => {
+    if (renamingIndex === index) return;
+    cancelPendingRename();
     isDirectory ? onOpenFolder(path) : onOpenFile(path);
   };
 
@@ -205,7 +236,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
       }
     } else if (e.key === 'Enter' && selectedIndex >= 0) {
       const item = results.find((_, i) => i === selectedIndex - startIndex);
-      if (item) handleRowDoubleClick(item.path, item.is_directory);
+      if (item) handleRowDoubleClick(selectedIndex, item.path, item.is_directory);
     }
   };
 
@@ -332,7 +363,7 @@ function ResultList({ results, totalCount, resultsOffset, sortField, sortDirecti
                       className={`result-row ${globalIndex === selectedIndex ? 'selected' : ''}`}
                       style={{ height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
                       onClick={(e) => handleRowClick(globalIndex, e)}
-                      onDoubleClick={() => handleRowDoubleClick(result.path, result.is_directory)}
+                      onDoubleClick={() => handleRowDoubleClick(globalIndex, result.path, result.is_directory)}
                       onMouseEnter={(e) => handleMouseEnter(e, globalIndex, result)}
                       onMouseLeave={handleMouseLeave}
                     >

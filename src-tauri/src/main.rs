@@ -39,23 +39,51 @@ use tokio::sync::Mutex;
 /// 检查单例实例，如果已有实例在运行则将其窗口置前并退出。
 ///
 /// 使用 Windows 命名 Mutex 实现跨进程检测。
-fn ensure_single_instance() -> bool {
+///
+/// `takeover` 为 true（--elevated 提权重启的实例）时：旧实例（普通权限）在
+/// `relaunch_elevated()` 成功后立即退出，此处轮询等待其释放 Mutex 后接管成为
+/// 唯一实例，避免新实例刚启动就撞见旧实例的 Mutex 而误退出。超时则退化为
+/// "激活已有窗口并退出"。
+fn ensure_single_instance(takeover: bool) -> bool {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::SetLastError;
+        use windows::Win32::Foundation::{CloseHandle, SetLastError, WIN32_ERROR};
         use windows::Win32::System::Threading::CreateMutexW;
         use windows::Win32::UI::WindowsAndMessaging::{
             FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
         };
 
         unsafe {
-            SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
             let name = "everyFile_Tauri_Single_Instance\0";
             let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let _ = CreateMutexW(None, false, windows::core::PCWSTR(name_wide.as_ptr()));
 
-            // 通过 Error::from_win32() 检查是否已存在（ERROR_ALREADY_EXISTS = 183）
-            if windows::core::Error::from_win32().code().0 & 0x0000FFFF == 183 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut acquired = false;
+            loop {
+                SetLastError(WIN32_ERROR(0));
+                let handle = CreateMutexW(None, false, windows::core::PCWSTR(name_wide.as_ptr()));
+                // 通过 Error::from_win32() 检查是否已存在（ERROR_ALREADY_EXISTS = 183）
+                let already_exists =
+                    windows::core::Error::from_win32().code().0 & 0x0000FFFF == 183;
+                if already_exists {
+                    // 关闭本进程对该已有 mutex 的重复句柄，避免句柄泄漏
+                    if let Ok(h) = handle {
+                        let _ = CloseHandle(h);
+                    }
+                    if !takeover || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                // 创建成功：windows 0.52 的 HANDLE 不会自动关闭（无 Drop 实现），
+                // 不调用 CloseHandle 即可让内核 mutex 持续占用，进程退出时由 OS 回收。
+                let _ = handle;
+                acquired = true;
+                break;
+            }
+
+            if !acquired {
                 log::info!("Another instance detected, activating existing window");
                 // 查找已有窗口并置前
                 let title = "everyFile - 极速文件搜索\0";
@@ -70,15 +98,20 @@ fn ensure_single_instance() -> bool {
                 }
                 return false;
             }
-            // 第一个实例，创建的 mutex 句柄在进程退出时由 OS 自动清理
+            // 第一个实例（或接管成功），mutex 句柄在进程退出时由 OS 自动清理
         }
     }
     true
 }
 
 fn main() {
+    // 解析命令行参数（须先于单实例检查：--elevated 决定接管行为）
+    let args: Vec<String> = std::env::args().collect();
+    let silent_mode = args.contains(&"-s".to_string()) || args.contains(&"-S".to_string());
+    let elevated_relaunch = args.iter().any(|a| a == "--elevated");
+
     // 单例检查：确保只有一个实例在运行
-    if !ensure_single_instance() {
+    if !ensure_single_instance(elevated_relaunch) {
         std::process::exit(0);
     }
 
@@ -97,10 +130,6 @@ fn main() {
     info!("Starting everyFile v{}", env!("CARGO_PKG_VERSION"));
     info!("Log directory: {:?}", file_logger::log_dir_path());
     info!("=================================================");
-
-    // 解析命令行参数，检查是否包含 -s 或 -S 参数（静默启动）
-    let args: Vec<String> = std::env::args().collect();
-    let silent_mode = args.contains(&"-s".to_string()) || args.contains(&"-S".to_string());
 
     // 获取程序自身路径（用于启动通知等）
     let exe_path = std::env::current_exe()
@@ -129,6 +158,29 @@ fn main() {
 
     // 检查管理员权限，决定是否使用 USN Journal
     let is_admin = fs::is_elevated();
+
+    // 普通用户且开启了"快速增量更新（USN Journal）"开关时，尝试 UAC 提权重启。
+    // 提权成功后旧实例立即退出，新实例以管理员令牌运行并自动走 USN 增量链路；
+    // 用户取消/非管理员组时保持普通模式（walkdir），由 --elevated 标志防止递归提权。
+    if !is_admin && !silent_mode && !elevated_relaunch {
+        if let Ok(config) = crate::config::Config::load() {
+            if config.index_settings.enable_usn_journal {
+                log::info!("USN journal enabled but not elevated, requesting elevation...");
+                match crate::fs::relaunch_elevated() {
+                    Ok(()) => {
+                        log::info!("Elevation accepted, exiting current instance");
+                        std::process::exit(0);
+                    }
+                    Err(code) => {
+                        log::warn!(
+                            "Elevation request failed (code={}), continuing as normal user",
+                            code
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // 构建 Tauri 应用
     info!("Building Tauri application...");
@@ -960,7 +1012,10 @@ fn main() {
         // 处理应用运行错误
         .unwrap_or_else(|e| {
             log::error!("Tauri application exited with error: {}", e);
-            eprintln!("Tauri application exited with error: {}", e);
+            file_logger::write_console(format!(
+                "Tauri application exited with error: {}",
+                e
+            ));
             std::process::exit(1);
         });
 

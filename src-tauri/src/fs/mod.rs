@@ -129,3 +129,53 @@ pub fn is_elevated() -> bool {
         Err(_) => false,
     }
 }
+
+/// 以管理员权限重新启动当前进程（UAC 提权）。
+///
+/// 通过 `ShellExecuteW` + `runas` verb 弹出 UAC 确认框；确认后派生当前程序的
+/// 高权限副本（附带原始参数 + `--elevated`），原进程应立即退出。
+/// 返回 `Err(code)` 表示用户取消（SE_ERR_ACCESSDENIED=5）或系统不支持提权。
+pub fn relaunch_elevated() -> std::result::Result<(), i32> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let exe = std::env::current_exe().map_err(|_| 0)?;
+    let exe_str = exe.to_string_lossy();
+
+    // 拼接原始参数（跳过 args[0] 程序名）+ "--elevated"
+    let mut params = String::new();
+    for (i, arg) in std::env::args().skip(1).enumerate() {
+        if i > 0 {
+            params.push(' ');
+        }
+        params.push_str(&arg);
+    }
+    if !params.is_empty() {
+        params.push(' ');
+    }
+    params.push_str("--elevated");
+
+    let verb = "runas\0";
+    let verb_wide: Vec<u16> = verb.encode_utf16().collect();
+    let file_wide: Vec<u16> = exe_str.encode_utf16().chain(std::iter::once(0)).collect();
+    let params_wide: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::PCWSTR(verb_wide.as_ptr()),
+            windows::core::PCWSTR(file_wide.as_ptr()),
+            windows::core::PCWSTR(params_wide.as_ptr()),
+            windows::core::PCWSTR(std::ptr::null()),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    // 返回值 <= 32 表示失败（如 SE_ERR_ACCESSDENIED=5 用户取消）
+    let code = result.0 as i32;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(code)
+    }
+}
