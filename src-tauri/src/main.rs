@@ -162,7 +162,12 @@ fn main() {
     // 普通用户且开启了"快速增量更新（USN Journal）"开关时，尝试 UAC 提权重启。
     // 提权成功后旧实例立即退出，新实例以管理员令牌运行并自动走 USN 增量链路；
     // 用户取消/非管理员组时保持普通模式（walkdir），由 --elevated 标志防止递归提权。
-    if !is_admin && !silent_mode && !elevated_relaunch {
+    //
+    // 注意：开发模式（debug 构建）下跳过提权，因为提权后旧进程退出会导致
+    // Tauri CLI 误认为 dev 会话结束而停止 Vite 开发服务器，提权后的新进程
+    // 无法连接到 Vite，导致 WebView 空白。如需在开发模式下测试 USN Journal，
+    // 请以管理员身份从管理员终端运行 npm run tauri dev。
+    if !is_admin && !silent_mode && !elevated_relaunch && !cfg!(debug_assertions) {
         if let Ok(config) = crate::config::Config::load() {
             if config.index_settings.enable_usn_journal {
                 log::info!("USN journal enabled but not elevated, requesting elevation...");

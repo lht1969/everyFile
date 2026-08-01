@@ -23,7 +23,7 @@
 
 ## 项目简介
 
-everyFile 是一款 Windows 平台下的本地文件搜索工具，灵感来源于 [everyFile Search Engine](https://www.voidtools.com/)。它使用 Tauri v2 框架构建，后端采用 Rust 语言编写，前端使用 React + TypeScript，结合 NTFS USN Journal 实现文件系统的实时索引与毫秒级搜索。
+everyFile 是一款 Windows 平台下的本地文件搜索工具，灵感来源于 [everything Search Engine](https://www.voidtools.com/)。它使用 Tauri v2 框架构建，后端采用 Rust 语言编写，前端使用 React + TypeScript，结合 NTFS USN Journal 实现文件系统的实时索引与毫秒级搜索。
 
 与传统的文件遍历搜索不同，本项目直接读取 NTFS 主文件表（MFT）建立索引，并通过 USN Journal 进行增量更新，无需逐目录扫描即可在百万级文件量下保持秒级响应。
 
@@ -39,7 +39,7 @@ everyFile 是一款 Windows 平台下的本地文件搜索工具，灵感来源�
 - **结果导出**：支持 CSV / TXT / JSON 格式导出搜索结果
 - **系统集成**：系统托盘常驻、开机自启、Windows Toast 通知
 - **管理员/普通用户双模式**：管理员模式启用 USN Journal 实时索引；普通用户使用 walkdir 兜底扫描
-- **轻量安装**：基于 Tauri v2，安装包仅约 10MB，内存占用低
+- **轻量安装**：基于 Tauri v2，安装包不足 10MB，内存占用低
 
 ## 系统要求
 

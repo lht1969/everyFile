@@ -435,6 +435,15 @@ fn show_menu_owned(
                 );
             }
             log::info!("Context menu command {} (properties) opened", cmd_id);
+        } else if verb.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("delete")) {
+            // 拦截删除操作：Shell 原生 InvokeCommand 的删除是否显示确认对话框
+            // 取决于系统回收站设置，不可控。统一改用 delete_file 函数，确保始终
+            // 显示标准删除确认对话框，防止误删除。
+            delete_file(owner_hwnd, &path);
+            log::info!(
+                "Context menu command {} (delete) executed via fallback with confirmation",
+                cmd_id
+            );
         } else {
             let mut invoke_info: CMINVOKECOMMANDINFOEX = unsafe { std::mem::zeroed() };
             invoke_info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32;
@@ -790,13 +799,33 @@ fn copy_path_to_clipboard(owner_hwnd: HWND, path: &str) {
 }
 
 fn delete_file(owner_hwnd: HWND, path: &str) {
-    // Double-null-terminated source path list for SHFileOperationW.
+    // 先用 MessageBoxW 显示自定义确认对话框，确保对话框显示在最前面。
+    // 不依赖 SHFileOperationW 的内置确认，因为后者以隐藏的 owner_hwnd 为父窗口，
+    // 对话框可能显示在后台，用户看不到，导致误以为窗口空白。
+    let msg = format!("您确定要将此文件移到回收站吗？\n\n{}", path);
+    let msg_wide = to_wide(&msg);
+    let title_wide = to_wide("确认删除");
+    let choice = unsafe {
+        MessageBoxW(
+            owner_hwnd,
+            PCWSTR(msg_wide.as_ptr()),
+            PCWSTR(title_wide.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+    if choice != IDYES {
+        log::info!("[CTX_MENU] Delete cancelled by user");
+        return;
+    }
+
+    // 用户确认后执行删除，使用 FOF_NOCONFIRMATION 跳过系统内置确认
     let from = path.encode_utf16().chain([0u16, 0u16]).collect::<Vec<u16>>();
     let mut ops: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     ops.hwnd = owner_hwnd;
     ops.wFunc = FO_DELETE;
     ops.pFrom = PCWSTR(from.as_ptr());
-    // FOF_ALLOWUNDO | FOF_NOCONFIRMATION: 取 .0 获取 u16 值
+    // FOF_ALLOWUNDO: 允许撤销（删除到回收站）
+    // FOF_NOCONFIRMATION: 跳过系统确认对话框（已用 MessageBoxW 确认过）
     ops.fFlags = (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0) as u16;
     // SHFileOperationW 需要 *mut SHFILEOPSTRUCTW
     let result = unsafe { SHFileOperationW(&mut ops) };
