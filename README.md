@@ -206,7 +206,6 @@ everyFile/
 │   │   │   ├── usn_worker.rs         # USN Journal worker
 │   │   │   ├── usn_types.rs          # USN 类型定义
 │   │   │   ├── path_table.rs         # 路径前缀压缩表
-│   │   │   ├── database.rs           # SQLite 数据库
 │   │   │   ├── scanner.rs            # walkdir 扫描器
 │   │   │   └── lib/                  # MFT 底层库
 │   │   ├── search/                   # 搜索模块
@@ -278,6 +277,7 @@ everyFile/
 - **位图索引**：`bitvec` 替代 `Vec<u32>`，file_id 索引节省 8.5 MB
 - **排序缓存**：按需缓存排序索引，LRU 驱逐策略限制内存上限
 - **增量合并**：delta 缓存超 1000 条或 10MB 时自动合并回 base
+- **内存弹性释放**：窗口隐藏到托盘时释放 fid_index、搜索缓存等可重建结构，增量更新到达时自动重建 fid_index，兼顾内存占用与索引实时性
 - **虚拟滚动**：仅渲染可见行 + overscan，百万级列表流畅滚动
 
 更多性能细节请参阅 [技术文档](./docs/TECHNICAL.md)。
