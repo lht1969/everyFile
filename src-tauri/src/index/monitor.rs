@@ -1706,8 +1706,17 @@ impl VolumeManager {
                 None => return,
             };
             if monitor.fid_index.is_none() {
-                log::warn!("[USN] No fid_index for {}, skipping", drive_letter);
-                return;
+                // fid_index 可能在 release_idle_memory（窗口隐藏到托盘）中被释放
+                // 此处按需重建，过滤已标记删除的条目，与 compact_files 行为一致
+                log::info!("[USN] Rebuilding fid_index for {}", drive_letter);
+                let mut new_fid_index: Vec<(u32, u32)> = Vec::with_capacity(monitor.files.len());
+                for (i, f) in monitor.files.iter().enumerate() {
+                    if !PathTable::is_deleted(f.path_id) {
+                        new_fid_index.push((f.file_id, i as u32));
+                    }
+                }
+                new_fid_index.sort_unstable_by_key(|(id, _)| *id);
+                monitor.fid_index = Some(new_fid_index);
             }
             let fid_index = monitor.fid_index.as_ref().unwrap();
             for (fid, new_result) in &updated {
