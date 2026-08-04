@@ -5,9 +5,11 @@ interface SearchPanelProps {
   onOpenSettings: () => void;
   onExport?: (format: 'csv' | 'txt' | 'json') => void;
   searching?: boolean;
+  // 卷加载未完成时禁用搜索框
+  disabled?: boolean;
 }
 
-function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPanelProps) {
+function SearchPanel({ onSearch, onOpenSettings, onExport, searching, disabled }: SearchPanelProps) {
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [filterType, setFilterType] = useState<'files' | 'directories'>('files');
@@ -148,6 +150,7 @@ function SearchPanel({ onSearch, onOpenSettings, onExport, searching }: SearchPa
             onFocus={handleInputFocus}
             onBlur={handleInputBlur}
             autoComplete="off"
+            disabled={disabled}
           />
           {query.length > 0 && (
             <button

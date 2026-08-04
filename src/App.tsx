@@ -638,6 +638,7 @@ function App() {
           onOpenSettings={() => setShowSettings(true)}
           onExport={handleExport}
           searching={searching}
+          disabled={indexStatus.status === 'scanning'}
         />
         <ResultList
           results={results}
