@@ -272,8 +272,9 @@ fn resolve_path_from_batch(
     for _ in 0..50 {
         if let Some(name) = name_map.get(&cur) {
             let name_str = name.to_string_lossy();
-            // Skip NTFS virtual entries
-            if name_str != "." && name_str != ".." && !name_str.starts_with('$') {
+            // 跳过 NTFS 虚拟条目 (. 和 ..)
+            // 保留 $ 前缀目录名（如 $WINDOWS.~BT）以确保路径完整，与全量扫描过滤逻辑一致
+            if name_str != "." && name_str != ".." {
                 components.push(name);
             }
         }
@@ -514,10 +515,6 @@ fn handle_full_scan(
     };
 
     let stats = match mft_lib::scan_volume_streaming(&volume_path, u64::MAX, &mut |r| {
-        // 跳过系统记录 (MFT 前 5 条: $MFT, $MFTMirr, $LogFile, $Volume, $AttrDef)
-        if r.record_number < 5 {
-            return;
-        }
         // 跳过无名/占位记录 (<Record#N>, <no name>)
         if r.name.starts_with('<') {
             return;
@@ -531,17 +528,20 @@ fn handle_full_scan(
         let size = r.size;
 
         // 目录：必须在所有过滤之前加入 dir_map！
-        // 原因：即使目录被 hidden/system/$-前缀过滤，它的子文件路径解析仍然需要
-        // 通过 dir_map 查找 parent 链。如果被过滤的目录不在 dir_map 中，
-        // 会导致 parent 链中断，所有子文件路径解析失败，被错误跳过。
-        // 这就是之前少了100万文件的根本原因。
+        // 原因：即使目录被 record_number/hidden/system 过滤，它的子文件路径解析仍然需要
+        // 通过 dir_map 查找 parent 链。特别是 record 5（根目录）必须在 dir_map 中，
+        // 否则所有文件的 parent 链都会在根目录处断裂，导致路径解析全部失败。
         if is_dir {
             dir_map.insert(record_number, (parent_record, name.clone()));
         }
 
-        // 以下过滤仅影响是否构建 FileEntry，不影响 dir_map
-        // 跳过 $-前缀的 NTFS 元数据文件 ($Bitmap, $Boot 等)
-        if r.name.starts_with('$') {
+        // 跳过 NTFS 系统元数据记录 (record 0-23: $MFT, $MFTMirr, $LogFile, $Volume,
+        // $AttrDef, 根目录, $Bitmap, $Boot, $BadClus, $Secure, $UpCase, $Extend 及保留项)
+        // 使用 record_number < 24 替代原先的 < 5 + name.starts_with('$') 过滤，
+        // 确保所有 NTFS 系统元数据不构建 FileEntry，同时允许用户创建的 $ 前缀目录
+        // （如 $WINDOWS.~BT）在 MFT 路径和 WalkDir 路径中行为一致。
+        // 注意：此过滤在 dir_map.insert 之后，确保根目录(record 5)等系统目录仍可用于路径解析。
+        if record_number < 24 {
             return;
         }
         // 跳过 NTFS 虚拟条目 (. 和 ..)
@@ -612,13 +612,8 @@ fn handle_full_scan(
             return;
         }
 
-        // 跳过路径中包含 $-前缀组件的条目（NTFS 特殊目录）
-        if path_str
-            .split('\\')
-            .any(|comp| comp.starts_with('$') && comp.len() > 1)
-        {
-            return;
-        }
+        // 不再过滤路径中 $-前缀组件：NTFS 系统元数据已由 record_number < 24 过滤，
+        // 用户创建的 $ 前缀目录（如 $WINDOWS.~BT, $WinREAgent）应可见，与 WalkDir 一致。
 
         // 对于目录，注册自身路径到 PathTable（供子条目 resolve_dir_path 使用）
         // 文件不需要注册，因为 FileEntry.path_id 指向父目录
@@ -662,18 +657,25 @@ fn handle_full_scan(
     };
 
     log::info!(
-        "[USN] Phase 1: Streamed {} records ({} files, {} dirs) for {} in {:?}, deferred={}",
+        "[USN] Phase 1: Streamed {} records ({} files, {} dirs) for {} in {:?}, deferred={}\n\
+         [USN]   scanner skip: no_sig={}, fixup={}, inactive={}, ads={}, hardlinks={}",
         stats.total_records,
         stats.files,
         stats.dirs,
         drive_letter,
         t0.elapsed(),
-        deferred.len()
+        deferred.len(),
+        stats.skip_no_signature,
+        stats.skip_fixup_fail,
+        stats.skip_inactive,
+        stats.total_ads,
+        stats.total_hard_links,
     );
 
     // Phase 2: 处理 deferred 条目（此时 dir_map 已包含所有目录）
     let t1 = Instant::now();
     let deferred_count = deferred.len();
+    let mut deferred_orphan = 0u64;
     for entry in deferred.drain(..) {
         // 分离 parent_path 和完整路径（与 Phase 1 callback 相同的逻辑）
         let parent_path_id: u32;
@@ -701,6 +703,7 @@ fn handle_full_scan(
                 }
                 None => {
                     // parent 仍然未知（可能是孤儿条目），跳过
+                    deferred_orphan += 1;
                     continue;
                 }
             }
@@ -709,12 +712,8 @@ fn handle_full_scan(
         if should_skip_path(&path_str) {
             continue;
         }
-        if path_str
-            .split('\\')
-            .any(|comp| comp.starts_with('$') && comp.len() > 1)
-        {
-            continue;
-        }
+
+        // 不再过滤路径中 $-前缀组件（与 Phase 1 一致，见上方说明）
 
         // 目录注册自身路径，文件不需要
         if entry.is_dir {
@@ -733,8 +732,9 @@ fn handle_full_scan(
     }
 
     log::info!(
-        "[USN] Phase 2: Resolved {} deferred entries in {:?}, total {} files (path_table size={})",
+        "[USN] Phase 2: Resolved {} deferred entries ({} orphan skipped) in {:?}, total {} files (path_table size={})",
         deferred_count,
+        deferred_orphan,
         t1.elapsed(),
         files.len(),
         path_table.len()
@@ -1040,8 +1040,10 @@ fn handle_full_scan_legacy(
         .par_iter()
         .enumerate()
         .filter_map(|(_idx, re)| {
-            // Skip $-prefixed NTFS metadata files (cheap pre-check before path resolution)
-            if re.file_name.to_string_lossy().starts_with('$') {
+            // 跳过 NTFS 系统元数据（MFT record 0-23）
+            // fid 低 48 位是 MFT record number，与主路径的 record_number < 24 过滤一致
+            let record_number = re.fid & 0xFFFFFFFFFFFF;
+            if record_number < 24 {
                 return None;
             }
             // Hidden check
@@ -1537,7 +1539,10 @@ fn handle_poll_changes(
             if !include_hidden_files && entry.is_hidden() {
                 continue;
             }
-            if entry.file_name.to_string_lossy().starts_with('$') {
+            // 跳过 NTFS 系统元数据（MFT record 0-23），与全量扫描路径一致
+            // 增量更新中新文件不可能有 record < 24，此过滤仅防御系统元数据变更事件
+            let record_number = entry.fid & 0xFFFFFFFFFFFF;
+            if record_number < 24 {
                 continue;
             }
 

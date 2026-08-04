@@ -2237,6 +2237,13 @@ impl VolumeMonitor {
     }
 
     /// Build a walkdir walker configured for this volume's settings.
+    ///
+    /// 计数差异说明（WalkDir vs MFT）：
+    /// WalkDir 按路径遍历，会对 NTFS 硬链接重复计数（同一文件的多个路径各计一次）；
+    /// MFT 按 MFT 记录枚举，每个文件只计一次。因此 WalkDir 的文件数通常略多于 MFT。
+    /// 此外 WalkDir 无法访问 NTFS 系统元数据（$Extend 等）和部分受保护目录，
+    /// 而 MFT（管理员模式）可以读取，导致这些目录下 MFT 计数更多。
+    /// 这种差异属于两种扫描方式的固有行为，非缺陷。
     fn build_walker(&self) -> walkdir::WalkDir {
         let path = if self.drive_letter.ends_with('\\') {
             self.drive_letter.clone()
@@ -2271,6 +2278,18 @@ impl VolumeMonitor {
                 }
                 if !include_hidden && name.starts_with('.') {
                     return false;
+                }
+                // 跳过 reparse points（junction/symlink），避免遍历进入导致文件重复计算
+                // Rust 的 is_symlink() 不检测 NTFS junction（reparse tag 不同），
+                // follow_links(false) 只阻止 symlink，junction 需要显式检测
+                // FILE_ATTRIBUTE_REPARSE_POINT (0x400)
+                #[cfg(windows)]
+                {
+                    if let Ok(meta) = e.metadata() {
+                        if meta.file_attributes() & 0x400 != 0 {
+                            return false;
+                        }
+                    }
                 }
                 true
             })
@@ -2400,6 +2419,18 @@ impl VolumeMonitor {
                 }
                 if !include_hidden && name.starts_with('.') {
                     return false;
+                }
+                // 跳过 reparse points（junction/symlink），避免遍历进入导致文件重复计算
+                // Rust 的 is_symlink() 不检测 NTFS junction（reparse tag 不同），
+                // follow_links(false) 只阻止 symlink，junction 需要显式检测
+                // FILE_ATTRIBUTE_REPARSE_POINT (0x400)
+                #[cfg(windows)]
+                {
+                    if let Ok(meta) = e.metadata() {
+                        if meta.file_attributes() & 0x400 != 0 {
+                            return false;
+                        }
+                    }
                 }
                 true
             })

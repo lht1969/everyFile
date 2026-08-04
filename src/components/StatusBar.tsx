@@ -35,7 +35,7 @@ function StatusBar({ message, indexStatus, isAdmin, searchTime }: StatusBarProps
         {indexStatus.volume_statuses.length > 0 && (
           <span className="volume-info">
             卷- {indexStatus.volume_statuses.map(vs => (
-              <span 
+              <span
                 key={vs.drive_letter}
                 className={`volume-tag ${getVolumeClassName(vs.state)}`}
               >
@@ -62,7 +62,7 @@ function StatusBar({ message, indexStatus, isAdmin, searchTime }: StatusBarProps
             ? '已以管理员权限运行：USN Journal 实时监控需要管理员权限，启用后应用会自动提权'
             : '以普通用户权限运行：实时增量更新（USN Journal）不可用'}
         >
-          {isAdmin ? '管理员(已提权)' : '普通用户'}
+          {isAdmin ? '管理员用户' : '普通用户'}
         </span>
       </div>
     </div>
