@@ -1477,6 +1477,10 @@ impl VolumeManager {
                     .par_iter()
                     .enumerate()
                     .filter_map(|(idx, file)| {
+                        // 跳过已标记删除的文件（托盘期间 apply_incremental_usn else 分支标记）
+                        if PathTable::is_deleted(file.path_id) {
+                            return None;
+                        }
                         if files_only && file.is_directory {
                             return None;
                         }
@@ -1494,6 +1498,10 @@ impl VolumeManager {
                     .par_iter()
                     .enumerate()
                     .filter_map(|(idx, file)| {
+                        // 跳过已标记删除的文件（托盘期间 apply_incremental_usn else 分支标记）
+                        if PathTable::is_deleted(file.path_id) {
+                            return None;
+                        }
                         let full_path = if needs_path {
                             monitor
                                 .path_table
@@ -1751,6 +1759,13 @@ impl VolumeManager {
                             *existing = modified_entry;
                         }
                     }
+                } else {
+                    // search_cache 为 None（窗口隐藏到托盘期间）：
+                    // 直接 in-place 修改 base.files 中的对应条目
+                    if let Ok(idx) = fid_index.binary_search_by_key(&fid_u32, |(id, _)| *id) {
+                        let file_idx = fid_index[idx].1 as usize;
+                        monitor.files[file_idx] = modified_entry;
+                    }
                 }
             }
         }
@@ -1780,6 +1795,25 @@ impl VolumeManager {
                 // renamed_fids 保护；真正的重命名会在 Phase 4 重新设置。
                 // 否则 NTFS 复用 fid 时，旧重命名残留会导致新删除被错误保留。
                 cache.delta.renamed_fids.remove(&fid_u32);
+            }
+        } else {
+            // search_cache 为 None（窗口隐藏到托盘期间）：
+            // 直接在 base.files 中标记删除（path_id 设为 deleted_id）
+            let monitor = self.volumes.get_mut(drive_letter).unwrap();
+            let fid_index = monitor.fid_index.as_ref().unwrap();
+            // 先收集要删除的索引，避免借用冲突
+            let indices_to_delete: Vec<usize> = removed
+                .iter()
+                .filter_map(|(fid, _)| {
+                    let fid_u32 = *fid as u32;
+                    fid_index
+                        .binary_search_by_key(&fid_u32, |(id, _)| *id)
+                        .ok()
+                        .map(|idx| fid_index[idx].1 as usize)
+                })
+                .collect();
+            for file_idx in indices_to_delete {
+                monitor.files[file_idx].path_id = PathTable::deleted_id();
             }
         }
 
@@ -1884,6 +1918,32 @@ impl VolumeManager {
             }
             cache.delta.matched = new_delta_matched;
             cache.delta.generation += 1;
+        } else {
+            // search_cache 为 None（窗口隐藏到托盘期间）：
+            // 直接将新文件 append 到 base.files，并重建 fid_index
+            let monitor = self.volumes.get_mut(drive_letter).unwrap();
+            for entry in added_entries {
+                let fid = entry.1.file_id;
+                // 区分"重命名"与"创建后立刻删除"（与 has_cache 逻辑一致）
+                if let Some(removed_path) = removed_path_map.get(&fid) {
+                    if let Some(added_path) = added_path_map.get(&fid) {
+                        if removed_path.eq_ignore_ascii_case(added_path) {
+                            // 创建后删除：不加入 base.files
+                            continue;
+                        }
+                    }
+                }
+                monitor.files.push(entry.1);
+            }
+            // 重建 fid_index（包含新增文件，过滤已删除条目）
+            let mut new_fid_index: Vec<(u32, u32)> = Vec::with_capacity(monitor.files.len());
+            for (i, f) in monitor.files.iter().enumerate() {
+                if !PathTable::is_deleted(f.path_id) {
+                    new_fid_index.push((f.file_id, i as u32));
+                }
+            }
+            new_fid_index.sort_unstable_by_key(|(id, _)| *id);
+            monitor.fid_index = Some(new_fid_index);
         }
     }
 

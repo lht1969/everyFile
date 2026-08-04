@@ -246,8 +246,6 @@ fn show_menu_owned(
         return Err(format!("Path does not exist: {}", path));
     }
 
-    let main_hwnd = get_main_window_hwnd(app)?;
-
     // ---- Shell object setup ----
     let desktop: IShellFolder = unsafe {
         SHGetDesktopFolder().map_err(|e| format!("Failed to get desktop folder: {}", e))?
@@ -363,7 +361,9 @@ fn show_menu_owned(
     // from "menu dismissed".
     log::info!("[CTX_MENU] TrackPopupMenu starting (main thread stays responsive)");
     let cmd_id = unsafe {
-        SetForegroundWindow(main_hwnd);
+        // SetForegroundWindow 必须调用在 TrackPopupMenu 的 owner 窗口上，
+        // 否则点击菜单外部时菜单不会自动关闭
+        SetForegroundWindow(owner_hwnd);
         let ret = TrackPopupMenu(
             hmenu,
             TPM_RETURNCMD,
@@ -449,7 +449,7 @@ fn show_menu_owned(
             invoke_info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32;
             invoke_info.fMask = CMIC_MASK_UNICODE;
             // The command's modal dialogs must be parented to a window owned by
-            // the calling thread; main_hwnd belongs to the main thread, and a
+            // the calling thread; the main window belongs to the main thread, and a
             // cross-thread owner breaks the shell property-sheet host.
             invoke_info.hwnd = owner_hwnd;
             invoke_info.lpVerb = PCSTR(offset as usize as *const u8);
@@ -567,20 +567,6 @@ unsafe extern "system" fn ctx_menu_subclass_proc(
     DefSubclassProc(hwnd, umsg, wparam, lparam)
 }
 
-fn get_main_window_hwnd(app: &tauri::AppHandle) -> std::result::Result<HWND, String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Failed to get main window".to_string())?;
-    let hwnd = HWND(
-        window
-            .hwnd()
-            .map_err(|e| format!("Failed to get HWND: {}", e))?
-            .0 as _,
-    );
-    log::info!("Got main window HWND: {:?}", hwnd);
-    Ok(hwnd)
-}
-
 struct ComGuard;
 
 impl ComGuard {
@@ -651,8 +637,6 @@ fn show_fallback_menu(
         screen_y
     );
 
-    let main_hwnd = get_main_window_hwnd(app)?;
-
     let hmenu = unsafe {
         CreatePopupMenu().map_err(|e| format!("Failed to create popup menu: {}", e))?
     };
@@ -685,7 +669,9 @@ fn show_fallback_menu(
     });
 
     let cmd_id = unsafe {
-        SetForegroundWindow(main_hwnd);
+        // SetForegroundWindow 必须调用在 TrackPopupMenu 的 owner 窗口上，
+        // 否则点击菜单外部时菜单不会自动关闭
+        SetForegroundWindow(owner_hwnd);
         let ret = TrackPopupMenu(
             hmenu,
             TPM_RETURNCMD,

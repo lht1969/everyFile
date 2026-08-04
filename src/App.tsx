@@ -435,6 +435,31 @@ function App() {
     }
   }, [sortState]);
 
+  // 监听窗口从托盘恢复事件，自动重新搜索以反映托盘期间的文件变更
+  useEffect(() => {
+    const unlisten = listen('window-restored', () => {
+      console.log('[WINDOW-RESTORED] received, re-searching');
+      const { query, filesOnly, directoriesOnly } = searchStateRef.current;
+      handleSearch(query, filesOnly, directoriesOnly);
+    });
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, [handleSearch]);
+
+  // 禁用 WebView2 默认右键菜单（保留输入框的复制/粘贴等右键菜单）
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+        return;
+      }
+      e.preventDefault();
+    };
+    document.addEventListener('contextmenu', handler);
+    return () => document.removeEventListener('contextmenu', handler);
+  }, []);
+
   const handleSortChange = useCallback(async (field: SortField, direction: SortDirection) => {
     if (rangeChangeTimerRef.current !== null) {
       clearTimeout(rangeChangeTimerRef.current);

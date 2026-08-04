@@ -1,7 +1,7 @@
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 pub fn setup_tray(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -25,6 +25,8 @@ pub fn setup_tray(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
+                    // 通知前端窗口已恢复，触发重新搜索以反映托盘期间的文件变更
+                    let _ = app.emit("window-restored", ());
                 }
             }
             "hide" => {
@@ -46,6 +48,8 @@ pub fn setup_tray(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(window) = tray.app_handle().get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
+                    // 通知前端窗口已恢复，触发重新搜索以反映托盘期间的文件变更
+                    let _ = tray.app_handle().emit("window-restored", ());
                 }
             }
         })
