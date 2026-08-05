@@ -311,7 +311,9 @@ pub async fn get_monitored_volumes(
     state: State<'_, super::search::AppState>,
 ) -> Result<Vec<VolumeResponse>, String> {
     let vm = state.volume_manager.lock().await;
-    let volumes = vm.volumes();
+    let mut volumes = vm.volumes();
+    // 始终以字母顺序返回卷列表
+    volumes.sort();
     let mut result = Vec::new();
 
     for vol in volumes {

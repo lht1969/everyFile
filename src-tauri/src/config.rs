@@ -63,6 +63,8 @@ impl Config {
                     log::warn!("Failed to save migrated config: {}", e);
                 }
             }
+            // 始终以字母顺序排列卷名，保证配置一致性
+            config.monitored_volumes.sort();
             Ok(config)
         } else {
             Ok(Config::default())
@@ -78,7 +80,11 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
 
-        let content = toml::to_string_pretty(self)?;
+        // 保存前排序卷名，确保配置文件中卷名始终按字母顺序排列
+        let mut config = self.clone();
+        config.monitored_volumes.sort();
+
+        let content = toml::to_string_pretty(&config)?;
         log::info!("Config content: {}", content);
         fs::write(config_path, content)?;
         log::info!("Config saved successfully");
