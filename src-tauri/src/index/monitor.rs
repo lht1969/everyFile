@@ -1315,9 +1315,24 @@ impl VolumeManager {
     }
 
     pub fn invalidate_search_cache(&mut self) {
-        self.search_cache = None;
+        // 与 release_idle_memory 相同：丢弃缓存前先合并 delta，
+        // 避免未 merge 的增量变更（新增/删除/修改）随缓存一起丢失。
+        self.merge_delta_before_drop();
         self.empty_query_generation += 1;
         self.empty_query_sorted = [None, None, None, None];
+    }
+
+    /// 丢弃 search_cache 前，将 delta 合并回 base.files，然后释放缓存。
+    ///
+    /// delta 中未 merge 的变更（new_files / deleted_ids / modified）只存在于
+    /// search_cache 里，对应的 USN 记录已被消费。若直接设置 search_cache = None
+    /// 丢弃整个缓存，这些变更将永久丢失，直到全量重扫。
+    /// merge 后 delta 被清空，再释放缓存即安全。
+    fn merge_delta_before_drop(&mut self) {
+        if let Some(cache) = self.search_cache.as_mut() {
+            cache.merge_delta_to_base(&mut self.volumes, &self.vol_names);
+        }
+        self.search_cache = None;
     }
 
     pub fn get_monitor(&self, drive_letter: &str) -> Option<&VolumeMonitor> {
@@ -2047,13 +2062,18 @@ impl VolumeManager {
     /// 释放后台空闲时可重建的内存，保留核心数据（files + path_table）。
     /// 窗口隐藏到托盘时调用，首次搜索时自动重建。
     /// 释放内容：search_cache、sorted_indices_map、各卷 fid_index。
-    /// 保留内容：delta（丢失需全量重扫）、files、path_table。
+    /// 保留内容：files、path_table。
     pub fn release_idle_memory(&mut self) {
         let before = self.memory_stats();
         let before_total = before.0 + before.1 + before.2 + before.3 + before.4;
 
-        // 释放搜索缓存（含 base.matched、delta、base_file_bitvec）
-        self.search_cache = None;
+        // 关键：释放 search_cache 前先把 delta 合并回 base.files。
+        // delta 中的新增/删除/修改只存在于缓存中，对应的 USN 记录已被消费，
+        // 直接丢弃会导致这些变更永久丢失（直到全量重扫）。
+        // 场景：窗口隐藏到托盘前文件被创建/删除，仅进入 delta 尚未 merge，
+        // 隐藏后重新搜索时这些文件会从结果中凭空消失。
+        self.merge_delta_before_drop();
+
         // 释放排序索引缓存
         self.sorted_indices_map.clear();
         // 释放空查询排序缓存（下次搜索时自动重建）
